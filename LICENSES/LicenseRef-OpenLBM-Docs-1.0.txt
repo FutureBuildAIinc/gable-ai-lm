@@ -1,0 +1,23 @@
+OpenLBM Documentation License 1.0
+=====================================================================
+SPDX-License-Identifier: LicenseRef-OpenLBM-Docs-1.0
+Applies to: documentation, specs, guides, and this Standard's prose.
+
+  Draft pending counsel.
+
+  Incorporates the OpenLBM Definitions Core v1.0 by reference (You, Control,
+  Location, Community Member, Large Operator, Production Use, Modification,
+  Distribute, Network-Provide, Corresponding Source, Change Date, Open Target,
+  Steward).
+
+DEED — Share and adapt the docs freely, even commercially. Credit the source,
+and share your adaptations under these same terms.
+
+1. GRANT. A worldwide, royalty-free license to reproduce, adapt, and
+   distribute the Documentation, for any purpose.
+2. ATTRIBUTION. Give reasonable credit to "the OpenLBM/Gable project" and link
+   the source; indicate changes.
+3. SHARE-ALIKE. Distribute adaptations under this same License.
+4. NO ADDITIONAL RESTRICTIONS; no warranty.
+   (Concept lineage: CC-BY-SA-4.0. Text original / or adopt CC-BY-SA directly
+   for docs if counsel prefers a standard instrument here.)
