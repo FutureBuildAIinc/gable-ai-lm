@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: LicenseRef-OpenLBM-Docs-1.0
+# SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+#
+# Dependabot keeps the three dependency surfaces of this repo current: the Go
+# module in backend/, the npm project in app/, and the GitHub Actions used by
+# .github/workflows/.
+#
+# Cadence is weekly rather than daily on purpose: the `vulnerabilities` job in
+# ci.yml already runs govulncheck nightly, so genuinely urgent Go problems
+# surface there first. Weekly PRs keep the review queue manageable for a small
+# maintainer team, and the open-PR limits stop a dependency storm from burying
+# real work.
+#
+# NOTE: `reviewers`/`assignees` are intentionally omitted — .github/CODEOWNERS
+# still has placeholder team handles. Add them here once the real teams exist.
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # Go backend. The module lives in backend/, not at the repo root.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: gomod
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - backend
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # The golang.org/x/* modules release in lockstep; separate PRs for each
+      # just churn go.sum.
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      go-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # Frontend (Vite + Lit + TypeScript).
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - frontend
+    commit-message:
+      prefix: "chore(deps)"
+    versioning-strategy: increase-if-necessary
+    groups:
+      # Build/test tooling churns constantly and is low risk — one PR a week
+      # for the lot of it.
+      dev-tooling:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+      prod-minor-and-patch:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # three.js makes breaking changes in minor releases, and the 3D load
+      # visualiser depends on specifics of its scene graph and the shared
+      # 1in = 1/12-world-unit render contract. Majors are reviewed by hand.
+      - dependency-name: "three"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/three"
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions used by .github/workflows/.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns:
+          - "*"

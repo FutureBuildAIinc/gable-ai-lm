@@ -1,0 +1,119 @@
+OpenLBM Community Source License 1.0.0
+=======================================
+
+  Draft pending counsel.
+
+  This is an original, source-available license in the lineage of the
+  Business Source License 1.1 (it retains an Additional Use Grant, which the
+  Functional Source License removed) with a size-based community carve-out
+  adapted from the PolyForm Small Business License. It is NOT the Business
+  Source License and is not affiliated with MariaDB, HashiCorp, or the
+  PolyForm Project. Modeled on their public structures; text is original.
+
+-----------------------------------------------------------------------
+PARAMETERS
+-----------------------------------------------------------------------
+
+  Licensor:          FutureBuild, Inc.
+
+  Licensed Work:     The specific version of the software identified in the
+                     accompanying notice (for example, "AI_LM 2.3.0" or
+                     "GableLBM Contractor Portal 1.4.0"). The Licensed Work
+                     is © FutureBuild, Inc.
+
+  Additional Use     Community Members (defined below) are granted use of the
+  Grant:             Licensed Work for ANY purpose, INCLUDING production use,
+                     at no charge, effective immediately.
+
+  Change Date:       Five (5) years from the date the specific version of the
+                     Licensed Work is first made available.
+
+  Change License:    GNU Affero General Public License, version 3.0
+                     (AGPL-3.0-only).
+
+-----------------------------------------------------------------------
+TERMS
+-----------------------------------------------------------------------
+
+1. GRANT (source-available). Subject to the conditions below, Licensor grants
+   You the right to copy, modify, create derivative works of, redistribute,
+   and make non-production use of the Licensed Work. The complete source of
+   the Licensed Work is provided to You.
+
+2. ADDITIONAL USE GRANT (the community carve-out). If You are a Community
+   Member, the restriction in Section 3 does not apply to You: You may use the
+   Licensed Work for any purpose, including production, at no charge. This
+   grant is effective immediately and does not wait for the Change Date.
+
+3. PRODUCTION-USE CONDITION. If You are NOT a Community Member, You may not use
+   the Licensed Work for a Production Purpose unless You have a separate
+   commercial license from Licensor. All other rights in Section 1 (read,
+   modify, non-production use, redistribute with this license intact) still
+   apply to You.
+
+4. CHANGE DATE / CONVERSION. On the Change Date for a given version, the terms
+   of this License with respect to that version terminate and are replaced by
+   the Change License, automatically and for everyone. From that date You may
+   use that version under the Change License. Each version has its own Change
+   Date measured from its own availability date; this License continues to
+   govern later versions until each reaches its own Change Date.
+
+5. REDISTRIBUTION. You must include a complete copy of this License, and the
+   Parameters and notices above, with every copy of the Licensed Work You
+   redistribute. Any redistribution outside the Additional Use Grant remains
+   subject to Section 3.
+
+6. NO TRADEMARK LICENSE. This License grants no rights in the names, logos, or
+   trademarks of Licensor (including "Gable", "GableLBM", "AI_LM", and
+   "OpenLBM"). See the separate trademark policy.
+
+7. TERMINATION. Any use of the Licensed Work in violation of this License
+   automatically terminates Your rights under this License for all versions,
+   for the current and any future breach period, until cured and Licensor
+   reinstates them in writing. A Community Member that ceases to qualify (for
+   example, on acquisition into a group that is not a Community Member) has a
+   ninety (90) day period to obtain a commercial license or cease Production
+   use.  [COUNSEL: confirm cure/termination + crossing-remedy mechanics.]
+
+8. DISCLAIMER. THE LICENSED WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS
+   FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. TO THE EXTENT
+   PERMITTED BY LAW, LICENSOR HAS NO LIABILITY ARISING FROM THIS LICENSE OR THE
+   USE OF THE LICENSED WORK.  [COUNSEL: governing law + venue.]
+
+-----------------------------------------------------------------------
+DEFINITIONS
+-----------------------------------------------------------------------
+
+  "You" / "Your" means the individual or legal entity exercising rights under
+  this License, together with all entities under common Control with it.
+
+  "Community Member" means an organization that, together with all entities
+  under common Control with it:
+     (a) operates fewer than fifty (50) Locations; and
+     (b) is not under the Control of, and does not Control, any entity whose
+         total annual revenue exceeds one billion US dollars ($1,000,000,000).
+  [COUNSEL: thresholds are business parameters — confirm 50 / $1B.]
+
+  "Location" means a physical retail, distribution, or manufacturing site
+  operated by the organization.
+
+  "Control" means ownership of substantially all the assets of an entity, or
+  the power to direct its management and policies by vote, contract, or
+  otherwise.
+
+  "Production Purpose" means any use other than for development, testing,
+  evaluation, or other non-production purposes. Using the Licensed Work to
+  operate a business, or to provide a hosted or managed service to any third
+  party, is a Production Purpose.
+
+-----------------------------------------------------------------------
+NOTICE (place in each licensed file / repository)
+-----------------------------------------------------------------------
+
+  License: OpenLBM Community Source License 1.0.0 (LicenseRef-OpenLBM-CSL-1.0)
+  Licensor: FutureBuild, Inc.
+  Licensed Work: <name and version>
+  Change Date: <availability date> + 5 years
+  Change License: AGPL-3.0-only
+  Free for Community Members immediately (see the Additional Use Grant).

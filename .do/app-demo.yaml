@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: LicenseRef-OpenLBM-Community-Source-1.0
+# SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+
+# =============================================================================
+#  ⚠️  NOT A PRODUCTION SPEC. DEMO DATA ONLY. ⚠️
+#
+#  This manifest sets AUTH_MODE=dev on a PUBLIC hostname
+#  (https://demo.ai-lm.gable.com). AUTH_MODE=dev means the auth middleware is
+#  never constructed and every role gate opens for anonymous callers — see
+#  ../SECURITY.md. AI_LM's API is not read-only: an unauthenticated caller who
+#  reaches POST /api/v1/workflow/plans/{id}/push can write arbitrary delivery
+#  routes into the connected ERP's dispatch board using this deployment's
+#  GABLE_INTEGRATION_KEY.
+#
+#  For a community demo that is the point — anyone can click through the
+#  workflow without an account, and the data behind it is fictional. It is NOT
+#  acceptable for any environment holding a real dealer's data.
+#
+#  Do not "fix" this by flipping AUTH_MODE here. Flipping it alone will make
+#  the service fail to start (it is fail-closed and needs SESSION_SECRET,
+#  CORS_ORIGINS, and an explicit DATABASE_URL) and will lock the demo UI out
+#  with no login path. Work the full checklist in .do/README.md instead.
+# =============================================================================
+
+# Digital Ocean App Platform spec — AI_LM COMMUNITY DEMO environment.
+#
+# !! NOT YET PROVISIONED !!
+# No `ai-lm-demo` app exists in the DigitalOcean account, and the `community`
+# branch this spec tracks does not exist in the repository either. Treat this
+# file as a reviewed template, not as a description of something running.
+# Confirm with: doctl apps list --format ID,Spec.Name,DefaultIngress
+#
+# When provisioned it tracks the `community` branch of
+# github.com/FutureBuildAIinc/gable-ai-lm and auto-deploys to
+# https://demo.ai-lm.gable.com on push, backed by a DO Managed Postgres cluster
+# (`ai-lm-pg`), logical DB `ai_lm_demo`.
+#
+# !! REPOSITORY MOVE !!
+# AI_LM migrated from futurebuildai/AI_LM to FutureBuildAIinc/gable-ai-lm. The
+# `github:` blocks below name the NEW repository. Before this spec can be
+# applied, the DigitalOcean GitHub App needs access to that repository (DO
+# console -> Settings -> GitHub permissions) and the `community` branch has to
+# exist.
+#
+# AI_LM is a satellite service: it pulls orders/products/vehicles from GableLBM
+# via /api/integration/* using GABLE_INTEGRATION_KEY and writes approved routes
+# back the same way. INSTANCE_COUNT must remain 1 (in-process middleware state).
+#
+# Apply with: doctl apps create --spec .do/app-demo.yaml  (first time)
+#             doctl apps update <app-id> --spec .do/app-demo.yaml
+name: ai-lm-demo
+region: nyc
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+domains:
+  - domain: demo.ai-lm.gable.com
+    type: PRIMARY
+
+services:
+  - name: backend
+    dockerfile_path: backend/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: community
+      deploy_on_push: true
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8090
+    health_check:
+      http_path: /healthz/live
+      initial_delay_seconds: 15
+      period_seconds: 30
+      failure_threshold: 3
+    routes:
+      # preserve_path_prefix keeps the original path when proxying to the
+      # container; without it App Platform strips the matched prefix and the
+      # Go router 404s (e.g. /healthz/live → /live).
+      - path: /api
+        preserve_path_prefix: true
+      - path: /healthz
+        preserve_path_prefix: true
+      - path: /metrics
+        preserve_path_prefix: true
+    envs:
+      - key: PORT
+        value: "8090"
+
+      # ⚠️ AUTHENTICATION DISABLED — public community demo, fictional data
+      # only. See the banner at the top of this file and .do/README.md.
+      - key: AUTH_MODE
+        value: dev
+
+      - key: CORS_ORIGINS
+        value: https://demo.ai-lm.gable.com
+
+      - key: GABLE_API_URL
+        scope: RUN_TIME
+        type: SECRET
+
+      # ⚠️ WRITE CREDENTIAL. Sent as X-Integration-Key on every ERP call,
+      # including the route write-back. Never inline it here.
+      - key: GABLE_INTEGRATION_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      - key: DATABASE_URL
+        value: ${ai-lm-pg.DATABASE_URL}
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+
+  - name: frontend
+    dockerfile_path: app/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: community
+      deploy_on_push: true
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8080
+    build_command: ""
+    envs:
+      # The Lit app calls relative /api/v1 paths; nginx reverse-proxies /api
+      # to the backend's private URL (CSP keeps everything same-origin).
+      - key: BACKEND_URL
+        value: ${backend.PRIVATE_URL}
+        scope: RUN_TIME
+    routes:
+      - path: /
+
+jobs:
+  # Runs after every successful deploy. Migrations always run; the demo seed
+  # runs ONLY when DEMO_SEED is exactly "true".
+  #
+  # This is the one environment where seeding on every deploy is the intended
+  # behaviour — the community demo is *supposed* to be a fictional Kelowna
+  # dealer, and re-seeding is how it recovers after visitors have clicked
+  # through it.
+  #
+  # That only holds if the seed is idempotent. Vehicle profiles already upsert;
+  # restricted points are currently inserted unconditionally, so today a repeat
+  # deploy adds a second Bennett Bridge rather than converging. Making the seed
+  # idempotent end-to-end is in flight — until it lands, prefer redeploying with
+  # DEMO_SEED removed and re-adding it only when the demo data needs resetting.
+  #
+  # DEMO_SEED is opt-IN precisely so that this stays a property of THIS spec.
+  # A new environment that does not declare it gets migrations and nothing
+  # else. Never copy this job into a production spec with DEMO_SEED set.
+  - name: migrate-and-seed
+    kind: POST_DEPLOY
+    dockerfile_path: backend/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: community
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    # sh -c is required: App Platform splits run_command on whitespace and
+    # passes argv to the first binary directly, so a bare `./migrate && ./seed`
+    # would not chain.
+    #
+    # `set -e` so a failed migration fails the job instead of falling through
+    # to the seed. Quoting is deliberately one level deep — outer single
+    # quotes, inner double quotes only around the variable — because nested
+    # escapes through YAML and then through App Platform's argv handling are
+    # exactly the kind of thing that breaks silently.
+    run_command: sh -c 'set -e; ./migrate; if [ "$DEMO_SEED" = true ]; then echo seeding demo data; ./seed; else echo skipping demo seed, DEMO_SEED is not true; fi'
+    envs:
+      # REQUIRED, and previously missing here: migrate/seed load the server's
+      # full config, which is fail-closed when AUTH_MODE != "dev" and demands
+      # SESSION_SECRET. Without this line the job exits with
+      # "FATAL: SESSION_SECRET must be set" before running a single migration.
+      # The job serves no HTTP, so this is not an exposure — but it is a
+      # workaround; the real fix is for migrate/seed to load only the config
+      # they need. Tracked in ROADMAP.md.
+      - key: AUTH_MODE
+        value: dev
+
+      # ⚠️ Demo data. Correct for this environment; wrong everywhere else.
+      - key: DEMO_SEED
+        value: "true"
+
+      - key: DATABASE_URL
+        value: ${ai-lm-pg.DATABASE_URL}
+        scope: RUN_TIME
+        type: SECRET
+
+databases:
+  - name: ai-lm-pg
+    engine: PG
+    version: "16"
+    production: true
+    cluster_name: ai-lm-pg
+    db_name: ai_lm_demo
+    db_user: ai_lm_user

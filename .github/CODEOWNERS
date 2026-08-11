@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: LicenseRef-OpenLBM-Docs-1.0
+# SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+#
+# Code owners for AI_LM. GitHub requests a review from the matching owner
+# whenever a pull request touches one of these paths.
+#
+# !! PLACEHOLDER TEAMS !!
+# The handles below do NOT exist yet. Before opening this repository to outside
+# contributors a maintainer must:
+#   1. Create the teams under the @FutureBuildAIinc organisation
+#      (Settings -> Teams). Suggested: maintainers, backend, frontend, infra,
+#      legal — or collapse them all to `maintainers` if the split is premature.
+#   2. Give each team at least *write* access to this repository. GitHub
+#      silently ignores CODEOWNERS entries for teams without write access, so a
+#      typo or a missing grant looks exactly like "nothing happened".
+#   3. Replace every handle here with the real one.
+#   4. Enable "Require review from Code Owners" in the branch protection rule
+#      for `main`, alongside the required "CI" status check.
+#
+# Syntax: last matching pattern wins, so the specific overrides at the bottom
+# take precedence over the catch-all at the top.
+
+# ---------------------------------------------------------------------------
+# Default owner for everything not matched below.
+# ---------------------------------------------------------------------------
+*                           @FutureBuildAIinc/maintainers
+
+# ---------------------------------------------------------------------------
+# Application code
+# ---------------------------------------------------------------------------
+/backend/                   @FutureBuildAIinc/backend
+/app/                       @FutureBuildAIinc/frontend
+
+# The GableLBM integration client is the entire dependency surface between
+# AI_LM and the ERP. A change here changes the contract, not just the code.
+/backend/internal/gable/    @FutureBuildAIinc/backend @FutureBuildAIinc/maintainers
+
+# Axle, GVW, volume, and securement math. A wrong answer in these files is a
+# safety and legal exposure for the dealer running the truck, not a display
+# bug — they get maintainer eyes regardless of how small the diff looks.
+/backend/internal/load/     @FutureBuildAIinc/backend @FutureBuildAIinc/maintainers
+/backend/internal/compliance/ @FutureBuildAIinc/backend @FutureBuildAIinc/maintainers
+
+# Database migrations are append-only and irreversible in production.
+/backend/migrations/        @FutureBuildAIinc/backend @FutureBuildAIinc/maintainers
+
+# ---------------------------------------------------------------------------
+# CI, deploy, and container plumbing
+# ---------------------------------------------------------------------------
+/.github/                   @FutureBuildAIinc/maintainers
+/.do/                       @FutureBuildAIinc/infra @FutureBuildAIinc/maintainers
+/docker-compose.yml         @FutureBuildAIinc/infra
+/backend/Dockerfile         @FutureBuildAIinc/infra
+/app/Dockerfile             @FutureBuildAIinc/infra
+/app/nginx.conf.template    @FutureBuildAIinc/infra
+
+# ---------------------------------------------------------------------------
+# Licensing, legal, and policy — maintainer approval always required. These
+# files define what the project *is* legally; a bad merge here is far more
+# expensive to unwind than a bad merge in application code.
+# ---------------------------------------------------------------------------
+/LICENSE                    @FutureBuildAIinc/maintainers @FutureBuildAIinc/legal
+/LICENSE-MAP.md             @FutureBuildAIinc/maintainers @FutureBuildAIinc/legal
+/LICENSES/                  @FutureBuildAIinc/maintainers @FutureBuildAIinc/legal
+/REUSE.toml                 @FutureBuildAIinc/maintainers @FutureBuildAIinc/legal
+/SECURITY.md                @FutureBuildAIinc/maintainers
+/CODE_OF_CONDUCT.md         @FutureBuildAIinc/maintainers
+/CONTRIBUTING.md            @FutureBuildAIinc/maintainers

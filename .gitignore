@@ -1,0 +1,50 @@
+# Environment files
+**/.env
+**/.env.*
+!**/.env.example
+
+# Local docker compose override (developer-specific tweaks)
+docker-compose.override.yml
+
+# Build artifacts
+backend/server
+backend/server_bin
+backend/migrate
+backend/seed
+*.log
+
+# Agent/AI directories
+.agent/
+.agents/
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Test/coverage output. CI uploads these as build artifacts (see
+# .github/workflows/ci.yml); they must never be committed. Without this,
+# `npm run test:coverage` leaves ~60 generated HTML files in app/coverage/
+# that `git add -A` would happily stage.
+coverage/
+backend/coverage.out
+backend/coverage-func.txt
+backend/test-output.txt
+backend/govulncheck.txt
+
+# Digital Ocean — keep .do/*.yaml tracked, ignore local-only manifests
+.do/*.local.*
+.do/.env*
+
+# OS
+.DS_Store
+Thumbs.db

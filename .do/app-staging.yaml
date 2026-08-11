@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: LicenseRef-OpenLBM-Community-Source-1.0
+# SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+
+# =============================================================================
+#  ⚠️  NOT A PRODUCTION SPEC. DEMO DATA ONLY. ⚠️
+#
+#  This manifest sets AUTH_MODE=dev on a PUBLIC hostname
+#  (https://load.gablelbm.com). AUTH_MODE=dev means the auth middleware is
+#  never constructed and every role gate opens for anonymous callers — see
+#  ../SECURITY.md. AI_LM's API is not read-only: an unauthenticated caller who
+#  reaches POST /api/v1/workflow/plans/{id}/push can write arbitrary delivery
+#  routes into the connected ERP's dispatch board using this deployment's
+#  GABLE_INTEGRATION_KEY.
+#
+#  That is tolerable ONLY because this environment holds nothing but
+#  non-confidential demo data and is wired to a demo ERP. It is NOT tolerable
+#  for any environment holding a real dealer's orders, customers, or fleet.
+#
+#  Do not "fix" this by flipping AUTH_MODE here. Flipping it alone will make
+#  the service fail to start (it is fail-closed and needs SESSION_SECRET,
+#  CORS_ORIGINS, and an explicit DATABASE_URL) and will lock the demo UI out
+#  with no login path. Work the full checklist in .do/README.md instead.
+# =============================================================================
+
+# Digital Ocean App Platform spec — AI_LM STAGING/DEMO environment.
+#
+# Standalone deploy of github.com/FutureBuildAIinc/gable-ai-lm (branch `main`),
+# fronted by the custom domain load.gablelbm.com. Backed by a DO Managed
+# Postgres cluster (`ai-lm-pg-staging`), logical DB `ai_lm_staging`.
+#
+# !! REPOSITORY MOVE !!
+# AI_LM migrated from futurebuildai/AI_LM to FutureBuildAIinc/gable-ai-lm. The
+# `github:` blocks below name the NEW repository. Before applying this spec to
+# the existing `ai-lm-staging` app, a human must:
+#   1. Push this tree to FutureBuildAIinc/gable-ai-lm `main`.
+#   2. Grant the DigitalOcean GitHub App access to that repository
+#      (DO console -> Settings -> GitHub permissions). App Platform cannot
+#      repoint an app at a repo it has no grant for, and `doctl apps update`
+#      will fail with a repository-not-found error if you skip this.
+#   3. Only then run the `doctl apps update` below.
+# Applying this spec without step 2 will fail the update, not silently deploy
+# the old code — but it will still interrupt the deploy pipeline, so sequence it.
+#
+# Integration target: GableLBM's `community` deployment at
+# https://demo.gablelbm.com. AI_LM pulls orders/products/vehicles from there via
+# /api/integration/* using GABLE_INTEGRATION_KEY and writes approved routes back
+# the same way. INSTANCE_COUNT must remain 1 (in-process middleware state).
+#
+# CORS_ORIGINS is intentionally unset: App Platform path-routes /api, /healthz
+# and /metrics to the backend under the SAME app URL as the frontend, so all
+# browser calls are same-origin and never hit CORS. Note that CORS_ORIGINS
+# becomes REQUIRED the moment AUTH_MODE is no longer `dev` — the server refuses
+# to start without it.
+#
+# Apply with: doctl apps create --spec .do/app-staging.yaml  (first time)
+#             doctl apps update <app-id> --spec .do/app-staging.yaml
+name: ai-lm-staging
+region: nyc
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+# Public custom domain. gablelbm.com's DNS zone is NOT managed in this DO
+# account — the registrar/DNS provider needs a CNAME:
+#   load.gablelbm.com → ai-lm-staging-b6ssv.ondigitalocean.app
+# App Platform provisions the TLS cert automatically once the record resolves.
+domains:
+  - domain: load.gablelbm.com
+    type: PRIMARY
+
+services:
+  - name: backend
+    dockerfile_path: backend/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: main
+      deploy_on_push: true
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8090
+    health_check:
+      http_path: /healthz/live
+      initial_delay_seconds: 15
+      period_seconds: 30
+      failure_threshold: 3
+    routes:
+      # preserve_path_prefix keeps the original path when proxying to the
+      # container; without it App Platform strips the matched prefix and the
+      # Go router 404s (e.g. /healthz/live → /live).
+      - path: /api
+        preserve_path_prefix: true
+      - path: /healthz
+        preserve_path_prefix: true
+      - path: /metrics
+        preserve_path_prefix: true
+    envs:
+      - key: PORT
+        value: "8090"
+
+      # ⚠️ AUTHENTICATION DISABLED — demo data only. See the banner at the top
+      # of this file and the checklist in .do/README.md. This value must be
+      # REMOVED (not changed to something else) as part of the production
+      # checklist, together with adding SESSION_SECRET and CORS_ORIGINS.
+      - key: AUTH_MODE
+        value: dev
+
+      # GableLBM community deployment — public base URL, not a secret.
+      - key: GABLE_API_URL
+        value: https://demo.gablelbm.com
+        scope: RUN_AND_BUILD_TIME
+
+      # ⚠️ WRITE CREDENTIAL. Sent as X-Integration-Key on every ERP call,
+      # including the route write-back. Must match GableLBM community's
+      # INTEGRATION_API_KEY. Never inline it here; it is an encrypted secret.
+      - key: GABLE_INTEGRATION_KEY
+        scope: RUN_TIME
+        type: SECRET
+
+      - key: DATABASE_URL
+        value: ${ai-lm-pg-staging.DATABASE_URL}
+        scope: RUN_AND_BUILD_TIME
+        type: SECRET
+
+  - name: frontend
+    dockerfile_path: app/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: main
+      deploy_on_push: true
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8080
+    build_command: ""
+    envs:
+      # The Lit app calls relative /api/v1 paths. App Platform path-routes /api
+      # to the backend; nginx's /api proxy is the same-origin fallback when the
+      # frontend container is hit directly.
+      - key: BACKEND_URL
+        value: ${backend.PRIVATE_URL}
+        scope: RUN_TIME
+    routes:
+      - path: /
+
+jobs:
+  # Runs after every successful deploy. Migrations always run; the demo seed
+  # runs ONLY when DEMO_SEED is exactly "true".
+  #
+  # Why the gate exists: this job used to be `sh -c "./migrate && ./seed"`
+  # unconditionally, which meant every deploy of every environment re-injected
+  # one demo dealer's fleet profiles and restricted points. That is correct for
+  # a demo and actively wrong anywhere else — a real dealer would find two
+  # fictional trucks in their fleet list after each deploy.
+  #
+  # DEMO_SEED is opt-IN. A new environment that simply does not declare it gets
+  # migrations and nothing else, which is the safe default. Never copy this job
+  # into a production spec with DEMO_SEED set.
+  - name: migrate-and-seed
+    kind: POST_DEPLOY
+    dockerfile_path: backend/Dockerfile
+    source_dir: /
+    github:
+      repo: FutureBuildAIinc/gable-ai-lm
+      branch: main
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    # sh -c is required: App Platform splits run_command on whitespace and
+    # passes argv to the first binary directly, so a bare `./migrate && ./seed`
+    # would not chain.
+    #
+    # `set -e` so a failed migration fails the job instead of falling through
+    # to the seed. Quoting is deliberately one level deep — outer single
+    # quotes, inner double quotes only around the variable — because nested
+    # escapes through YAML and then through App Platform's argv handling are
+    # exactly the kind of thing that breaks silently.
+    run_command: sh -c 'set -e; ./migrate; if [ "$DEMO_SEED" = true ]; then echo seeding demo data; ./seed; else echo skipping demo seed, DEMO_SEED is not true; fi'
+    envs:
+      # migrate/seed load the same config as the server, so AUTH_MODE=dev keeps
+      # the job off the fail-closed path (it requires SESSION_SECRET otherwise).
+      # The job serves no HTTP, so this is not an exposure — but it is also a
+      # workaround: the real fix is for the migrate/seed commands to load only
+      # the config they actually need. Tracked in ROADMAP.md.
+      - key: AUTH_MODE
+        value: dev
+
+      # ⚠️ Demo data. Set to "true" ONLY on environments whose data is
+      # disposable. Remove it (or set anything else) and the seed is skipped.
+      - key: DEMO_SEED
+        value: "true"
+
+      - key: DATABASE_URL
+        value: ${ai-lm-pg-staging.DATABASE_URL}
+        scope: RUN_TIME
+        type: SECRET
+
+databases:
+  - name: ai-lm-pg-staging
+    engine: PG
+    version: "16"
+    production: true
+    cluster_name: ai-lm-pg-staging
+    db_name: ai_lm_staging
+    db_user: ai_lm_user

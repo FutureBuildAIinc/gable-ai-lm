@@ -1,0 +1,114 @@
+version = 1
+
+# AI_LM per-component licensing, in the REUSE 3.x machine-readable form.
+# This file mirrors LICENSE-MAP.md; when the two disagree, fix both.
+#
+# AI_LM is a Community-Source *satellite* of the Gable ecosystem, so its map is
+# much flatter than the host repo's. There is no Commons/Surface/Connector
+# split here: the whole product — Go backend, Lit frontend, SQL migrations,
+# deployment manifests — is one Licensed Work under
+# LicenseRef-OpenLBM-Community-Source-1.0. Prose and repo plumbing are
+# LicenseRef-OpenLBM-Docs-1.0. That is the entire map.
+#
+# Every file in the tree already carries a matching SPDX header (or a `.license`
+# sidecar, for formats that cannot hold a comment). The annotations below are a
+# backstop, not the primary mechanism: they mean a file added tomorrow is
+# covered the moment it lands, instead of the day someone remembers to paste a
+# header into it. `reuse lint` is happy either way; the belt-and-braces exist so
+# the license job in .github/workflows/ci.yml never goes red for a missing
+# header on an otherwise-correct PR.
+#
+# ORDER MATTERS: when a path matches more than one [[annotations]] block, the
+# LAST matching block wins. Nothing here currently relies on that, but keep the
+# broad blocks above the narrow ones if a carve-out is ever added.
+
+# ---------------------------------------------------------------------------
+# The Licensed Work
+# ---------------------------------------------------------------------------
+# Backend service: modules under internal/, shared packages under pkg/, the
+# three commands (server, migrate, seed), SQL migrations, the build manifests
+# that describe them, and the container definition.
+[[annotations]]
+path = [
+  "backend/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 FutureBuild, Inc. and OpenLBM contributors"
+SPDX-License-Identifier = "LicenseRef-OpenLBM-Community-Source-1.0"
+
+# Frontend surface. Unlike the host repo there is no separate Surface license
+# for AI_LM: the Lit app is not an independently licensable component, it is
+# the operator UI of the same Licensed Work and ships with it.
+[[annotations]]
+path = [
+  "app/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 FutureBuild, Inc. and OpenLBM contributors"
+SPDX-License-Identifier = "LicenseRef-OpenLBM-Community-Source-1.0"
+
+# Deployment manifests and local orchestration. These are part of the Licensed
+# Work rather than repo plumbing: they are how an operator *runs* AI_LM, they
+# ship in the same distribution, and a downstream deployer edits them the way
+# they edit code. Their existing SPDX headers already say Community-Source.
+[[annotations]]
+path = [
+  ".do/**",
+  "docker-compose.yml",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 FutureBuild, Inc. and OpenLBM contributors"
+SPDX-License-Identifier = "LicenseRef-OpenLBM-Community-Source-1.0"
+
+# ---------------------------------------------------------------------------
+# Prose
+# ---------------------------------------------------------------------------
+# Root-level documentation. `*.md` matches root-level markdown ONLY — a single
+# `*` does not cross a `/`, so nothing under backend/ or app/ is affected. Using
+# the glob rather than naming README.md, ARCHITECTURE.md, CLAUDE.md, DEVOPS.md,
+# INTEGRATIONS.md, CONTRIBUTING*.md, SECURITY.md, CODE_OF_CONDUCT.md and
+# ROADMAP.md individually means the next document is covered on the day it is
+# written.
+#
+# LICENSE, LICENSES/*, LICENSE-MAP.md and REUSE.toml itself are deliberately
+# absent: the REUSE specification exempts license files and the config file from
+# needing annotation, and listing them here would be a no-op at best.
+#
+# `.do/*.md` is carved back out of the `.do/**` Community-Source block above —
+# the manifests are part of the Licensed Work, the operator notes sitting next
+# to them are prose. This block comes second, and the last matching block wins.
+[[annotations]]
+path = [
+  "*.md",
+  ".do/*.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 FutureBuild, Inc. and OpenLBM contributors"
+SPDX-License-Identifier = "LicenseRef-OpenLBM-Docs-1.0"
+
+# ---------------------------------------------------------------------------
+# Repo plumbing
+# ---------------------------------------------------------------------------
+# CI workflows, the REUSE gate script, issue/PR templates, CODEOWNERS,
+# dependabot config, ignore files, and the Claude contributor kit.
+#
+# These are Docs, not Community-Source, for a specific reason: they are not part
+# of the Licensed Work. Nobody "uses AI_LM in production" by running our GitHub
+# Actions workflow, so applying a license whose central term is a
+# production-use condition to a CI config would be nonsense. They exist to
+# develop *this repository*, and they are licensed the same way the rest of the
+# project's meta-material is. This matches the host repo's REUSE.toml.
+#
+# .claude/** is listed even though .gitignore excludes the directory — the files
+# under it are tracked (they predate the ignore rule), so `reuse lint` still
+# sees them.
+[[annotations]]
+path = [
+  ".github/**",
+  ".claude/**",
+  ".gitignore",
+  ".dockerignore",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 FutureBuild, Inc. and OpenLBM contributors"
+SPDX-License-Identifier = "LicenseRef-OpenLBM-Docs-1.0"

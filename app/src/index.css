@@ -1,0 +1,91 @@
+/* SPDX-License-Identifier: LicenseRef-OpenLBM-Community-Source-1.0 */
+/* SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* MD3 Dark Theme Defaults (Industrial Dark) */
+    --background: 230 20% 5%;
+    /* #0A0B10 Deep Space */
+    --foreground: 210 40% 98%;
+
+    /* Primary: Gable Green #00FFA3 */
+    --primary: 158 100% 50%;
+    --primary-foreground: 230 20% 5%;
+    --primary-container: 158 100% 10%;
+    --on-primary-container: 158 100% 80%;
+
+    /* Secondary: Slate Steel */
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --secondary-container: 217 33% 25%;
+    --on-secondary-container: 210 40% 98%;
+
+    /* Tertiary: Blueprint Blue #38BDF8 */
+    --tertiary: 199 95% 60%;
+    --tertiary-foreground: 230 20% 5%;
+
+    /* Error/Destructive: Safety Red #F43F5E */
+    --destructive: 346 87% 60%;
+    --destructive-foreground: 210 40% 98%;
+
+    /* Neutral Surfaces */
+    --card: 229 19% 11%;
+    --card-foreground: 210 40% 98%;
+    --popover: 229 19% 11%;
+    --popover-foreground: 210 40% 98%;
+
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 158 100% 50%;
+    --accent-foreground: 230 20% 5%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 158 100% 50%;
+
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  *:focus-visible {
+    outline: 2px solid #00FFA3;
+    outline-offset: 2px;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased selection:bg-gable-green/30 selection:text-gable-green;
+  }
+}
+
+@layer utilities {
+  .glass-card {
+    @apply bg-slate-steel/60 backdrop-blur-xl border border-white/5 shadow-elevation-1;
+  }
+
+  .glass-panel {
+    @apply bg-deep-space/80 backdrop-blur-2xl border-r border-white/5;
+  }
+
+  .font-data {
+    @apply font-mono tracking-tight;
+  }
+
+  .animate-enter {
+    @apply animate-fade-in animate-slide-up;
+  }
+}
+
+/* Leaflet dark-tile container styling */
+.leaflet-container {
+  background: #0A0B10;
+}

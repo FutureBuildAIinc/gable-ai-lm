@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: LicenseRef-OpenLBM-Community-Source-1.0
+# SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai_lm_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gable_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gable_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_lm_db}
+    ports:
+      # :5434 matches GableLBM/GableRun so the same local Postgres host port
+      # convention holds across the workspace. AI_LM uses its own database.
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - ai_lm_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gable_user} -d ${POSTGRES_DB:-ai_lm_db}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ai_lm_postgres_data:

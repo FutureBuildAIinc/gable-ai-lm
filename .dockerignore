@@ -1,0 +1,8 @@
+# Build context is the repo root (source_dir: /). Keep local-only artifacts out
+# of the image so `npm ci` resolves a clean tree and Go builds from source.
+**/node_modules
+**/dist
+**/.git
+**/.env
+**/*.log
+**/.DS_Store
