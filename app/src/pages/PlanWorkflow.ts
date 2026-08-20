@@ -1107,16 +1107,51 @@ export class PlanWorkflow extends LitElement {
     return html`
       <div class="glass-card rounded-xl p-4">
         <h2 class="text-sm font-semibold text-zinc-300 mb-3">Axle Loads</h2>
+        ${lp.profile_status === 'INCOMPLETE'
+          ? html`<div
+              class="mb-3 px-3 py-2 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-xs flex gap-2"
+            >
+              ${icon(AlertTriangle, 14)}
+              <span>
+                Fleet profile incomplete — these weight verdicts are not trustworthy.
+                ${lp.profile_issues && lp.profile_issues.length > 0
+                  ? html`<ul class="mt-1 list-disc list-inside text-safety-red/80">
+                      ${lp.profile_issues.map((i) => html`<li>${i}</li>`)}
+                    </ul>`
+                  : nothing}
+              </span>
+            </div>`
+          : nothing}
         <div class="space-y-3">
           ${lp.axle_loads.map((a) => {
-            const pct = Math.min(a.utilization * 100, 120);
-            const barColor = a.status === 'FAIL' ? 'bg-safety-red' : a.status === 'WARN' ? 'bg-amber-warn' : 'bg-gable-green';
+            // An UNKNOWN axle has no rating, so `utilization` is 0 for want of a
+            // denominator — not because the axle is empty. Never draw it as a
+            // (green, 0%-wide) pass; draw a full-width neutral track instead so
+            // it reads as "not judged" rather than "judged fine".
+            const unrated = a.status === 'UNKNOWN';
+            const pct = unrated ? 100 : Math.min(a.utilization * 100, 120);
+            const barColor = unrated
+              ? 'bg-zinc-500/40 border border-dashed border-zinc-400/50'
+              : a.status === 'FAIL'
+                ? 'bg-safety-red'
+                : a.status === 'WARN'
+                  ? 'bg-amber-warn'
+                  : 'bg-gable-green';
+            const textColor = unrated
+              ? 'text-zinc-400'
+              : a.status === 'FAIL'
+                ? 'text-safety-red'
+                : a.status === 'WARN'
+                  ? 'text-amber-warn'
+                  : 'text-zinc-300';
             return html`
               <div>
                 <div class="flex justify-between text-xs mb-1">
                   <span class="text-zinc-400">Axle ${a.axle_number}</span>
-                  <span class="font-mono ${a.status === 'FAIL' ? 'text-safety-red' : a.status === 'WARN' ? 'text-amber-warn' : 'text-zinc-300'}">
-                    ${a.weight_lbs.toLocaleString()} / ${a.max_weight_lbs.toLocaleString()} lb
+                  <span class="font-mono ${textColor}">
+                    ${unrated
+                      ? html`${a.weight_lbs.toLocaleString()} lb / UNRATED — cannot be judged`
+                      : html`${a.weight_lbs.toLocaleString()} / ${a.max_weight_lbs.toLocaleString()} lb`}
                   </span>
                 </div>
                 <div class="h-2.5 w-full rounded-full bg-white/5 overflow-hidden">

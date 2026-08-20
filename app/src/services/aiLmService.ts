@@ -125,12 +125,24 @@ export interface Placement {
   step?: number; // 1-based physical packing order
 }
 
+// AxleLoad mirrors internal/load.AxleLoad.
+//
+// `status` is FOUR-valued, not three. UNKNOWN means the fleet profile never
+// supplied a rating for this axle, so its load cannot be judged at all — it is
+// NOT a degraded PASS, and `utilization` is 0 in that case purely because there
+// is no denominator. Any UI that keys a colour map off `status` must handle
+// UNKNOWN explicitly; falling through to the PASS branch paints an unjudgeable
+// axle green (see load/model.go, "StatusUnknown is NOT a degraded PASS").
+//
+// `advisory` is always true from the solver: the per-axle split is a planning
+// aid, not a certified scale ticket.
 export interface AxleLoad {
   axle_number: number;
   weight_lbs: number;
   max_weight_lbs: number;
   utilization: number;
-  status: 'PASS' | 'WARN' | 'FAIL';
+  status: 'PASS' | 'WARN' | 'FAIL' | 'UNKNOWN';
+  advisory?: boolean;
 }
 
 export interface Strap {
@@ -163,9 +175,19 @@ export interface LoadPlan {
   total_weight_lbs: number;
   axle_loads: AxleLoad[];
   balance_score: number;
+  // Overall weight verdict. Deliberately three-valued even though a per-axle
+  // status can be UNKNOWN: load/model.go collapses UNKNOWN to FAIL here
+  // ("blocking, and never PASS") and carries the reason on profile_status /
+  // profile_issues below.
   gvw_status: 'PASS' | 'WARN' | 'FAIL';
   unplaced: string[];
   max_load_height_in?: number;
+  // Fleet-profile completeness (load/model.go Plan.ProfileStatus). INCOMPLETE
+  // means a blank axle rating, a blank GVWR or no axles at all, and every weight
+  // verdict on this plan is therefore untrustworthy — profile_issues names each
+  // defect. Omitted by older backends, hence optional.
+  profile_status?: 'COMPLETE' | 'INCOMPLETE';
+  profile_issues?: string[];
   // Volume budget (T2-2).
   bed_volume_cuft?: number;
   usable_volume_cuft?: number;
