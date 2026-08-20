@@ -53,24 +53,14 @@ export async function fetchWithAuth(
       externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
     }
 
+    let response: Response;
     try {
-      const response = await fetch(url, {
+      response = await fetch(url, {
         ...fetchOpts,
         headers,
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
-
-      if (response.status === 401) {
-        localStorage.removeItem('token');
-        const path = window.location.pathname;
-        if (!path.endsWith('/login')) {
-          window.location.href = '/login';
-        }
-        throw new Error('Session expired');
-      }
-
-      return response;
     } catch (err) {
       clearTimeout(timeoutId);
       lastError = err instanceof Error ? err : new Error(String(err));
@@ -82,7 +72,25 @@ export async function fetchWithAuth(
       if (attempt < retries && lastError.name !== 'AbortError') {
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
       }
+      continue;
     }
+
+    // Session expiry is TERMINAL, not transient. This throw deliberately sits
+    // outside the try above: raising it from inside would let the generic
+    // network-failure catch sleep RETRY_DELAY and re-issue the request against
+    // the token we just discarded. This wrapper also carries
+    // POST /workflow/plans/{id}/push, so a retried 401 fires the ERP
+    // write-back twice.
+    if (response.status === 401) {
+      localStorage.removeItem('token');
+      const path = window.location.pathname;
+      if (!path.endsWith('/login')) {
+        window.location.href = '/login';
+      }
+      throw new Error('Session expired');
+    }
+
+    return response;
   }
 
   throw lastError!;

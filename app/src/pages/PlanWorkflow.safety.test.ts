@@ -287,15 +287,14 @@ describe('PlanWorkflow — fleet-profile completeness', () => {
     expect(text(axleCard(el))).toContain('Axle 1');
   });
 
-  // BUG (app/src/pages/PlanWorkflow.ts:1155-1157): the balance score is rendered
-  // as a flat percentage with no reference to profile completeness. When the
-  // profile is INCOMPLETE the solver deliberately leaves BalanceScore at 0
-  // ("not computable — left at 0 alongside ProfileIncomplete",
-  // backend/internal/load/solver.go), so the panel reads "Balance score 0%",
-  // which a dispatcher reads as "catastrophically unbalanced" rather than
-  // "not measured". Fix: render "—" (or "not computed") when
-  // profile_status === 'INCOMPLETE', the same way the axle rating now does.
-  it.fails('does not report a computed balance score for an unjudgeable profile', async () => {
+  // The balance score must never be rendered as a flat percentage without
+  // reference to profile completeness. When the profile is INCOMPLETE the solver
+  // deliberately leaves BalanceScore at 0 ("not computable — left at 0 alongside
+  // ProfileIncomplete", backend/internal/load/solver.go), and a panel reading
+  // "Balance score 0%" tells a dispatcher "catastrophically unbalanced" when the
+  // truth is "not measured". It renders "— not computed" instead, the same way
+  // an unrated axle does.
+  it('does not report a computed balance score for an unjudgeable profile', async () => {
     const el = await packStep((lp) => {
       lp.profile_status = 'INCOMPLETE';
       lp.profile_issues = ['fleet profile has no axles — per-axle load cannot be computed'];

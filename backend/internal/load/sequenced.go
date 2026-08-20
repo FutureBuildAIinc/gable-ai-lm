@@ -42,6 +42,15 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 		bedH = math.Inf(1) // open bed: no configured height cap
 	}
 
+	// Volume budget (T2-2): the bed envelope alone over-states what a truck can
+	// really carry, because banding gaps, dunnage and irregular stock are not in
+	// the bounding boxes. Enforce the usable-volume budget as a hard cap
+	// alongside the geometry so a high-volume / low-weight load is capped by
+	// space, not just by weight. The assignment step already sizes trucks with
+	// the same UsableBedVolumeCuFt budget, so packing and assignment agree.
+	usableVol := UsableBedVolumeCuFt(v.BedLengthIn, v.BedWidthIn, v.BedHeightIn)
+	var placedVol float64
+
 	step := 0
 	tierBase := 0.0 // bottom of the current stop's tier
 	// SKU of the non-stackable article sealing the top of the load, if any.
@@ -91,7 +100,20 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 			}
 
 			remaining := qty
+			unitVol := itemVolumeCuFt(it)
 			for remaining > 0 {
+				// Hard volume cap: how many more units of this article the
+				// usable-volume budget still has room for.
+				volRoom := remaining
+				if usableVol > 0 && unitVol > 0 {
+					volRoom = int(math.Floor((usableVol - placedVol) / unitVol))
+					if volRoom <= 0 {
+						plan.Unplaced = append(plan.Unplaced,
+							fmt.Sprintf("%s ×%d (bed volume full)", it.SKU, remaining))
+						break
+					}
+				}
+
 				headroom := bedH - level
 				cols, layers := bundleShape(remaining, it, v, headroom)
 				if cols == 0 {
@@ -141,6 +163,9 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 				if count > remaining {
 					count = remaining
 				}
+				if count > volRoom {
+					count = volRoom
+				}
 				placed := 0
 				for layer := 0; layer < layers && placed < count; layer++ {
 					for col := 0; col < cols && placed < count; col++ {
@@ -164,6 +189,7 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 					}
 				}
 				remaining -= placed
+				placedVol += float64(placed) * unitVol
 				if placed > 0 && !it.Stackable {
 					// Nothing may be laid over this article: seal the level
 					// (no rise within this tier) and the tier (no tier on top).
@@ -245,10 +271,18 @@ func bundleShape(qty int, it Item, v Vehicle, headroomIn float64) (cols, layers 
 	if maxCols < 1 {
 		return 0, 0
 	}
-	hCap := math.Min(maxBundleHeightIn, headroomIn)
-	maxLayers := int(hCap / it.HeightIn)
+	// maxBundleHeightIn caps how tall a BAND may be; headroomIn caps what still
+	// fits above the current level. An article taller than the band cap is not
+	// unplaceable — it simply is never banded, so it is laid one unit high
+	// whenever the remaining headroom takes it. Conflating the two caps made
+	// every article over 30 in tall (a 40 in stone step, a crated window) report
+	// "truck full" on an empty bed.
+	maxLayers := int(math.Min(maxBundleHeightIn, headroomIn) / it.HeightIn)
 	if maxLayers < 1 {
-		return 0, 0
+		if it.HeightIn > headroomIn {
+			return 0, 0 // genuinely no headroom left for even one unit
+		}
+		maxLayers = 1
 	}
 	if !it.Stackable {
 		maxLayers = 1

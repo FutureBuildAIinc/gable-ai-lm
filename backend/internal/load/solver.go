@@ -21,139 +21,41 @@ const (
 	failUtilization = 1.00
 )
 
-// ShelfSolver is the MVP deterministic placement heuristic. It lays unit boxes
-// in rows across the bed width, advancing along the bed length, stacking a
-// second layer for stackable items when height allows. Weight is distributed to
-// axles by longitudinal position using linear interpolation between the two
-// bracketing axles.
-type ShelfSolver struct{}
+// TieredSolver is THE placement engine. It satisfies the single-shot Solver
+// interface (one bag of items, no delivery sequence) by packing that bag as a
+// single tier through SolveSequencedBundles — the same multi-tier bundle packer
+// the multi-stop /plan workflow uses.
+//
+// There used to be two engines: a "shelf" heuristic behind
+// POST /api/v1/load/optimize and the tiered packer behind the /plan workflow.
+// They produced materially different plans for the same truck, and the shelf
+// heuristic could not physically stack at all — it raised a unit's Z while its
+// Y cursor kept advancing, so a "second layer" floated beside its row with
+// nothing beneath it. Worse, every physical-safety rule (stackability, bed
+// envelope, volume budget) had to be implemented and fixed twice. There is now
+// one engine, so a self-hoster wiring the documented endpoint gets exactly the
+// plan the production workflow would build.
+type TieredSolver struct{}
+
+// NewTieredSolver returns the deterministic tier/bundle placement engine.
+func NewTieredSolver() *TieredSolver { return &TieredSolver{} }
+
+// ShelfSolver is the previous name of the single engine.
+//
+// Deprecated: the shelf heuristic is gone; this is an alias for TieredSolver
+// kept so existing wiring keeps compiling. Use TieredSolver.
+type ShelfSolver = TieredSolver
 
 // NewShelfSolver returns the default deterministic solver.
-func NewShelfSolver() *ShelfSolver { return &ShelfSolver{} }
+//
+// Deprecated: use NewTieredSolver.
+func NewShelfSolver() *ShelfSolver { return NewTieredSolver() }
 
-// unit is a single expanded box (one quantity of an item).
-type unit struct {
-	item  Item
-	index int
-}
-
-func (s *ShelfSolver) Solve(v Vehicle, items []Item) Plan {
-	plan := Plan{
-		GableVehicleID: v.GableVehicleID,
-		Placements:     []Placement{},
-		AxleLoads:      []AxleLoad{},
-		Unplaced:       []string{},
-	}
-
-	// Expand items into individual unit boxes.
-	var units []unit
-	for _, it := range items {
-		qty := it.Quantity
-		if qty <= 0 {
-			qty = 1
-		}
-		for i := 0; i < qty; i++ {
-			units = append(units, unit{item: it})
-		}
-	}
-
-	// Heaviest first improves stability (heavy on the bottom layer) and yields a
-	// deterministic order. Tie-break on SKU for determinism.
-	sort.SliceStable(units, func(i, j int) bool {
-		if units[i].item.WeightLbs != units[j].item.WeightLbs {
-			return units[i].item.WeightLbs > units[j].item.WeightLbs
-		}
-		return units[i].item.SKU < units[j].item.SKU
-	})
-
-	// Shelf packing cursor.
-	var cursorX float64   // current row start along length
-	var cursorY float64   // current position across width
-	var rowDepth float64  // max length of items in current row
-	var rowHeight float64 // max height in current row (for stacking ceiling)
-	// rowBaseStackable is false once ANY non-stackable article sits in the
-	// current row's base layer: nothing may then be laid over that row.
-	rowBaseStackable := true
-
-	// Volume budget (T2-2): enforce the bed's usable volume as a hard cap
-	// alongside the bed-envelope geometry, so a high-volume / low-weight load is
-	// capped by space, not just weight.
-	usableVol := UsableBedVolumeCuFt(v.BedLengthIn, v.BedWidthIn, v.BedHeightIn)
-	var placedVol float64
-
-	for _, u := range units {
-		it := u.item
-		if it.LengthIn <= 0 || it.WidthIn <= 0 || it.HeightIn <= 0 {
-			plan.Unplaced = append(plan.Unplaced, it.SKU+" (no geometry)")
-			continue
-		}
-
-		// Hard volume cap: stop placing once the usable bed volume is consumed.
-		if uvol := itemVolumeCuFt(it); usableVol > 0 && placedVol+uvol > usableVol {
-			plan.Unplaced = append(plan.Unplaced, it.SKU+" (bed volume full)")
-			continue
-		}
-
-		// Wrap to a new row when the item exceeds remaining width.
-		if cursorY+it.WidthIn > v.BedWidthIn {
-			cursorX += rowDepth
-			cursorY = 0
-			rowDepth = 0
-			rowHeight = 0
-			rowBaseStackable = true
-		}
-
-		// Out of bed length → cannot place.
-		if cursorX+it.LengthIn > v.BedLengthIn {
-			plan.Unplaced = append(plan.Unplaced, it.SKU)
-			continue
-		}
-
-		z := 0.0
-		// Stack a second layer only when this article may be stacked AND the row
-		// beneath may be stacked upon — never over a slab, crate or PT post.
-		if it.Stackable && rowBaseStackable && rowHeight > 0 && rowHeight+it.HeightIn <= v.BedHeightIn {
-			z = rowHeight
-		}
-
-		p := Placement{
-			ItemID:    it.ProductID,
-			SKU:       it.SKU,
-			X:         cursorX,
-			Y:         cursorY,
-			Z:         z,
-			LengthIn:  it.LengthIn,
-			WidthIn:   it.WidthIn,
-			HeightIn:  it.HeightIn,
-			WeightLbs: it.WeightLbs,
-			AxleGroup: nearestAxle(v.Axles, cursorX+it.LengthIn/2),
-		}
-		plan.Placements = append(plan.Placements, p)
-		placedVol += itemVolumeCuFt(it)
-
-		cursorY += it.WidthIn
-		if it.LengthIn > rowDepth {
-			rowDepth = it.LengthIn
-		}
-		if z == 0 {
-			if it.HeightIn > rowHeight {
-				rowHeight = it.HeightIn
-			}
-			if !it.Stackable {
-				rowBaseStackable = false
-			}
-		}
-	}
-
-	computeAxleLoads(&plan, v)
-	computeVolume(&plan, v)
-	for _, p := range plan.Placements {
-		if top := p.Z + p.HeightIn; top > plan.MaxLoadHeightIn {
-			plan.MaxLoadHeightIn = top
-		}
-	}
-	computeSecurement(&plan, v)
-	return plan
+// Solve packs items onto the vehicle as one synthetic stop. Placements carry
+// their 1-based pack Step; OrderID and StopSequence are left unset because a
+// single-shot solve has no delivery sequence to express.
+func (s *TieredSolver) Solve(v Vehicle, items []Item) Plan {
+	return SolveSequencedBundles(v, []StopItems{{Items: items}})
 }
 
 // computeAxleLoads distributes cargo + tare weight across axles, sets each

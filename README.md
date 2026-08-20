@@ -35,9 +35,12 @@ its artifacts so a run can be resumed or replayed:
 | **4. Route Review** | Check every route against restricted points (bridge weight limits, overpass clearances) and auto-resolve flags by rerouting or re-balancing across trucks. |
 | **5. Manifest & Push** | Write the final routes and packing manifests back to the ERP's dispatch board. |
 
-**3D load solving.** A deterministic shelf-packing solver places each item in
-inches from the front-left-floor corner of the bed, respecting stackability and
-a usable-volume budget. The frontend renders the result with Three.js at
+**3D load solving.** A single deterministic tier/bundle packer places each item
+in inches from the front-left-floor corner of the bed, respecting stackability
+and a usable-volume budget. `POST /api/v1/load/optimize` and the guided workflow
+run the same engine — the standalone endpoint packs its items as one synthetic
+stop — so an integrator wiring the documented API gets exactly the plan the UI
+would build. The frontend renders the result with Three.js at
 **1 inch = 1/12 world unit** — the same render contract as GableLBM's product
 twin, so a board is the same size in both applications.
 

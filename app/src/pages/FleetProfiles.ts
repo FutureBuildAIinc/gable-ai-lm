@@ -58,18 +58,60 @@ export class FleetProfiles extends LitElement {
     };
   }
 
+  /**
+   * A cleared numeric box is UNSET, not zero. `Number('')` is 0, and the load
+   * solver reads a 0 GVWR or a 0 axle rating as "unrated" — so one stray
+   * backspace here would silently turn every future load plan for that truck
+   * into a confident green PASS. Blank maps to undefined (as the sibling
+   * CompliancePoints form does) and `_blankRatings()` refuses the save until
+   * the operator supplies a real number.
+   */
+  private static _num(value: string): number | undefined {
+    return value.trim() === '' ? undefined : Number(value);
+  }
+
   private _setField(field: keyof ProfileInput, value: string) {
     if (!this._draft) return;
-    const v = field === 'name' ? value : Number(value);
+    const v = field === 'name' ? value : FleetProfiles._num(value);
     this._draft = { ...this._draft, [field]: v } as ProfileInput;
   }
 
   private _setAxle(idx: number, field: keyof Omit<Axle, 'id'>, value: string) {
     if (!this._draft) return;
     const axles = [...this._draft.axles];
-    const v = field === 'axle_type' ? value : Number(value);
-    axles[idx] = { ...axles[idx], [field]: v };
+    const v = field === 'axle_type' ? value : FleetProfiles._num(value);
+    axles[idx] = { ...axles[idx], [field]: v } as Omit<Axle, 'id'>;
     this._draft = { ...this._draft, axles };
+  }
+
+  /** Names every rating the operator has left blank, for the save guard. */
+  private _blankRatings(): string[] {
+    const d = this._draft;
+    if (!d) return [];
+    const missing: string[] = [];
+    const need: [string, number | undefined][] = [
+      ['Bed length', d.bed_length_in],
+      ['Bed width', d.bed_width_in],
+      ['Bed height', d.bed_height_in],
+      ['GVWR', d.gvwr_lbs],
+      ['Tare weight', d.tare_weight_lbs],
+    ];
+    for (const [label, v] of need) {
+      if (v === undefined || v === null || Number.isNaN(v)) missing.push(label);
+    }
+    d.axles.forEach((a, i) => {
+      if (a.max_weight_lbs === undefined || a.max_weight_lbs === null || Number.isNaN(a.max_weight_lbs)) {
+        missing.push(`Axle ${a.axle_number ?? i + 1} max weight`);
+      }
+      if (
+        a.position_from_front_in === undefined ||
+        a.position_from_front_in === null ||
+        Number.isNaN(a.position_from_front_in)
+      ) {
+        missing.push(`Axle ${a.axle_number ?? i + 1} position`);
+      }
+    });
+    return missing;
   }
 
   private _addAxle() {
@@ -88,6 +130,17 @@ export class FleetProfiles extends LitElement {
 
   private async _save() {
     if (!this._draft || !this._selectedId) return;
+    // Refuse rather than send a blank rating: the endpoint is a whole-profile
+    // replace and an omitted number lands in the database as 0, which the
+    // solver reads as "unrated" and reports as a confident PASS.
+    const missing = this._blankRatings();
+    if (missing.length > 0) {
+      this._saved = false;
+      this._error =
+        `Cannot save with a blank rating — the solver reads a blank as unrated and would ` +
+        `report a false PASS. Enter a value for: ${missing.join(', ')}.`;
+      return;
+    }
     this._saving = true;
     this._error = '';
     this._saved = false;
@@ -102,13 +155,23 @@ export class FleetProfiles extends LitElement {
     }
   }
 
-  private _numInput(label: string, field: keyof ProfileInput, value: number, unit: string) {
+  /** Renders a cleared/unset number as an empty box, never the string "undefined". */
+  private static _numValue(value: number | undefined | null): string {
+    return value === undefined || value === null || Number.isNaN(value) ? '' : String(value);
+  }
+
+  private _numInput(
+    label: string,
+    field: keyof ProfileInput,
+    value: number | undefined,
+    unit: string,
+  ) {
     return html`
       <label class="flex flex-col gap-1 text-xs text-zinc-400">
         ${label} <span class="text-zinc-600">(${unit})</span>
         <input
           type="number"
-          .value=${String(value)}
+          .value=${FleetProfiles._numValue(value)}
           @change=${(e: Event) => this._setField(field, (e.target as HTMLInputElement).value)}
           class="bg-deep-space border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-white focus:outline-none focus:ring-1 focus:ring-gable-green/50"
         />
@@ -192,12 +255,12 @@ export class FleetProfiles extends LitElement {
                               <tr class="border-b border-white/5">
                                 <td class="py-1.5 pr-2 font-mono text-zinc-400">${a.axle_number}</td>
                                 <td class="py-1.5 px-2">
-                                  <input type="number" .value=${String(a.max_weight_lbs)}
+                                  <input type="number" .value=${FleetProfiles._numValue(a.max_weight_lbs)}
                                     @change=${(e: Event) => this._setAxle(idx, 'max_weight_lbs', (e.target as HTMLInputElement).value)}
                                     class="bg-deep-space border border-white/10 rounded px-2 py-1 text-right font-mono w-24 text-white focus:outline-none focus:ring-1 focus:ring-gable-green/50" />
                                 </td>
                                 <td class="py-1.5 px-2">
-                                  <input type="number" .value=${String(a.position_from_front_in)}
+                                  <input type="number" .value=${FleetProfiles._numValue(a.position_from_front_in)}
                                     @change=${(e: Event) => this._setAxle(idx, 'position_from_front_in', (e.target as HTMLInputElement).value)}
                                     class="bg-deep-space border border-white/10 rounded px-2 py-1 text-right font-mono w-24 text-white focus:outline-none focus:ring-1 focus:ring-gable-green/50" />
                                 </td>

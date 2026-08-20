@@ -71,36 +71,49 @@ func TestSolveFlagsOverweightGVW(t *testing.T) {
 	}
 }
 
-// TestShelfSolverDoesNotRaiseOverNonStackableRow verifies the legacy solver's
-// second-layer rule checks the row it would lift over, not only whether the
-// incoming article is itself stackable.
+// TestShelfSolverDoesNotRaiseOverNonStackableRow verifies the single-shot
+// Solver surface (POST /api/v1/load/optimize) honours Item.Stackable in BOTH
+// directions: material that will not fit beside a non-stackable article is
+// reported unplaced rather than raised on top of it.
 //
-// ShelfSolver gives every unit its own Y slot, so this never produced a true
-// footprint overlay; it raised the Z of a unit above the top of a slab in the
-// same row, which is still wrong to render in the 3D twin.
+// The bed is shortened to one article-length row so the packer's only remaining
+// move is upward — which is exactly what the stackability seal must refuse.
 func TestShelfSolverDoesNotRaiseOverNonStackableRow(t *testing.T) {
 	v := testVehicle()
+	v.BedLengthIn = 48 // one row deep: the only way to fit more is to stack
+
 	items := []Item{
-		{ProductID: "slab", SKU: "STONE-SLAB", Quantity: 1, LengthIn: 48, WidthIn: 48, HeightIn: 12, WeightLbs: 500, Stackable: false},
-		{ProductID: "p1", SKU: "2x4", Quantity: 1, LengthIn: 48, WidthIn: 48, HeightIn: 12, WeightLbs: 100, Stackable: true},
+		{ProductID: "slab", SKU: "STONE-SLAB", Quantity: 2, LengthIn: 48, WidthIn: 48, HeightIn: 12, WeightLbs: 500, Stackable: false},
+		{ProductID: "p1", SKU: "2x4", Quantity: 2, LengthIn: 48, WidthIn: 48, HeightIn: 12, WeightLbs: 100, Stackable: true},
 	}
 	plan := NewShelfSolver().Solve(v, items)
 
-	if len(plan.Placements) != 2 {
-		t.Fatalf("expected both units placed, got %d (unplaced %v)", len(plan.Placements), plan.Unplaced)
-	}
 	for _, p := range plan.Placements {
 		if p.Z != 0 {
-			t.Errorf("%s raised to z=%.1f over a row whose base layer is a non-stackable slab", p.SKU, p.Z)
+			t.Errorf("%s raised to z=%.1f over a deck sealed by a non-stackable slab", p.SKU, p.Z)
 		}
 	}
+	assertNoOverlayOnNonStackable(t, plan, "STONE-SLAB")
+	sealed := false
+	for _, u := range plan.Unplaced {
+		if strings.Contains(u, "cannot stack on non-stackable") {
+			sealed = true
+		}
+	}
+	if !sealed {
+		t.Errorf("expected the blocked lumber to be reported unplaced with a stackability reason, got %v", plan.Unplaced)
+	}
 
-	// Control: a stackable base row still carries a second layer, so the guard
-	// is about stackability and not about disabling stacking outright. (That the
-	// raised unit lands in its own Y slot rather than truly on the row below is a
-	// separate known defect — see TestShelfSolverSecondLayerIsSupported.)
+	// Control: the ONLY thing keeping that lumber off the truck is stackability,
+	// so the guard is about stackability and not about disabling stacking
+	// outright. With a stackable base the same load packs in full, on a real
+	// second layer.
 	items[0].Stackable = true
 	ctl := NewShelfSolver().Solve(v, items)
+	if len(ctl.Placements) != 4 {
+		t.Fatalf("control: expected all 4 units packed on a stackable base, got %d (unplaced %v)",
+			len(ctl.Placements), ctl.Unplaced)
+	}
 	raised := false
 	for _, p := range ctl.Placements {
 		if p.Z > 0 {
@@ -116,17 +129,24 @@ func TestShelfSolverDoesNotRaiseOverNonStackableRow(t *testing.T) {
 // unit raised off the deck rests on something: its footprint must overlap a unit
 // below it.
 func TestShelfSolverSecondLayerIsSupported(t *testing.T) {
-	t.Skip("KNOWN BUG: ShelfSolver raises Z for the second layer while the Y cursor keeps advancing, " +
-		"so a 'stacked' unit gets its own Y slot and floats beside the row instead of sitting on it. " +
-		"No unit ever overlaps another in XY, so the legacy /api/v1/load/optimize engine cannot stack at all. " +
-		"Fixing it means giving ShelfSolver a real layer model or routing that endpoint through the tiered " +
-		"packer (the 'two placement engines diverge' gap) — out of scope for the stackability fix.")
-
 	v := testVehicle()
 	items := []Item{
 		{ProductID: "p1", SKU: "2x4", Quantity: 2, LengthIn: 48, WidthIn: 48, HeightIn: 12, WeightLbs: 100, Stackable: true},
 	}
 	plan := NewShelfSolver().Solve(v, items)
+
+	// The two units must genuinely be banded one on top of the other, not laid
+	// side by side — otherwise the support check below is vacuous.
+	raised := 0
+	for _, p := range plan.Placements {
+		if p.Z > 0 {
+			raised++
+		}
+	}
+	if raised == 0 {
+		t.Fatalf("expected the second stackable unit to be banded on top of the first, got %+v", plan.Placements)
+	}
+
 	for i, p := range plan.Placements {
 		if p.Z == 0 {
 			continue

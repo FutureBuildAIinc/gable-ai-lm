@@ -694,16 +694,14 @@ describe('PlanWorkflow — step 5 manifest and push', () => {
     );
   });
 
-  // KNOWN BUG (app/src/pages/PlanWorkflow.ts:1375-1403): the push gate looks at
-  // `compliance.status` and the proof/sign-off only. A truck whose own load plan
-  // came back `gvw_status: 'FAIL'` — over its GVWR or an axle rating — is still
-  // pushable as long as its route crosses no restricted point, and the manifest
-  // card shows nothing about it. This mirrors the backend gate
-  // (internal/workflow/service.go Push), which checks restricted-point FAIL and
-  // Proof.Ready() but never LoadPlan.GVWStatus or LoadPlan.Unplaced. The product
-  // is sold on GVW enforcement, so an over-GVW truck must not be one click from
-  // the dispatch board.
-  it.fails('blocks the push while a truck is over its own GVW/axle rating', async () => {
+  // The push gate must judge each truck's OWN capacity, not just its route: a
+  // truck whose load plan came back `gvw_status: 'FAIL'` — over its GVWR or an
+  // axle rating — must not be one click from the dispatch board merely because
+  // its route crosses no restricted point. The UI mirrors the backend gate
+  // (internal/workflow/service.go blockingCapacityReasons /
+  // capacityStatusClears) and mirrors its WHITELIST semantics, so a status
+  // value neither side has seen before fails closed on both.
+  it('blocks the push while a truck is over its own GVW/axle rating', async () => {
     const el = await mountPlan(); // loads[0].load_plan.gvw_status === 'FAIL'
 
     const push = Array.from(el.querySelectorAll('button')).find((b) =>
@@ -713,12 +711,13 @@ describe('PlanWorkflow — step 5 manifest and push', () => {
     expect(push.disabled).toBe(true);
   });
 
-  // KNOWN BUG (same gate): `load_plan.unplaced` lists SKUs the packer could not
-  // physically fit. Step 3 shows them; the step-5 manifest — the sheet the yard
-  // and the ERP receive — lists the ORDERED lines and quantities with no
-  // dropped-cargo callout, so a truck goes out with fewer pieces than the
-  // paperwork claims and nothing says so.
-  it.fails('flags dropped cargo on the manifest', async () => {
+  // `load_plan.unplaced` lists SKUs the packer could not physically fit. The
+  // step-5 manifest — the sheet the yard and the ERP receive — lists the ORDERED
+  // lines and quantities, so without an explicit dropped-cargo callout a truck
+  // goes out with fewer pieces than the paperwork claims and nothing says so.
+  // The backend manifest (workflow buildManifest) emits `unplaced`; this is the
+  // UI half of the same statement.
+  it('flags dropped cargo on the manifest', async () => {
     const el = await mountPlan();
 
     const manifest = Array.from(el.querySelectorAll('.glass-card')).find((c) =>
@@ -730,6 +729,13 @@ describe('PlanWorkflow — step 5 manifest and push', () => {
 
   it('sends the push and re-renders the plan as live once it lands', async () => {
     const p = plan();
+    // The push gate refuses a truck whose OWN capacity is not cleared, and the
+    // shared fixture deliberately ships one that is not (gvw FAIL, axle 2 FAIL,
+    // a dropped SKU). A plan that actually reaches the dispatch board has
+    // cleared all three, so this fixture clears them.
+    p.loads[0].load_plan!.gvw_status = 'PASS';
+    p.loads[0].load_plan!.axle_loads[1].status = 'PASS';
+    p.loads[0].load_plan!.unplaced = [];
     const pushed = { ...p, status: 'PUSHED' as const };
     const fetchMock = vi.fn((_url: string, init: RequestInit = {}) =>
       Promise.resolve(jsonResponse((init.method ?? 'GET') === 'POST' ? pushed : p)),

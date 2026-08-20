@@ -67,6 +67,59 @@ function tomorrow(): string {
 }
 
 /**
+ * Mirrors `capacityStatusClears` in backend/internal/workflow/service.go and
+ * MUST stay identical to it.
+ *
+ * It is deliberately a WHITELIST: PASS is clear and WARN is "loaded near the
+ * rating but still within it". Everything else blocks — FAIL, UNKNOWN, an empty
+ * string (the solver skips the gross check entirely when the profile carries no
+ * GVWR, which would otherwise read as a confident PASS), or any status value a
+ * future solver adds. Enumerating the bad values instead would let a new status
+ * ship as a silent pass on one side of the wire only; fail-closed is the only
+ * correct default for a module sold on GVW/axle enforcement.
+ */
+function capacityStatusClears(status: string | undefined | null): boolean {
+  switch ((status ?? '').trim().toUpperCase()) {
+    case 'PASS':
+    case 'WARN':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Mirrors `statusLabel` in backend/internal/workflow/service.go. */
+function capacityStatusLabel(status: string | undefined | null): string {
+  const s = (status ?? '').trim();
+  return s === '' ? 'UNKNOWN (not evaluated)' : s.toUpperCase();
+}
+
+/**
+ * Mirrors `blockingCapacityReasons` in backend/internal/workflow/service.go:
+ * why one truck's OWN load solve is not clear to dispatch, independent of what
+ * its route crosses. Empty ⇒ the truck's own weight/volume verdict permits
+ * departure.
+ */
+function blockingCapacityReasons(l: TruckLoad): string[] {
+  const lp = l.load_plan;
+  if (!lp) return ['not packed'];
+  const reasons: string[] = [];
+  if (!capacityStatusClears(lp.gvw_status)) {
+    reasons.push(`GVW ${capacityStatusLabel(lp.gvw_status)}`);
+  }
+  for (const a of lp.axle_loads ?? []) {
+    if (!capacityStatusClears(a.status)) {
+      reasons.push(`axle ${a.axle_number} ${capacityStatusLabel(a.status)}`);
+    }
+  }
+  const dropped = lp.unplaced ?? [];
+  if (dropped.length > 0) {
+    reasons.push(`${dropped.length} SKU(s) did not fit and were dropped: ${dropped.join(', ')}`);
+  }
+  return reasons;
+}
+
+/**
  * <ailm-plan-workflow> — the single-page guided dispatch workflow. One stepper
  * carries a delivery date from order ingestion through analysis, truck
  * assignment, LIFO 3D packing, restricted-point review (with AI resolution)
@@ -1163,7 +1216,21 @@ export class PlanWorkflow extends LitElement {
         </div>
         <div class="mt-3 pt-3 border-t border-white/5 flex justify-between text-xs">
           <span class="text-zinc-400">Balance score</span>
-          <span class="font-mono text-blueprint-blue">${(lp.balance_score * 100).toFixed(0)}%</span>
+          ${lp.profile_status === 'INCOMPLETE'
+            ? // Balance is the spread of utilisation across axles, so the solver
+              // leaves it at 0 when the profile cannot be judged at all
+              // ("not computable" — see load/solver.go computeAxleLoads).
+              // Rendering that 0 as a flat "0%" reads as "catastrophically
+              // unbalanced" instead of "not measured", so say so instead — the
+              // same way the axle ratings above do.
+              html`<span
+                class="font-mono text-zinc-400"
+                title="Balance cannot be computed while the fleet profile is incomplete"
+                >— not computed</span
+              >`
+            : html`<span class="font-mono text-blueprint-blue"
+                >${(lp.balance_score * 100).toFixed(0)}%</span
+              >`}
         </div>
         ${lp.usable_volume_cuft
           ? html`<div class="mt-2 flex justify-between text-xs items-center">
@@ -1410,6 +1477,12 @@ export class PlanWorkflow extends LitElement {
     const anyFail = p.loads.some((l) => l.compliance?.status === 'FAIL');
     const proofReady = (l: TruckLoad) => !!l.proof && l.proof.attachments.length > 0 && l.proof.signed_off;
     const notReady = p.loads.filter((l) => !proofReady(l));
+    // A truck over its OWN GVWR/axle rating, or one carrying less than it was
+    // loaded with, must not reach the dispatch board just because its route
+    // crosses no restricted point. Same whitelist the backend Push gate uses.
+    const overCapacity = p.loads
+      .map((l) => ({ load: l, reasons: blockingCapacityReasons(l) }))
+      .filter((x) => x.reasons.length > 0);
     const pushed = p.status === 'PUSHED';
     const ordersById = new Map(p.orders.map((o) => [o.order_id, o]));
     return html`
@@ -1425,12 +1498,17 @@ export class PlanWorkflow extends LitElement {
               </p>
               <button
                 @click=${this._push}
-                ?disabled=${this._busy !== '' || anyFail || notReady.length > 0}
+                ?disabled=${this._busy !== '' ||
+                anyFail ||
+                overCapacity.length > 0 ||
+                notReady.length > 0}
                 title=${anyFail
                   ? 'Resolve all FAIL compliance flags before pushing'
-                  : notReady.length > 0
-                    ? 'Every truck needs yard proof + sign-off before it can depart'
-                    : ''}
+                  : overCapacity.length > 0
+                    ? 'Re-pack or rebalance every truck whose own load capacity is not cleared'
+                    : notReady.length > 0
+                      ? 'Every truck needs yard proof + sign-off before it can depart'
+                      : ''}
                 class="flex items-center gap-2 bg-gable-green text-deep-space font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow transition-all disabled:opacity-40"
               >
                 ${icon(Send, 18)} ${this._busy === 'push' ? 'Pushing…' : 'Push to GableLBM dispatch'}
@@ -1439,6 +1517,19 @@ export class PlanWorkflow extends LitElement {
         ${anyFail && !pushed
           ? html`<div class="px-4 py-2.5 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-sm">
               One or more trucks still FAIL route compliance — go back to Route Review.
+            </div>`
+          : nothing}
+        ${overCapacity.length > 0 && !pushed
+          ? html`<div class="px-4 py-2.5 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-sm">
+              <div class="flex items-center gap-2 font-medium">
+                ${icon(AlertTriangle, 16)}
+                <span>Load capacity not cleared — go back to Pack Loads.</span>
+              </div>
+              <ul class="mt-1 list-disc list-inside text-safety-red/80 text-xs">
+                ${overCapacity.map(
+                  (x) => html`<li>${x.load.vehicle_name}: ${x.reasons.join('; ')}</li>`,
+                )}
+              </ul>
             </div>`
           : nothing}
         ${!anyFail && notReady.length > 0 && !pushed
@@ -1459,6 +1550,12 @@ export class PlanWorkflow extends LitElement {
     const color = STOP_HEX[li % STOP_HEX.length];
     const proofReady = !!l.proof && l.proof.attachments.length > 0 && l.proof.signed_off;
     const hasShots = !!l.proof && l.proof.attachments.length > 0;
+    // `unplaced` is cargo the packer could not physically fit. The stop list
+    // below is the ORDERED lines and quantities, so without this callout the
+    // yard and the ERP both receive a manifest claiming pieces that are not on
+    // the truck. The backend manifest (workflow buildManifest) emits the same
+    // field; surface it here too.
+    const dropped = l.load_plan?.unplaced ?? [];
     return html`
       <div class="glass-card rounded-xl p-5">
         <div class="flex items-center gap-2 mb-1">
@@ -1475,6 +1572,22 @@ export class PlanWorkflow extends LitElement {
               ? 'text-amber-warn border-amber-warn/40'
               : 'text-safety-red border-safety-red/40'}">${l.compliance?.status ?? '—'}</span>
         </div>
+        ${dropped.length > 0
+          ? html`<div
+              class="mb-3 px-3 py-2 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-xs"
+            >
+              <div class="flex items-center gap-2 font-medium">
+                ${icon(AlertTriangle, 13)}
+                <span
+                  >${dropped.length} SKU(s) did not fit and were dropped — this truck ships short
+                  of the lines listed below.</span
+                >
+              </div>
+              <ul class="mt-1 list-disc list-inside text-safety-red/80">
+                ${dropped.map((u) => html`<li>${u}</li>`)}
+              </ul>
+            </div>`
+          : nothing}
         ${this._plan?.status !== 'PUSHED' && !proofReady
           ? html`<div class="mb-3 flex items-center gap-2 text-xs">
               ${hasShots

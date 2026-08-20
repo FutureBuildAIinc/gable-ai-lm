@@ -127,14 +127,13 @@ describe('fetchWithAuth — session expiry', () => {
     expect(localStorage.getItem('token')).toBeNull();
   });
 
-  // KNOWN BUG (app/src/services/fetchClient.ts:64-85): the 401 branch throws
-  // 'Session expired' from inside the try, so the generic catch treats it as a
-  // transient failure — it sleeps RETRY_DELAY (2s) and re-issues the request.
-  // Every expired session therefore costs a duplicate call plus a 2s stall,
-  // and because the same wrapper carries POST /workflow/plans/{id}/push, an
-  // expired session fires the ERP write-back twice. Expiry is a terminal
-  // condition: the loop must break, not retry.
-  it.fails('does not re-issue the request after a 401', async () => {
+  // Session expiry is a TERMINAL condition, not a transient failure. Throwing
+  // 'Session expired' from inside the try would let the generic catch sleep
+  // RETRY_DELAY (2s) and re-issue the request — a duplicate call plus a 2s
+  // stall on every expired session, and because the same wrapper carries
+  // POST /workflow/plans/{id}/push, a duplicated ERP write-back. The 401 check
+  // therefore lives outside the try, so it leaves the retry loop immediately.
+  it('does not re-issue the request after a 401', async () => {
     window.history.replaceState({}, '', '/login');
     localStorage.setItem('token', 'stale');
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));

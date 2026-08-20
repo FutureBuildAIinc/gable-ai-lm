@@ -151,7 +151,7 @@ func main() {
 	catalog.NewHandler(catalogSvc).RegisterRoutes(mux, writeGuard)
 
 	// Load optimization (pillar 1).
-	loadSvc := load.NewService(load.NewRepository(db), fleetSvc, load.NewShelfSolver(),
+	loadSvc := load.NewService(load.NewRepository(db), fleetSvc, load.NewTieredSolver(),
 		cfg.SecurementJurisdiction, cfg.SecurementAnchorSpacingIn)
 	load.NewHandler(loadSvc).RegisterRoutes(mux, writeGuard)
 

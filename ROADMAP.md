@@ -440,15 +440,6 @@ arrives hours after the cause.
 These are real and located, but each is a contained fix rather than a structural
 one:
 
-- **Two placement engines, and the documented one is the weaker.**
-  `POST /api/v1/load/optimize` runs `ShelfSolver`; the guided workflow runs the
-  multi-tier `SolveSequencedBundles`. `ShelfSolver` raises Z for a second layer
-  while its Y cursor keeps advancing, so a "stacked" unit gets its own footprint
-  slot beside the row instead of resting on it — see the skipped
-  `TestShelfSolverSecondLayerIsSupported` in
-  `backend/internal/load/solver_test.go`, which states the defect in full. An
-  integrator wiring the documented API therefore gets materially worse packing
-  than the UI, and every packing fix has to be applied twice.
 - **Securement rulesets are compiled in.** `backend/internal/load/securement_rules.go`
   registers `US_FMCSA` and `CA_NSC` as Go values. Another jurisdiction is a code
   change and a redeploy, which is a poor fit for self-hosting.

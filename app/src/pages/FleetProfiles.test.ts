@@ -231,16 +231,13 @@ describe('FleetProfiles — editing', () => {
     expect(fieldInput(el, 'Bed length').value).toBe('300');
   });
 
-  // KNOWN BUG (app/src/pages/FleetProfiles.ts:61-73): _setField/_setAxle run
-  // every non-name value through Number(), and Number('') is 0. Clearing the
-  // GVWR box (or an axle rating) therefore saves a rating of ZERO rather than
-  // leaving it alone or refusing the save — and the solver treats 0 as
-  // "unrated": load/solver.go skips the GVW check entirely when GVWRLbs <= 0
-  // and utilStatus() returns PASS when MaxWeightLbs <= 0. One stray backspace
-  // in this form turns every future load plan for that truck into a confident
-  // green PASS. Note the sibling form gets this right: CompliancePoints._set
-  // maps '' to undefined so a blank limit is omitted, not zeroed.
-  it.fails('does not save a zero rating when a field is cleared', async () => {
+  // `Number('')` is 0, and the solver treats 0 as "unrated": load/solver.go
+  // reports UNKNOWN (never a confident PASS) for a blank GVWR or axle rating,
+  // and the whole-profile upsert would persist that 0. So a cleared box must
+  // never be sent as a rating of ZERO — _setField/_setAxle map '' to undefined
+  // (as the sibling CompliancePoints._set does) and the save is refused until
+  // the operator supplies a real number.
+  it('does not save a zero rating when a field is cleared', async () => {
     stubFleetApi();
     const el = await mount<FleetProfiles>('ailm-fleet-profiles');
 
