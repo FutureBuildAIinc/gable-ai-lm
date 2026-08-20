@@ -5,14 +5,13 @@ name: CI
 
 on:
   # `main` is the only branch that exists today (it is what .do/app-staging.yaml
-  # deploys). `staging` and `community` are listed ahead of time so the
   # ecosystem's promotion path works the moment those branches are cut, and so
   # nobody has to remember to edit this file first. Filters for branches that do
   # not exist are inert.
   push:
-    branches: [main, staging, community]
+    branches: [main, staging]
   pull_request:
-    branches: [main, staging, community]
+    branches: [main, staging]
   # The nightly trigger exists for the `vulnerabilities` job only: a CVE can
   # land in a dependency without anyone touching the repo, and we want to hear
   # about it then rather than on the next unrelated PR. Every other job is gated
