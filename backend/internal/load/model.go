@@ -13,7 +13,9 @@
 // present advisory numbers as certified.
 //
 // TRUSTWORTHY — Plan.TotalWeightLbs (gross combination weight) is exact: it is
-// the sum of every placed unit's weight plus the profile's tare weight, and
+// the sum of every placed unit's weight, plus any cargo that rides without a
+// placement (Plan.UnmodeledWeightLbs — a dimensionless SKU has nothing to
+// position but still goes on the deck), plus the profile's tare weight.
 // Plan.GVWStatus compares that total against the profile's GVWR. Nothing about
 // longitudinal geometry affects it.
 //
@@ -38,6 +40,29 @@
 //   - Statics only. No dynamic load transfer, no suspension behaviour, and no
 //     tandem-spread / federal bridge-formula legal limits — only each axle's own
 //     rating from the fleet profile.
+//   - Unmodeled cargo. Plan.UnmodeledWeightLbs rides but has no placement, so it
+//     is in the gross and absent from every axle.
+//
+// HOW CALLERS MUST GATE ON THIS. A dispatch gate may HARD-REFUSE on the exact
+// numbers and must NOT hard-refuse on the advisory ones:
+//
+//   - Plan.GVWStatus (gross vs GVWR, and the profile-completeness roll-up) is a
+//     measurement of an exact quantity — block on it.
+//   - An AxleLoad with Advisory=true over its rating is this model's opinion,
+//     computed on a datum it documents as wrong (the steer axle at the bed
+//     origin) and without the overhang lever that would move the answer in
+//     either direction. Surface it loudly — it is the reason to stop at a scale
+//     — but do not refuse on it, because refusing turns an unvalidated estimate
+//     into a hard cap: on the default flatbed profile it caps payload at roughly
+//     half the truck's rating, which trains dispatchers to distrust the module
+//     rather than to weigh the truck. ROADMAP §3 is explicit that per-axle
+//     numbers stay advisory "until validated against certified scale tickets".
+//   - Advisory=false is the seam for that future: a per-axle verdict sourced
+//     from a calibrated/measured profile is a measurement, and a gate may block
+//     on it. The zero value is therefore the blocking one — fail-closed.
+//   - An axle that could not be judged at all (StatusUnknown, or any status a
+//     future solver adds) is a PROFILE defect, not an advisory estimate, and
+//     stays blocking. It also forces Plan.GVWStatus to FAIL — see below.
 //
 // UNKNOWN — when the fleet profile is missing a rating (a zero axle rating, a
 // zero GVWR, or no axles at all) the affected axle status is StatusUnknown and
@@ -134,10 +159,13 @@ const (
 
 // AxleLoad is the computed load on one axle vs its rating.
 //
-// Advisory is always true: the per-axle split is a planning aid, not a certified
-// scale ticket. See the package doc for exactly what the model does and does not
-// account for (bed-origin datum, no overhang reactions, tare split by axle rating
-// rather than chassis CG). Callers MUST NOT present these numbers as certified.
+// Advisory is true for everything this solver produces: the per-axle split is a
+// planning aid, not a certified scale ticket. See the package doc for exactly
+// what the model does and does not account for (bed-origin datum, no overhang
+// reactions, tare split by axle rating rather than chassis CG). Callers MUST NOT
+// present these numbers as certified, and a dispatch gate must warn rather than
+// refuse on an Advisory over-rating — see "HOW CALLERS MUST GATE ON THIS" in the
+// package doc.
 type AxleLoad struct {
 	AxleNumber   int     `json:"axle_number"`
 	WeightLbs    int64   `json:"weight_lbs"`
@@ -168,9 +196,24 @@ type Plan struct {
 	// contract and its consumers key maps by it; the precise reason is on
 	// ProfileStatus/ProfileIssues, which callers should render as
 	// "profile incomplete — results not trustworthy".
-	GVWStatus       string   `json:"gvw_status"` // PASS/WARN/FAIL
-	Unplaced        []string `json:"unplaced"`   // SKUs that did not fit
-	MaxLoadHeightIn float64  `json:"max_load_height_in,omitempty"`
+	GVWStatus string `json:"gvw_status"` // PASS/WARN/FAIL
+
+	// Unplaced is every article the packer did not position, each with a TYPED
+	// reason. The two families are not interchangeable: a capacity reason means
+	// the cargo stays in the yard and the customer ships short, whereas
+	// ReasonNoGeometry means the article has no recorded dimensions to place —
+	// it still rides, it is simply absent from the twin. Callers gating on
+	// "can this truck go?" must branch on Unplaced.Blocking(), never on len().
+	Unplaced []Unplaced `json:"unplaced"`
+
+	// UnmodeledWeightLbs is the weight of cargo that rides but has no placement:
+	// the Unplaced entries whose Rides() is true. It is already INCLUDED in
+	// TotalWeightLbs (gross stays exact even when the twin is incomplete) and is
+	// necessarily ABSENT from AxleLoads, because there is no position to
+	// attribute it to. Non-zero ⇒ the per-axle split understates the truck.
+	UnmodeledWeightLbs int64 `json:"unmodeled_weight_lbs,omitempty"`
+
+	MaxLoadHeightIn float64 `json:"max_load_height_in,omitempty"`
 
 	// ProfileStatus reports whether the fleet profile carried everything needed
 	// to judge this load: ProfileComplete or ProfileIncomplete. ProfileIssues

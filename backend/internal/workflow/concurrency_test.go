@@ -39,10 +39,17 @@ func planWithPackedLoad() *Plan {
 			CapacityWeightLbs: 20000,
 			TotalWeightLbs:    4000,
 			Stops:             []Stop{{OrderID: "o1", Sequence: 1, Lat: 49.1, Lng: -119.1, WeightLbs: 4000}},
+			// Shaped like real solver output: every axle rated, and every
+			// per-axle verdict flagged Advisory (load.AxleLoad documents it as
+			// always true). Tests that need a CERTIFIED per-axle verdict clear
+			// Advisory explicitly — the gate keys on that flag.
 			LoadPlan: &load.Plan{
 				TotalWeightLbs: 18000,
 				GVWStatus:      "PASS",
-				AxleLoads:      []load.AxleLoad{{AxleNumber: 1, Status: "PASS"}, {AxleNumber: 2, Status: "PASS"}},
+				AxleLoads: []load.AxleLoad{
+					{AxleNumber: 1, WeightLbs: 6000, MaxWeightLbs: 12000, Utilization: 0.5, Status: "PASS", Advisory: true},
+					{AxleNumber: 2, WeightLbs: 12000, MaxWeightLbs: 21000, Utilization: 0.571, Status: "PASS", Advisory: true},
+				},
 			},
 			Compliance: &ComplianceReview{Status: "PASS"},
 			Proof: &LoadProof{

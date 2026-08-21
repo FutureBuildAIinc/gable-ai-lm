@@ -482,14 +482,91 @@ describe('PlanWorkflow — truck tab status dot', () => {
 describe('PlanWorkflow — unplaced cargo', () => {
   it('names every SKU the packer could not fit', async () => {
     const el = await packStep((lp) => {
-      lp.unplaced = ['WRC-2X8-20', 'LVL-1.75X11.875-24'];
+      lp.unplaced = [
+        { sku: 'WRC-2X8-20', quantity: 12, reason: 'TRUCK_FULL', detail: 'truck full' },
+        { sku: 'LVL-1.75X11.875-24', quantity: 4, reason: 'TRUCK_FULL', detail: 'truck full' },
+      ];
     });
 
-    expect(text(el)).toContain('Did not fit: WRC-2X8-20, LVL-1.75X11.875-24');
+    expect(text(el)).toContain('Did not fit');
+    expect(text(el)).toContain('WRC-2X8-20 ×12 (truck full)');
+    expect(text(el)).toContain('LVL-1.75X11.875-24 ×4 (truck full)');
+    // The consequence, not just the list: this truck ships the customer short.
+    expect(text(el)).toMatch(/not on the truck|ships short/i);
   });
 
   it('says nothing about unplaced cargo when everything fit', async () => {
     const el = await packStep();
     expect(text(el)).not.toContain('Did not fit');
+  });
+
+  // A SKU with no recorded geometry is NOT dropped cargo: the packer had nothing
+  // to position, but the material still rides and the yard loads it by hand.
+  // Rendering it as "did not fit" told the dispatcher the truck was short when
+  // it was not — and on the backend it refused the push outright.
+  it('separates a line with no geometry from cargo that did not fit', async () => {
+    const el = await packStep((lp) => {
+      lp.unplaced = [
+        { sku: 'WRC-2X8-20', quantity: 12, reason: 'TRUCK_FULL', detail: 'truck full' },
+        {
+          sku: 'HANGER-26',
+          quantity: 120,
+          reason: 'NO_GEOMETRY',
+          detail: 'no geometry recorded',
+          weight_lbs: 90,
+        },
+      ];
+      lp.unmodeled_weight_lbs = 90;
+    });
+
+    const body = text(el);
+    expect(body).toContain('No digital-twin geometry');
+    expect(body).toContain('HANGER-26 ×120 (no geometry recorded)');
+    expect(body).toMatch(/load by hand/i);
+    // Its weight is in the gross but not in the axle split — say so.
+    expect(body).toContain('90 lb');
+
+    // And it must NOT be inside the red "did not fit" callout.
+    const droppedCallout = el.querySelector('[class*="bg-safety-red/10"]');
+    expect(droppedCallout).not.toBeNull();
+    expect(text(droppedCallout!)).toContain('WRC-2X8-20');
+    expect(text(droppedCallout!)).not.toContain('HANGER-26');
+  });
+
+  it('says nothing about missing geometry when every line is dimensioned', async () => {
+    const el = await packStep((lp) => {
+      lp.unplaced = [
+        { sku: 'WRC-2X8-20', quantity: 12, reason: 'TRUCK_FULL', detail: 'truck full' },
+      ];
+    });
+    expect(text(el)).not.toContain('No digital-twin geometry');
+  });
+});
+
+// The per-axle split is an estimate the load package documents as unvalidated
+// (steer axle at the bed origin, no overhang lever). An over-rating on it is a
+// reason to weigh the truck, not a verdict — and the readout has to say which,
+// or a dispatcher reads a red bar as a certified refusal.
+describe('PlanWorkflow — advisory axle readout', () => {
+  it('marks an advisory over-rating as advisory, next to the number', async () => {
+    const el = await packStep((lp) => {
+      lp.axle_loads[0] = {
+        axle_number: 1,
+        weight_lbs: 13_400,
+        max_weight_lbs: 12_000,
+        utilization: 1.117,
+        status: 'FAIL',
+        advisory: true,
+      };
+    });
+
+    const body = text(el);
+    expect(body).toMatch(/advisory/i);
+    expect(body).toMatch(/certified scale/i);
+  });
+
+  it('always states that the per-axle split is not a scale ticket', async () => {
+    const el = await packStep();
+    expect(text(el)).toMatch(/planning estimate, not a scale ticket/i);
   });
 });

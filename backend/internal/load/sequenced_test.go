@@ -209,7 +209,7 @@ func TestNonStackableTierIsNeverOverlaid(t *testing.T) {
 	}
 	sealed := false
 	for _, u := range plan.Unplaced {
-		if strings.Contains(u, "cannot stack on non-stackable") {
+		if u.Reason == ReasonNotStackable && strings.Contains(u.Detail, "cannot stack on non-stackable") {
 			sealed = true
 		}
 	}
@@ -268,7 +268,7 @@ func TestNonStackableSealsTheLevelWithinATier(t *testing.T) {
 	}
 	blocked := false
 	for _, u := range plan.Unplaced {
-		if strings.Contains(u, "cannot stack on non-stackable") {
+		if u.Reason == ReasonNotStackable && strings.Contains(u.Detail, "cannot stack on non-stackable") {
 			blocked = true
 		}
 	}

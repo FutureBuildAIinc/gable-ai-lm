@@ -31,7 +31,33 @@ func rawBedVolumeCuFt(v Vehicle) float64 {
 
 // UsableBedVolumeCuFt is the volume budget a load may occupy: the bed bounding
 // volume discounted by the packing-efficiency factor. Exposed so the assignment
-// step can apply the same volume cap it uses at pack time.
+// step can apply the same volume cap the packer uses.
+//
+// KNOWN GAP — the same number, two different constraints. At pack time this is
+// one of TWO caps: the tier packer also has to fit real boxes inside the bed
+// envelope, and that is the cap that actually bites. Measured on the default
+// 288×96×96 flatbed (budget 998 ft³) across six representative lumber mixes at
+// one, two and three stops, the largest load that packs with nothing dropped
+// ranges from 63% to 99% of this budget, and every overflow is ReasonTruckFull
+// (out of deck or headroom) rather than ReasonVolumeFull. Assignment, which has
+// only this cap, can therefore hand a truck more cube than the packer can place.
+//
+// Derating this constant does NOT reconcile them, for three reasons:
+//
+//  1. the shortfall is mix-dependent (a flat OSB load reaches 98%, a mixed
+//     framing load 67%) and not monotonic in stop count, so no scalar covers it;
+//  2. derating to the worst case would under-fill EVERY truck by a third, which
+//     puts more trucks on the road than the day needs — a real cost to a dealer,
+//     traded for a rarer overflow;
+//  3. this constant is also the packer's own hard cap, so lowering it makes the
+//     packer drop cargo EARLIER — the opposite of the intent.
+//
+// Closing it properly means giving assignment the packer's second constraint:
+// either trial-pack each candidate truck during assignment (which requires the
+// line items and the fleet profile inside sweepAssign, and a re-sequence per
+// candidate because tier packing is stop-order dependent), or model the tier
+// geometry analytically (bed height ÷ per-stop tier height, row depth = longest
+// board in the row). Both change the assignment contract; neither is a constant.
 func UsableBedVolumeCuFt(bedLengthIn, bedWidthIn, bedHeightIn float64) float64 {
 	if bedLengthIn <= 0 || bedWidthIn <= 0 || bedHeightIn <= 0 {
 		return 0

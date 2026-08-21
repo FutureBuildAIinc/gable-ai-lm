@@ -127,9 +127,16 @@ type ComplianceAction struct {
 // Detours are AI-inserted waypoints that steer the route polyline around
 // flagged restrictions (rendered on the route map; not pushed to GableLBM).
 type ComplianceReview struct {
-	Status            string                  `json:"status"` // PASS/WARN/FAIL
-	Flags             []compliance.Flag       `json:"flags"`
-	Actions           []ComplianceAction      `json:"actions"`
+	Status  string             `json:"status"` // PASS/WARN/FAIL
+	Flags   []compliance.Flag  `json:"flags"`
+	Actions []ComplianceAction `json:"actions"`
+	// Advisories are capacity findings the dispatcher must SEE but may proceed
+	// past: an over-rating on the per-axle estimate (whose datum the load package
+	// documents as unvalidated), and lines with no digital-twin geometry (which
+	// ride, but are not in the 3D plan). They never refuse a push — the UI is
+	// required to render them, because an advisory nobody sees is worse than no
+	// advisory at all. See workflow.capacityFindings.
+	Advisories        []string                `json:"advisories,omitempty"`
 	Detours           []compliance.RoutePoint `json:"detours,omitempty"`
 	CheckedGrossLbs   int64                   `json:"checked_gross_lbs"`
 	CheckedMaxAxleLbs int64                   `json:"checked_max_axle_lbs"`

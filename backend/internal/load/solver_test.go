@@ -96,7 +96,7 @@ func TestShelfSolverDoesNotRaiseOverNonStackableRow(t *testing.T) {
 	assertNoOverlayOnNonStackable(t, plan, "STONE-SLAB")
 	sealed := false
 	for _, u := range plan.Unplaced {
-		if strings.Contains(u, "cannot stack on non-stackable") {
+		if u.Reason == ReasonNotStackable && strings.Contains(u.Detail, "cannot stack on non-stackable") {
 			sealed = true
 		}
 	}

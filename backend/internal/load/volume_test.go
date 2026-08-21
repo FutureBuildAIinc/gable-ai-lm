@@ -50,7 +50,7 @@ func TestShelfSolverVolumeCap(t *testing.T) {
 	}
 	foundVolFlag := false
 	for _, u := range plan.Unplaced {
-		if strings.Contains(u, "bed volume full") {
+		if u.Reason == ReasonVolumeFull && strings.Contains(u.Detail, "bed volume full") {
 			foundVolFlag = true
 		}
 	}

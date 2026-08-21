@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	// cargoUtilizationCap keeps headroom below the rated payload so the packed
-	// load can still pass axle checks (cargo never sits perfectly distributed).
+	// cargoUtilizationCap keeps headroom below the rated payload: cargo never
+	// sits perfectly distributed, and the gross-vs-GVWR verdict — the one Push
+	// hard-refuses on — has to clear once tare is added. It also keeps the
+	// advisory per-axle split off its limits more often than not.
 	cargoUtilizationCap = 0.80
 	// LIFO tier packing stacks one tier per stop, so stop count is bounded by
 	// what physically stacks on a flatbed (also matches real LBM route sizes).
@@ -37,6 +39,14 @@ const (
 // maps a vehicle id to its usable bed volume in ft³; a zero/absent entry
 // disables the volume cap for that truck. Returns per-truck loads (stops
 // unsequenced) and any stops no truck could take.
+//
+// The volume cap here is a BUDGET, not a packing guarantee: it is the same
+// load.UsableBedVolumeCuFt figure the packer uses, but the packer is also bound
+// by the physical bed envelope and that is what actually overflows. See the
+// "KNOWN GAP" note on load.UsableBedVolumeCuFt for the measured spread (63-99%
+// of the budget) and why no constant closes it. A truck sized right at this
+// budget can still report ReasonTruckFull at pack time; that is a blocking
+// finding at Push, so it surfaces rather than shipping short silently.
 func sweepAssign(vehicles []gable.Vehicle, stops []routing.Stop, depotLat, depotLng float64, volCapByVehicle map[string]float64) ([]routing.Load, []routing.Stop) {
 	usable := make([]gable.Vehicle, 0, len(vehicles))
 	for _, v := range vehicles {

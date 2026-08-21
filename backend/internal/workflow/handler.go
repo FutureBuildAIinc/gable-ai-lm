@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/FutureBuildAIinc/gable-ai-lm/pkg/httputil"
@@ -55,13 +56,27 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, roleGuard ...func(http.Hand
 	mux.HandleFunc("POST /api/v1/workflow/plans/{id}/late-adds/{orderId}/resolve", guard(h.HandleResolveLateAdd))
 }
 
+// HandleIngest starts a workflow run for a date.
+//
+// The two failure modes are reported differently on purpose. A bad request —
+// empty body, missing date, unparseable date — is the CLIENT's mistake and maps
+// to 400; only a genuine failure to reach or read GableLBM (or the catalog it
+// serves) maps to 502 UPSTREAM_ERROR. Mapping every ingest error to 502 told
+// operators "GableLBM is down" whenever a caller posted an empty body, which is
+// a support call spent on a healthy ERP.
 func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	var req IngestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		// io.EOF is an empty body: let Ingest's own validation name the missing
+		// field rather than reporting it as malformed JSON.
 		httputil.RespondError(w, r, "invalid request body", http.StatusBadRequest, err)
 		return
 	}
 	plan, err := h.svc.Ingest(r.Context(), req)
+	if errors.Is(err, ErrInvalidRequest) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadRequest, err)
+		return
+	}
 	if err != nil {
 		httputil.RespondError(w, r, "ingest failed", http.StatusBadGateway, err)
 		return

@@ -5,9 +5,11 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,13 @@ const (
 // defaultDeckHeightIn approximates deck height above road for clearance checks:
 // total vehicle height = deck + tallest placement.
 const defaultDeckHeightIn = 58.0
+
+// ErrInvalidRequest marks a caller mistake — a missing or malformed field on the
+// request itself — as distinct from a failure reaching or reading GableLBM.
+// Handlers map it to 400; everything else on those paths is an upstream fault
+// and maps to 502. Without the distinction an empty POST body reported
+// "GableLBM is down", sending the operator to check an ERP that was fine.
+var ErrInvalidRequest = errors.New("invalid request")
 
 // planStore is the persistence seam for workflow plans (satisfied by
 // *Repository). It is declared consumer-side like every other seam in this
@@ -137,10 +146,10 @@ func (s *Service) GetLatestForDate(ctx context.Context, date string) (*Plan, err
 // one: per-line effective geometry/weight, totals, shape profile, issues.
 func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) {
 	if req.Date == "" {
-		return nil, fmt.Errorf("date is required")
+		return nil, fmt.Errorf("%w: date is required", ErrInvalidRequest)
 	}
 	if _, err := time.Parse("2006-01-02", req.Date); err != nil {
-		return nil, fmt.Errorf("invalid date %q; expected YYYY-MM-DD", req.Date)
+		return nil, fmt.Errorf("%w: invalid date %q; expected YYYY-MM-DD", ErrInvalidRequest, req.Date)
 	}
 
 	orders, err := s.gable.ListOrdersForDate(ctx, req.Date)
@@ -553,28 +562,104 @@ func capacityStatusClears(status string) bool {
 	}
 }
 
-// blockingCapacityReasons lists why one truck's own load solve is not clear to
-// dispatch: an over-rating (or unverifiable) GVW/axle result, or cargo the
-// packer could not physically fit. Empty ⇒ the truck's own weight/volume
-// verdict permits departure.
-func blockingCapacityReasons(l TruckLoad) []string {
-	var reasons []string
+// axleVerdictIsAdvisory reports whether an over-rating axle verdict is this
+// model's ESTIMATE rather than a measurement — the case that must warn instead
+// of refuse.
+//
+// It reads the solver's own confidence flag (load.AxleLoad.Advisory, which the
+// load package doc explains in "HOW CALLERS MUST GATE ON THIS"). Three things
+// must all hold, and the zero value fails all three, so anything that does not
+// positively assert "this is an estimate over a known rating" keeps blocking:
+//
+//   - Advisory — the split came from the unvalidated bed-origin datum with no
+//     overhang lever. ROADMAP §3: advisory "until validated against certified
+//     scale tickets". A future calibrated source sets Advisory=false and this
+//     gate blocks on it again, with no further change here.
+//   - the axle is RATED — a zero rating is StatusUnknown, a fleet-profile defect
+//     rather than an estimate, and there is nothing to be advisory about.
+//   - the verdict is FAIL — the only status that is both non-clearing and
+//     actually computed. UNKNOWN, "", and any status a future solver adds are
+//     not estimates; they stay blocking.
+func axleVerdictIsAdvisory(a load.AxleLoad) bool {
+	return a.Advisory && a.MaxWeightLbs > 0 &&
+		strings.EqualFold(strings.TrimSpace(a.Status), load.StatusFail)
+}
+
+// capacityFindings splits one truck's own load solve into what BLOCKS a push
+// and what the dispatcher must merely SEE.
+//
+// blocking is the exact, measured trouble: an over-GVWR (or unjudgeable) gross
+// weight, an axle whose rating the profile never supplied, or cargo the packer
+// could not physically fit — which would ship the customer short with nothing on
+// the manifest to show it. Empty ⇒ the truck's own verdict permits departure.
+//
+// advisories are real signals with soft numbers behind them. They never refuse a
+// departure, and callers MUST render them: an advisory nobody sees is worse than
+// no advisory at all.
+//
+//   - a per-axle over-rating computed on the model's documented-wrong datum
+//     (see axleVerdictIsAdvisory);
+//   - articles with no recorded geometry: they are not "dropped", they ride —
+//     they simply are not in the 3D plan, so the yard loads them by hand and
+//     their weight is in the gross but not in the per-axle split.
+func capacityFindings(l TruckLoad) (blocking, advisories []string) {
 	if l.LoadPlan == nil {
-		return []string{"not packed"}
+		return []string{"not packed"}, nil
 	}
 	if !capacityStatusClears(l.LoadPlan.GVWStatus) {
-		reasons = append(reasons, fmt.Sprintf("GVW %s", statusLabel(l.LoadPlan.GVWStatus)))
+		blocking = append(blocking, fmt.Sprintf("GVW %s", statusLabel(l.LoadPlan.GVWStatus)))
 	}
 	for _, a := range l.LoadPlan.AxleLoads {
-		if !capacityStatusClears(a.Status) {
-			reasons = append(reasons, fmt.Sprintf("axle %d %s", a.AxleNumber, statusLabel(a.Status)))
+		if capacityStatusClears(a.Status) {
+			continue
 		}
+		if axleVerdictIsAdvisory(a) {
+			advisories = append(advisories, fmt.Sprintf(
+				"axle %d is over its rating on the ADVISORY split (%s of %s lb, %.0f%%) — the per-axle model uses the bed origin as the steer datum and does not model overhang, so verify at a certified scale before dispatch",
+				a.AxleNumber, formatLbs(a.WeightLbs), formatLbs(a.MaxWeightLbs), a.Utilization*100))
+			continue
+		}
+		blocking = append(blocking, fmt.Sprintf("axle %d %s", a.AxleNumber, statusLabel(a.Status)))
 	}
-	if n := len(l.LoadPlan.Unplaced); n > 0 {
-		reasons = append(reasons, fmt.Sprintf("%d SKU(s) did not fit and were dropped: %s",
-			n, strings.Join(l.LoadPlan.Unplaced, ", ")))
+
+	dropped, noGeometry := load.SplitUnplaced(l.LoadPlan.Unplaced)
+	if n := len(dropped); n > 0 {
+		blocking = append(blocking, fmt.Sprintf("%d SKU(s) did not fit and were dropped: %s",
+			n, strings.Join(load.UnplacedStrings(dropped), ", ")))
 	}
-	return reasons
+	if n := len(noGeometry); n > 0 {
+		msg := fmt.Sprintf("%d line(s) have no digital-twin geometry and are not in the 3D plan — load by hand and check the manifest: %s",
+			n, strings.Join(load.UnplacedStrings(noGeometry), ", "))
+		if w := l.LoadPlan.UnmodeledWeightLbs; w > 0 {
+			msg += fmt.Sprintf(" (%s lb in the gross weight, absent from the per-axle split)", formatLbs(w))
+		}
+		advisories = append(advisories, msg)
+	}
+	return blocking, advisories
+}
+
+// blockingCapacityReasons lists only the findings that refuse a departure.
+func blockingCapacityReasons(l TruckLoad) []string {
+	blocking, _ := capacityFindings(l)
+	return blocking
+}
+
+// formatLbs renders a weight with thousands separators for operator messages.
+func formatLbs(lbs int64) string {
+	s := strconv.FormatInt(lbs, 10)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	var b strings.Builder
+	for i, d := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(d)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
 }
 
 // statusLabel renders an empty/unset status readably in an operator message.
@@ -589,11 +674,17 @@ func statusLabel(s string) string {
 // last gate before a load is live on the dispatch board and the yard's
 // Pack-Trucks surface, so it refuses on any of:
 //   - a restricted-point compliance FAIL (bridge weight / overpass clearance);
-//   - the truck's OWN capacity verdict — an over-GVWR or over-axle load, or one
-//     whose rating could not be verified — regardless of what the route crosses;
-//   - cargo the packer could not fit (LoadPlan.Unplaced), which would ship the
-//     customer short with nothing on the manifest to show it;
+//   - the truck's OWN measured capacity verdict — an over-GVWR gross weight, or
+//     an axle whose rating the fleet profile never supplied — regardless of what
+//     the route crosses;
+//   - cargo the packer could not FIT (a blocking load.Unplaced entry), which
+//     would ship the customer short with nothing on the manifest to show it;
 //   - a missing yard proof-of-load or sign-off (T1-6).
+//
+// It deliberately does NOT refuse on the advisory findings (see
+// capacityFindings): an over-rating on the per-axle estimate, or a line with no
+// digital-twin geometry. Both are carried onto the review, logged here, and
+// written onto the manifest that reaches the yard — the dispatcher decides.
 func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -616,11 +707,19 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		if l.Compliance.Status == "FAIL" {
 			failing = append(failing, l.VehicleName)
 		}
-		// The truck's own GVW/axle rating and any cargo that did not fit — a
-		// route with no weight-restricted bridge must not launder an overweight
-		// or short-loaded truck onto the dispatch board.
-		if reasons := blockingCapacityReasons(l); len(reasons) > 0 {
-			overCapacity = append(overCapacity, fmt.Sprintf("%s (%s)", l.VehicleName, strings.Join(reasons, "; ")))
+		// The truck's own GVW rating and any cargo that did not fit — a route
+		// with no weight-restricted bridge must not launder an overweight or
+		// short-loaded truck onto the dispatch board.
+		blocking, advisories := capacityFindings(l)
+		if len(blocking) > 0 {
+			overCapacity = append(overCapacity, fmt.Sprintf("%s (%s)", l.VehicleName, strings.Join(blocking, "; ")))
+		}
+		// Advisory findings do not refuse. Log them so a dispatched load that
+		// later scales over is traceable to the warning nobody acted on; they
+		// also ride on the review and on the manifest the yard reads.
+		for _, a := range advisories {
+			slog.Warn("dispatching a load with an unresolved capacity advisory",
+				"plan", p.ID, "date", p.PlanDate, "vehicle", l.VehicleName, "advisory", a)
 		}
 		// Yard proof-of-load + sign-off gate (T1-6): no truck leaves the yard
 		// without photo/video proof and a sign-off.
@@ -693,33 +792,56 @@ func buildManifest(p *Plan, l TruckLoad) map[string]any {
 			}
 		}
 	}
-	// Unplaced is cargo the packer could not physically fit. The yard must see
-	// it on the manifest — otherwise an auto-resolved load silently ships the
-	// customer fewer pieces than they ordered. Always emitted (never omitted
-	// when empty) so "no dropped cargo" is an explicit statement, not a gap.
+	// The two kinds of unplaced article are separated here because the yard does
+	// two DIFFERENT things with them, and a single list made the manifest lie
+	// about both:
+	//
+	//   dropped        — did not fit. It is NOT on the truck; the customer ships
+	//                    short and somebody has to be told.
+	//   no_geometry    — has no recorded dimensions, so it is not in the 3D
+	//                    packing steps. It IS on the truck: the yard loads it by
+	//                    hand, and it is in total_weight_lbs but not in
+	//                    axle_loads (unmodeled_weight_lbs says how much).
+	//
+	// Every key is always emitted (never omitted when empty) so "nothing was
+	// dropped" is an explicit statement rather than a gap. `unplaced` keeps the
+	// full typed list so a consumer can re-derive either set.
 	unplaced := l.LoadPlan.Unplaced
 	if unplaced == nil {
-		unplaced = []string{}
+		unplaced = []load.Unplaced{}
+	}
+	dropped, noGeometry := load.SplitUnplaced(unplaced)
+	blocking, advisories := capacityFindings(l)
+	if advisories == nil {
+		advisories = []string{}
 	}
 	return map[string]any{
-		"version":            1,
-		"plan_date":          p.PlanDate,
-		"vehicle_id":         l.VehicleID,
-		"vehicle_name":       l.VehicleName,
-		"driver_name":        l.DriverName,
-		"bed":                l.Bed,
-		"total_weight_lbs":   l.LoadPlan.TotalWeightLbs,
-		"gvw_status":         l.LoadPlan.GVWStatus,
-		"max_load_height_in": l.LoadPlan.MaxLoadHeightIn,
-		"axle_loads":         l.LoadPlan.AxleLoads,
-		"unplaced":           unplaced,
-		"capacity_cleared":   len(blockingCapacityReasons(l)) == 0,
-		"stops":              stops,
-		"steps":              l.LoadPlan.Placements, // already in pack order with Step set
-		"sku_names":          skuNames,
-		"securement":         l.LoadPlan.Securement,
-		"compliance":         l.Compliance,
-		"proof":              l.Proof,
+		// version 2: `unplaced` carries typed reasons (was a flat string list),
+		// and `dropped` / `no_geometry` / `advisories` / `unmodeled_weight_lbs`
+		// were added alongside it.
+		"version":              2,
+		"plan_date":            p.PlanDate,
+		"vehicle_id":           l.VehicleID,
+		"vehicle_name":         l.VehicleName,
+		"driver_name":          l.DriverName,
+		"bed":                  l.Bed,
+		"total_weight_lbs":     l.LoadPlan.TotalWeightLbs,
+		"unmodeled_weight_lbs": l.LoadPlan.UnmodeledWeightLbs,
+		"gvw_status":           l.LoadPlan.GVWStatus,
+		"max_load_height_in":   l.LoadPlan.MaxLoadHeightIn,
+		"axle_loads":           l.LoadPlan.AxleLoads,
+		"axle_loads_advisory":  true,
+		"unplaced":             unplaced,
+		"dropped":              load.UnplacedStrings(dropped),
+		"no_geometry":          load.UnplacedStrings(noGeometry),
+		"advisories":           advisories,
+		"capacity_cleared":     len(blocking) == 0,
+		"stops":                stops,
+		"steps":                l.LoadPlan.Placements, // already in pack order with Step set
+		"sku_names":            skuNames,
+		"securement":           l.LoadPlan.Securement,
+		"compliance":           l.Compliance,
+		"proof":                l.Proof,
 	}
 }
 

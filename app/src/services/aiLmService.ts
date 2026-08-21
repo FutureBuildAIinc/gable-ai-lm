@@ -142,6 +142,11 @@ export interface AxleLoad {
   max_weight_lbs: number;
   utilization: number;
   status: 'PASS' | 'WARN' | 'FAIL' | 'UNKNOWN';
+  // True for everything this solver produces: the per-axle split is a planning
+  // estimate (steer axle at the bed origin, no overhang lever), not a scale
+  // ticket. It is the flag the push gate reads — an advisory over-rating warns,
+  // a certified one (advisory false/absent) blocks. Optional because an older
+  // backend omits it, and absent must therefore mean "not claimed advisory".
   advisory?: boolean;
 }
 
@@ -166,6 +171,46 @@ export interface Securement {
   notes: string[];
 }
 
+/**
+ * Why the packer did not position an article — mirrors the reason codes in
+ * backend/internal/load/unplaced.go.
+ *
+ * `NO_GEOMETRY` is an information gap: the SKU has no recorded L/W/H (joist
+ * hangers, caulk, random-length linear-foot stock), so there is nothing to
+ * place. The material still RIDES — the yard loads it by hand and it is simply
+ * absent from the 3D twin. Every other reason is a capacity failure: the cargo
+ * stays in the yard and the customer ships short.
+ */
+export type UnplacedReason =
+  | 'NO_GEOMETRY'
+  | 'TRUCK_FULL'
+  | 'BED_VOLUME_FULL'
+  | 'TOO_LARGE_FOR_BED'
+  | 'NOT_STACKABLE'
+  | (string & {}); // a reason a future backend adds — treated as blocking
+
+export interface Unplaced {
+  sku: string;
+  quantity: number;
+  reason: UnplacedReason;
+  detail: string;
+  weight_lbs?: number;
+}
+
+/**
+ * Mirrors `Unplaced.Blocking()` in backend/internal/load/unplaced.go, including
+ * its fail-closed default: everything except the one known-benign reason blocks,
+ * so a reason added on the backend cannot slip through the UI as harmless.
+ */
+export function isBlockingUnplaced(u: Unplaced): boolean {
+  return u.reason !== 'NO_GEOMETRY';
+}
+
+/** Renders one entry the way the backend's Unplaced.String() does. */
+export function unplacedLabel(u: Unplaced): string {
+  return `${u.sku} ×${u.quantity} (${u.detail})`;
+}
+
 export interface LoadPlan {
   id: string;
   gable_route_id?: string;
@@ -180,7 +225,14 @@ export interface LoadPlan {
   // ("blocking, and never PASS") and carries the reason on profile_status /
   // profile_issues below.
   gvw_status: 'PASS' | 'WARN' | 'FAIL';
-  unplaced: string[];
+  // Every article the packer did not position, each with a TYPED reason. The two
+  // families are not interchangeable — see UnplacedReason. Never gate on
+  // `unplaced.length`; branch on the reason (isBlockingUnplaced below).
+  unplaced: Unplaced[];
+  // Weight of cargo that RIDES but has no placement (the NO_GEOMETRY entries).
+  // Already included in total_weight_lbs, and necessarily absent from
+  // axle_loads because there is no position to attribute it to.
+  unmodeled_weight_lbs?: number;
   max_load_height_in?: number;
   // Fleet-profile completeness (load/model.go Plan.ProfileStatus). INCOMPLETE
   // means a blank axle rating, a blank GVWR or no axles at all, and every weight
@@ -358,6 +410,10 @@ export interface ComplianceReview {
   status: 'PASS' | 'WARN' | 'FAIL';
   flags: ComplianceFlag[];
   actions: ComplianceAction[];
+  // Capacity findings the dispatcher must SEE but may proceed past: an
+  // over-rating on the advisory per-axle split, and lines with no digital-twin
+  // geometry. They never block a push, so the UI is required to render them.
+  advisories?: string[];
   detours?: { lat: number; lng: number }[];
   checked_gross_lbs: number;
   checked_max_axle_lbs: number;

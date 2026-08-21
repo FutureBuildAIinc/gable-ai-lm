@@ -32,6 +32,9 @@ import {
 } from 'lucide';
 import {
   aiLmService,
+  isBlockingUnplaced,
+  unplacedLabel,
+  type AxleLoad,
   type WorkflowPlan,
   type WorkflowStatus,
   type TruckLoad,
@@ -95,29 +98,68 @@ function capacityStatusLabel(status: string | undefined | null): string {
 }
 
 /**
- * Mirrors `blockingCapacityReasons` in backend/internal/workflow/service.go:
- * why one truck's OWN load solve is not clear to dispatch, independent of what
- * its route crosses. Empty ⇒ the truck's own weight/volume verdict permits
- * departure.
+ * Mirrors `axleVerdictIsAdvisory` in backend/internal/workflow/service.go.
+ *
+ * An over-rating on a RATED axle that the solver flagged advisory is this
+ * model's estimate, computed on a datum its own package doc calls wrong (steer
+ * axle at the bed origin, no overhang lever). It warns; it does not refuse.
+ * Everything else — an unrated axle, an unknown status, `advisory` absent — is
+ * not an estimate and keeps blocking.
  */
-function blockingCapacityReasons(l: TruckLoad): string[] {
+function axleVerdictIsAdvisory(a: AxleLoad): boolean {
+  return a.advisory === true && a.max_weight_lbs > 0 && (a.status ?? '').trim().toUpperCase() === 'FAIL';
+}
+
+/**
+ * Mirrors `capacityFindings` in backend/internal/workflow/service.go: what one
+ * truck's own load solve BLOCKS on, and what it merely has to show.
+ *
+ * `blocking` is exact trouble — over GVWR, an axle the profile never rated, or
+ * cargo that did not fit. Empty ⇒ the truck's own verdict permits departure.
+ * `advisories` are real signals with soft numbers behind them: they must be
+ * rendered, and must not disable the push.
+ */
+function capacityFindings(l: TruckLoad): { blocking: string[]; advisories: string[] } {
   const lp = l.load_plan;
-  if (!lp) return ['not packed'];
-  const reasons: string[] = [];
+  if (!lp) return { blocking: ['not packed'], advisories: [] };
+  const blocking: string[] = [];
+  const advisories: string[] = [];
   if (!capacityStatusClears(lp.gvw_status)) {
-    reasons.push(`GVW ${capacityStatusLabel(lp.gvw_status)}`);
+    blocking.push(`GVW ${capacityStatusLabel(lp.gvw_status)}`);
   }
   for (const a of lp.axle_loads ?? []) {
-    if (!capacityStatusClears(a.status)) {
-      reasons.push(`axle ${a.axle_number} ${capacityStatusLabel(a.status)}`);
+    if (capacityStatusClears(a.status)) continue;
+    if (axleVerdictIsAdvisory(a)) {
+      advisories.push(
+        `Axle ${a.axle_number} is over its rating on the ADVISORY split ` +
+          `(${a.weight_lbs.toLocaleString()} of ${a.max_weight_lbs.toLocaleString()} lb, ` +
+          `${Math.round(a.utilization * 100)}%) — verify at a certified scale before dispatch.`,
+      );
+      continue;
     }
+    blocking.push(`axle ${a.axle_number} ${capacityStatusLabel(a.status)}`);
   }
-  const dropped = lp.unplaced ?? [];
+  const unplaced = lp.unplaced ?? [];
+  const dropped = unplaced.filter(isBlockingUnplaced);
+  const noGeometry = unplaced.filter((u) => !isBlockingUnplaced(u));
   if (dropped.length > 0) {
-    reasons.push(`${dropped.length} SKU(s) did not fit and were dropped: ${dropped.join(', ')}`);
+    blocking.push(
+      `${dropped.length} SKU(s) did not fit and were dropped: ${dropped.map(unplacedLabel).join(', ')}`,
+    );
   }
-  return reasons;
+  if (noGeometry.length > 0) {
+    const weight = lp.unmodeled_weight_lbs ?? 0;
+    advisories.push(
+      `${noGeometry.length} line(s) have no digital-twin geometry and are not in the 3D plan — ` +
+        `load by hand and check the manifest: ${noGeometry.map(unplacedLabel).join(', ')}` +
+        (weight > 0
+          ? ` (${weight.toLocaleString()} lb in the gross weight, absent from the per-axle split).`
+          : '.'),
+    );
+  }
+  return { blocking, advisories };
 }
+
 
 /**
  * <ailm-plan-workflow> — the single-page guided dispatch workflow. One stepper
@@ -158,6 +200,12 @@ export class PlanWorkflow extends LitElement {
 
   // T2-3 — late-add order id input.
   @state() private _lateOrderId = '';
+
+  // Push step — the dispatcher has ticked "I have read the load advisories".
+  // Advisory findings (an over-rating on the per-axle estimate, lines with no
+  // digital-twin geometry) do not refuse a dispatch on either side of the wire,
+  // so this is the thing that keeps them from being scrolled past.
+  @state() private _advisoryAck = false;
 
   private _signedBy(): string {
     return localStorage.getItem('ailm_name') || 'Yard staff';
@@ -1038,11 +1086,7 @@ export class PlanWorkflow extends LitElement {
                     .visibleSteps=${this._stepSlider}
                   ></ailm-load-3d-visualizer>
                   ${this._playbackControls()}
-                  ${t.load_plan.unplaced.length > 0
-                    ? html`<div class="px-4 py-2 rounded-lg border border-amber-warn/30 bg-amber-warn/10 text-amber-warn text-xs">
-                        Did not fit: <span class="font-mono">${t.load_plan.unplaced.join(', ')}</span>
-                      </div>`
-                    : nothing}
+                  ${this._unplacedCallouts(t)}
                 </div>
                 <div class="space-y-4">
                   ${this._stopSequencer(t)}
@@ -1054,6 +1098,50 @@ export class PlanWorkflow extends LitElement {
             `
           : html`<p class="text-sm text-zinc-500">Pack the trucks to build each 3D load plan.</p>`}
       </div>
+    `;
+  }
+
+  /**
+   * The two kinds of unplaced article, told apart — because the yard does two
+   * different things with them and one callout for both said the wrong thing
+   * about each.
+   *
+   * DID NOT FIT is red: the cargo is not on the truck, the customer ships short,
+   * and a push is refused until it is resolved.
+   * NO GEOMETRY is amber: the article IS on the truck, it just has no recorded
+   * dimensions to draw, so the yard loads it by hand. It never blocks a push.
+   */
+  private _unplacedCallouts(t: TruckLoad) {
+    const unplaced = t.load_plan?.unplaced ?? [];
+    if (unplaced.length === 0) return nothing;
+    const dropped = unplaced.filter(isBlockingUnplaced);
+    const noGeometry = unplaced.filter((u) => !isBlockingUnplaced(u));
+    const unmodeled = t.load_plan?.unmodeled_weight_lbs ?? 0;
+    return html`
+      ${dropped.length > 0
+        ? html`<div class="px-4 py-2 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-xs flex gap-2">
+            ${icon(AlertTriangle, 14)}
+            <span>
+              <strong>Did not fit — not on the truck.</strong> This load ships short until it is
+              re-packed or rebalanced:
+              <span class="font-mono">${dropped.map(unplacedLabel).join(', ')}</span>
+            </span>
+          </div>`
+        : nothing}
+      ${noGeometry.length > 0
+        ? html`<div class="px-4 py-2 rounded-lg border border-amber-warn/30 bg-amber-warn/10 text-amber-warn text-xs flex gap-2">
+            ${icon(Ruler, 14)}
+            <span>
+              <strong>No digital-twin geometry — load by hand.</strong> These lines have no
+              recorded dimensions, so they are not in the 3D plan. They still ride:
+              <span class="font-mono">${noGeometry.map(unplacedLabel).join(', ')}</span>${unmodeled >
+              0
+                ? html` — <span class="font-mono">${unmodeled.toLocaleString()} lb</span> counted in
+                    the gross weight but not in the axle split.`
+                : nothing}
+            </span>
+          </div>`
+        : nothing}
     `;
   }
 
@@ -1159,7 +1247,11 @@ export class PlanWorkflow extends LitElement {
     const lp = t.load_plan!;
     return html`
       <div class="glass-card rounded-xl p-4">
-        <h2 class="text-sm font-semibold text-zinc-300 mb-3">Axle Loads</h2>
+        <h2 class="text-sm font-semibold text-zinc-300 mb-1">Axle Loads</h2>
+        <p class="text-[11px] text-zinc-500 mb-3">
+          Advisory — a planning estimate, not a scale ticket. Gross weight is exact; the per-axle
+          split is not.
+        </p>
         ${lp.profile_status === 'INCOMPLETE'
           ? html`<div
               class="mb-3 px-3 py-2 rounded-lg border border-safety-red/30 bg-safety-red/10 text-safety-red text-xs flex gap-2"
@@ -1197,6 +1289,9 @@ export class PlanWorkflow extends LitElement {
                 : a.status === 'WARN'
                   ? 'text-amber-warn'
                   : 'text-zinc-300';
+            // An over-rating on the advisory split is a reason to stop at a
+            // scale, not a verdict: say which it is, right where the number is.
+            const advisoryOver = axleVerdictIsAdvisory(a);
             return html`
               <div>
                 <div class="flex justify-between text-xs mb-1">
@@ -1210,6 +1305,16 @@ export class PlanWorkflow extends LitElement {
                 <div class="h-2.5 w-full rounded-full bg-white/5 overflow-hidden">
                   <div class="h-full ${barColor} transition-all" style="width: ${pct}%"></div>
                 </div>
+                ${advisoryOver
+                  ? html`<p class="mt-1 text-[11px] text-amber-warn flex gap-1.5">
+                      ${icon(AlertTriangle, 12)}
+                      <span
+                        >Over the rating on the <strong>advisory</strong> split — weigh at a
+                        certified scale. This estimate puts the steer axle at the bed origin and
+                        does not model overhang, so it does not by itself stop a dispatch.</span
+                      >
+                    </p>`
+                  : nothing}
               </div>
             `;
           })}
@@ -1404,6 +1509,20 @@ export class PlanWorkflow extends LitElement {
                     </dl>
                   </div>
 
+                  ${(t.compliance.advisories ?? []).length > 0
+                    ? html`<div class="glass-card rounded-xl p-4 border border-amber-warn/30">
+                        <h2 class="text-sm font-semibold text-amber-warn mb-1 flex items-center gap-2">
+                          ${icon(AlertTriangle, 15)} Load Advisories
+                        </h2>
+                        <p class="text-[11px] text-zinc-500 mb-2">
+                          Not refusals — the dispatcher decides. They are on the manifest too.
+                        </p>
+                        <ul class="space-y-2 text-xs text-amber-warn/90 list-disc list-inside">
+                          ${(t.compliance.advisories ?? []).map((a) => html`<li>${a}</li>`)}
+                        </ul>
+                      </div>`
+                    : nothing}
+
                   ${t.compliance.actions.length > 0
                     ? html`<div class="glass-card rounded-xl p-4">
                         <h2 class="text-sm font-semibold text-zinc-300 mb-3">AI Resolutions</h2>
@@ -1480,9 +1599,14 @@ export class PlanWorkflow extends LitElement {
     // A truck over its OWN GVWR/axle rating, or one carrying less than it was
     // loaded with, must not reach the dispatch board just because its route
     // crosses no restricted point. Same whitelist the backend Push gate uses.
-    const overCapacity = p.loads
-      .map((l) => ({ load: l, reasons: blockingCapacityReasons(l) }))
-      .filter((x) => x.reasons.length > 0);
+    const findings = p.loads.map((l) => ({ load: l, ...capacityFindings(l) }));
+    const overCapacity = findings.filter((x) => x.blocking.length > 0);
+    // Advisory findings do NOT disable the push — the backend does not refuse on
+    // them either. They are made unmissable instead: a banner the dispatcher has
+    // to tick before the button arms, so proceeding is a decision rather than an
+    // oversight.
+    const advisories = findings.filter((x) => x.advisories.length > 0);
+    const needsAck = advisories.length > 0 && !this._advisoryAck;
     const pushed = p.status === 'PUSHED';
     const ordersById = new Map(p.orders.map((o) => [o.order_id, o]));
     return html`
@@ -1501,14 +1625,17 @@ export class PlanWorkflow extends LitElement {
                 ?disabled=${this._busy !== '' ||
                 anyFail ||
                 overCapacity.length > 0 ||
-                notReady.length > 0}
+                notReady.length > 0 ||
+                needsAck}
                 title=${anyFail
                   ? 'Resolve all FAIL compliance flags before pushing'
                   : overCapacity.length > 0
                     ? 'Re-pack or rebalance every truck whose own load capacity is not cleared'
                     : notReady.length > 0
                       ? 'Every truck needs yard proof + sign-off before it can depart'
-                      : ''}
+                      : needsAck
+                        ? 'Acknowledge the load advisories above before pushing'
+                        : ''}
                 class="flex items-center gap-2 bg-gable-green text-deep-space font-semibold px-5 py-2.5 rounded-lg hover:shadow-glow transition-all disabled:opacity-40"
               >
                 ${icon(Send, 18)} ${this._busy === 'push' ? 'Pushing…' : 'Push to GableLBM dispatch'}
@@ -1527,9 +1654,38 @@ export class PlanWorkflow extends LitElement {
               </div>
               <ul class="mt-1 list-disc list-inside text-safety-red/80 text-xs">
                 ${overCapacity.map(
-                  (x) => html`<li>${x.load.vehicle_name}: ${x.reasons.join('; ')}</li>`,
+                  (x) => html`<li>${x.load.vehicle_name}: ${x.blocking.join('; ')}</li>`,
                 )}
               </ul>
+            </div>`
+          : nothing}
+        ${advisories.length > 0 && !pushed
+          ? html`<div class="px-4 py-3 rounded-lg border border-amber-warn/40 bg-amber-warn/10 text-amber-warn text-sm">
+              <div class="flex items-center gap-2 font-medium">
+                ${icon(AlertTriangle, 16)}
+                <span>Load advisories — these do not block the push, and you must read them.</span>
+              </div>
+              <ul class="mt-2 space-y-1.5 text-xs text-amber-warn/90">
+                ${advisories.map(
+                  (x) => html`<li>
+                    <span class="font-medium text-amber-warn">${x.load.vehicle_name}:</span>
+                    <ul class="list-disc list-inside ml-3">
+                      ${x.advisories.map((a) => html`<li>${a}</li>`)}
+                    </ul>
+                  </li>`,
+                )}
+              </ul>
+              <label class="mt-3 flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  class="accent-[#FBBF24]"
+                  .checked=${this._advisoryAck}
+                  @change=${(e: Event) => {
+                    this._advisoryAck = (e.target as HTMLInputElement).checked;
+                  }}
+                />
+                <span>I have read these advisories and accept responsibility for dispatching.</span>
+              </label>
             </div>`
           : nothing}
         ${!anyFail && notReady.length > 0 && !pushed
@@ -1550,12 +1706,14 @@ export class PlanWorkflow extends LitElement {
     const color = STOP_HEX[li % STOP_HEX.length];
     const proofReady = !!l.proof && l.proof.attachments.length > 0 && l.proof.signed_off;
     const hasShots = !!l.proof && l.proof.attachments.length > 0;
-    // `unplaced` is cargo the packer could not physically fit. The stop list
-    // below is the ORDERED lines and quantities, so without this callout the
-    // yard and the ERP both receive a manifest claiming pieces that are not on
-    // the truck. The backend manifest (workflow buildManifest) emits the same
-    // field; surface it here too.
-    const dropped = l.load_plan?.unplaced ?? [];
+    // The stop list below is the ORDERED lines and quantities, so an article the
+    // packer did not position needs saying out loud — but the two reasons mean
+    // opposite things to whoever reads this card. `dropped` is not on the truck
+    // (the customer ships short); `noGeometry` IS on the truck and merely absent
+    // from the 3D plan. The backend manifest emits the same split.
+    const unplaced = l.load_plan?.unplaced ?? [];
+    const dropped = unplaced.filter(isBlockingUnplaced);
+    const noGeometry = unplaced.filter((u) => !isBlockingUnplaced(u));
     return html`
       <div class="glass-card rounded-xl p-5">
         <div class="flex items-center gap-2 mb-1">
@@ -1584,7 +1742,23 @@ export class PlanWorkflow extends LitElement {
                 >
               </div>
               <ul class="mt-1 list-disc list-inside text-safety-red/80">
-                ${dropped.map((u) => html`<li>${u}</li>`)}
+                ${dropped.map((u) => html`<li>${unplacedLabel(u)}</li>`)}
+              </ul>
+            </div>`
+          : nothing}
+        ${noGeometry.length > 0
+          ? html`<div
+              class="mb-3 px-3 py-2 rounded-lg border border-amber-warn/30 bg-amber-warn/10 text-amber-warn text-xs"
+            >
+              <div class="flex items-center gap-2 font-medium">
+                ${icon(Ruler, 13)}
+                <span
+                  >${noGeometry.length} line(s) have no digital-twin geometry — on the truck, loaded
+                  by hand, not in the 3D plan.</span
+                >
+              </div>
+              <ul class="mt-1 list-disc list-inside text-amber-warn/80">
+                ${noGeometry.map((u) => html`<li>${unplacedLabel(u)}</li>`)}
               </ul>
             </div>`
           : nothing}

@@ -27,7 +27,7 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 		GableVehicleID: v.GableVehicleID,
 		Placements:     []Placement{},
 		AxleLoads:      []AxleLoad{},
-		Unplaced:       []string{},
+		Unplaced:       []Unplaced{},
 	}
 
 	// Reverse route order: highest stop sequence loads first (bottom tier).
@@ -46,8 +46,18 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 	// really carry, because banding gaps, dunnage and irregular stock are not in
 	// the bounding boxes. Enforce the usable-volume budget as a hard cap
 	// alongside the geometry so a high-volume / low-weight load is capped by
-	// space, not just by weight. The assignment step already sizes trucks with
-	// the same UsableBedVolumeCuFt budget, so packing and assignment agree.
+	// space, not just by weight.
+	//
+	// The assignment step sizes trucks with the SAME UsableBedVolumeCuFt number,
+	// but that does not make the two agree — assignment models only this cap,
+	// while the packer is additionally bound by the physical bed envelope, and
+	// the envelope is what actually bites. Measured on the default 288×96×96
+	// flatbed (budget 998 ft³) across six representative lumber mixes at one, two
+	// and three stops, the largest load that packs with nothing dropped is 63-99%
+	// of the budget (median ~91%), and EVERY overflow is ReasonTruckFull (deck /
+	// headroom), never ReasonVolumeFull. Assignment therefore promises space the
+	// tier geometry cannot always deliver. See UsableBedVolumeCuFt for why no
+	// single derate fixes that.
 	usableVol := UsableBedVolumeCuFt(v.BedLengthIn, v.BedWidthIn, v.BedHeightIn)
 	var placedVol float64
 
@@ -61,8 +71,8 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 	for _, stop := range ordered {
 		if bedSealedBy != "" {
 			for _, it := range stop.Items {
-				plan.Unplaced = append(plan.Unplaced,
-					fmt.Sprintf("%s ×%d (cannot stack on non-stackable %s)", it.SKU, itemQty(it), bedSealedBy))
+				plan.Unplaced = append(plan.Unplaced, unplacedItem(it, itemQty(it), ReasonNotStackable,
+					fmt.Sprintf("cannot stack on non-stackable %s", bedSealedBy)))
 			}
 			continue
 		}
@@ -91,11 +101,14 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 		for _, it := range items {
 			qty := itemQty(it)
 			if it.LengthIn <= 0 || it.WidthIn <= 0 || it.HeightIn <= 0 {
-				plan.Unplaced = append(plan.Unplaced, fmt.Sprintf("%s ×%d (no geometry)", it.SKU, qty))
+				// No geometry recorded — nothing to position. NOT a capacity
+				// failure: the article still rides, it is just absent from the
+				// twin (see Unplaced's reason-code doc).
+				plan.Unplaced = append(plan.Unplaced, unplacedItem(it, qty, ReasonNoGeometry, "no geometry recorded"))
 				continue
 			}
 			if it.LengthIn > v.BedLengthIn || it.WidthIn > v.BedWidthIn {
-				plan.Unplaced = append(plan.Unplaced, fmt.Sprintf("%s ×%d (too large for bed)", it.SKU, qty))
+				plan.Unplaced = append(plan.Unplaced, unplacedItem(it, qty, ReasonTooLarge, "too large for bed"))
 				continue
 			}
 
@@ -109,7 +122,7 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 					volRoom = int(math.Floor((usableVol - placedVol) / unitVol))
 					if volRoom <= 0 {
 						plan.Unplaced = append(plan.Unplaced,
-							fmt.Sprintf("%s ×%d (bed volume full)", it.SKU, remaining))
+							unplacedItem(it, remaining, ReasonVolumeFull, "bed volume full"))
 						break
 					}
 				}
@@ -120,15 +133,15 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 					// No headroom at this level — try the next level up.
 					if levelMaxH > 0 {
 						if levelSealedBy != "" {
-							plan.Unplaced = append(plan.Unplaced,
-								fmt.Sprintf("%s ×%d (cannot stack on non-stackable %s)", it.SKU, remaining, levelSealedBy))
+							plan.Unplaced = append(plan.Unplaced, unplacedItem(it, remaining, ReasonNotStackable,
+								fmt.Sprintf("cannot stack on non-stackable %s", levelSealedBy)))
 							break
 						}
 						level += levelMaxH
 						cursorX, cursorY, rowDepth, levelMaxH = 0, 0, 0, 0
 						continue
 					}
-					plan.Unplaced = append(plan.Unplaced, fmt.Sprintf("%s ×%d (truck full)", it.SKU, remaining))
+					plan.Unplaced = append(plan.Unplaced, unplacedItem(it, remaining, ReasonTruckFull, "truck full"))
 					break
 				}
 				bw := float64(cols) * it.WidthIn
@@ -144,12 +157,12 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 				if cursorX+it.LengthIn > v.BedLengthIn {
 					if levelMaxH <= 0 {
 						// Nothing placed at this level and it already overflows.
-						plan.Unplaced = append(plan.Unplaced, fmt.Sprintf("%s ×%d (truck full)", it.SKU, remaining))
+						plan.Unplaced = append(plan.Unplaced, unplacedItem(it, remaining, ReasonTruckFull, "truck full"))
 						break
 					}
 					if levelSealedBy != "" {
-						plan.Unplaced = append(plan.Unplaced,
-							fmt.Sprintf("%s ×%d (cannot stack on non-stackable %s)", it.SKU, remaining, levelSealedBy))
+						plan.Unplaced = append(plan.Unplaced, unplacedItem(it, remaining, ReasonNotStackable,
+							fmt.Sprintf("cannot stack on non-stackable %s", levelSealedBy)))
 						break
 					}
 					level += levelMaxH
@@ -244,6 +257,18 @@ func SolveSequencedBundles(v Vehicle, stops []StopItems) Plan {
 	}
 	computeSecurement(&plan, v)
 	return plan
+}
+
+// unplacedItem records qty units of an item the packer did not position, with
+// the typed reason and the weight those units represent.
+func unplacedItem(it Item, qty int, reason, detail string) Unplaced {
+	return Unplaced{
+		SKU:       it.SKU,
+		Quantity:  qty,
+		Reason:    reason,
+		Detail:    detail,
+		WeightLbs: it.WeightLbs * float64(qty),
+	}
 }
 
 // itemQty is the placeable unit count for an item; a missing or non-positive

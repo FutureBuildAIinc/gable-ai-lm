@@ -170,30 +170,42 @@ func (s *Service) reviewLoad(ctx context.Context, p *Plan, l *TruckLoad, vehicle
 
 // applyCapacityVerdict folds the truck's OWN load solve into the review that
 // the dispatcher sees and that Push gates on. The restricted-point check only
-// knows about bridges and overpasses; a truck packed over its GVWR or axle
-// rating (or one whose rating could not be verified), or one carrying less than
-// the order because pieces did not fit, is just as undispatchable even on a
-// route with no restrictions at all.
+// knows about bridges and overpasses; a truck packed over its GVWR (or one whose
+// rating could not be verified), or one carrying less than the order because
+// pieces did not fit, is just as undispatchable even on a route with no
+// restrictions at all.
 //
-// FAIL, not WARN: these are hard refusals at Push, so Review must say so rather
-// than show a green badge the dispatcher will trust. It adds no compliance
-// Flag, so it never triggers the restricted-point weight rebalancer — this is a
-// packing problem, not a route problem.
+// Two severities, matching what Push does with each (see capacityFindings):
+//
+//   - blocking findings ⇒ FAIL, because they are hard refusals at Push and
+//     Review must say so rather than show a green badge the dispatcher trusts.
+//   - advisory findings ⇒ at least WARN, plus the text on review.Advisories.
+//     Push lets these through, so Review is where the dispatcher meets them:
+//     never green, never a refusal.
+//
+// Neither adds a compliance Flag, so neither triggers the restricted-point
+// weight rebalancer — this is a packing problem, not a route problem.
 func applyCapacityVerdict(review *ComplianceReview, l TruckLoad) {
-	reasons := blockingCapacityReasons(l)
-	if len(reasons) == 0 {
-		// A near-rating (WARN) load is legal but worth surfacing.
-		if l.LoadPlan != nil && strings.EqualFold(strings.TrimSpace(l.LoadPlan.GVWStatus), "WARN") && review.Status == "PASS" {
-			review.Status = "WARN"
-		}
+	blocking, advisories := capacityFindings(l)
+	review.Advisories = advisories
+
+	if len(blocking) > 0 {
+		review.Status = "FAIL"
+		review.Actions = append(review.Actions, ComplianceAction{
+			Type:        "MANUAL_REVIEW",
+			Description: "Load capacity not cleared: " + strings.Join(blocking, "; "),
+			Resolved:    false,
+		})
 		return
 	}
-	review.Status = "FAIL"
-	review.Actions = append(review.Actions, ComplianceAction{
-		Type:        "MANUAL_REVIEW",
-		Description: "Load capacity not cleared: " + strings.Join(reasons, "; "),
-		Resolved:    false,
-	})
+	if review.Status != "PASS" {
+		return // already WARN/FAIL on the route itself — do not downgrade it
+	}
+	// A near-rating (WARN) load is legal but worth surfacing; so is an advisory.
+	if len(advisories) > 0 ||
+		(l.LoadPlan != nil && strings.EqualFold(strings.TrimSpace(l.LoadPlan.GVWStatus), "WARN")) {
+		review.Status = "WARN"
+	}
 }
 
 // checkOnce runs one compliance check for the load's current packing + detours

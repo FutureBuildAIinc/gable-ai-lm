@@ -237,6 +237,24 @@ than getting no answer, because the operator stops checking.
   reconciles computed splits against real weigh-scale tickets is the only thing
   that turns this from a model into a measurement.
 
+### What the dispatch gate does with them today
+
+The push gate matches the confidence stated above, because for a while it did
+not: it hard-refused on any per-axle FAIL, which turned this unvalidated estimate
+into a hard cap at roughly half a flatbed's rated payload (with the steer axle at
+the bed origin, 48-56% of cargo weight lands on it, so a 24 000 lb flatbed failed
+its 12 000 lb steer at about 12 500 lb of cargo).
+
+- **Gross weight is exact and still blocks.** Over GVWR, an unrated axle, a
+  profile with no GVWR — all refuse a push. That guarantee is untouched.
+- **An advisory per-axle over-rating warns and does not block.** It is raised on
+  the review step (status WARN, never green), written onto the yard manifest, and
+  logged at push. The dispatcher decides — and the thing they should decide to do
+  is drive over a scale.
+- `load.AxleLoad.Advisory` is the seam. A per-axle verdict from a calibrated or
+  scale-ticket-backed source sets it false, and the gate blocks on that again
+  with no further change. The zero value is the blocking one.
+
 ---
 
 ## 4. No licensing, metering or entitlement seam

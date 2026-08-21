@@ -148,7 +148,9 @@ function plan(): WorkflowPlan {
           total_weight_lbs: 34210, // cargo + tare, per load.computeAxleLoads
           balance_score: 0.874,
           gvw_status: 'FAIL',
-          unplaced: ['WRC-2X8-20'],
+          unplaced: [
+            { sku: 'WRC-2X8-20', quantity: 12, reason: 'TRUCK_FULL', detail: 'truck full' },
+          ],
           max_load_height_in: 62.6,
           bed_volume_cuft: 942.1,
           usable_volume_cuft: 612.4,
@@ -484,7 +486,8 @@ describe('PlanWorkflow — step 3 load safety readouts', () => {
     const el = await mountPlan();
     await clickByText(el, 'button', 'Pack Loads');
 
-    expect(text(el)).toContain('Did not fit: WRC-2X8-20');
+    expect(text(el)).toContain('Did not fit');
+    expect(text(el)).toContain('WRC-2X8-20 ×12 (truck full)');
   });
 
   it('converts strap positions to feet and cites the jurisdiction ruleset', async () => {
@@ -692,6 +695,72 @@ describe('PlanWorkflow — step 5 manifest and push', () => {
     expect(text(el)).toContain(
       'Yard proof + sign-off required before depart: International Box Truck.',
     );
+  });
+
+  // An ADVISORY finding is not a refusal on either side of the wire: the backend
+  // Push gate lets it through (the per-axle datum is documented as unvalidated;
+  // a dimensionless SKU has nothing to place). The UI must therefore not disable
+  // the button — but it must make the finding impossible to miss, which is what
+  // the acknowledgement is for. Before this, the same two conditions were hard
+  // refusals and a dealer with joist hangers could never dispatch.
+  it('lets an advisory finding through the push gate, after it is acknowledged', async () => {
+    const el = await mountPlan((p) => {
+      // A clean plan except for the two advisory conditions.
+      p.loads[0].load_plan!.gvw_status = 'PASS';
+      p.loads[0].load_plan!.axle_loads[1].status = 'FAIL';
+      p.loads[0].load_plan!.axle_loads[1].advisory = true;
+      p.loads[0].load_plan!.unplaced = [
+        {
+          sku: 'HANGER-26',
+          quantity: 120,
+          reason: 'NO_GEOMETRY',
+          detail: 'no geometry recorded',
+          weight_lbs: 90,
+        },
+      ];
+      p.loads[0].load_plan!.unmodeled_weight_lbs = 90;
+    });
+
+    const push = () =>
+      Array.from(el.querySelectorAll('button')).find((b) =>
+        text(b).includes('Push to GableLBM dispatch'),
+      ) as HTMLButtonElement;
+
+    // Unmissable: named, listed, and holding the button until it is read.
+    expect(text(el)).toContain('Load advisories');
+    expect(text(el)).toContain('Axle 2 is over its rating on the ADVISORY split');
+    expect(text(el)).toContain('certified scale');
+    expect(text(el)).toContain('no digital-twin geometry');
+    expect(text(el)).not.toContain('Load capacity not cleared');
+    expect(push().disabled).toBe(true);
+    expect(push().title).toBe('Acknowledge the load advisories above before pushing');
+
+    const ack = Array.from(el.querySelectorAll('input[type="checkbox"]')).at(-1) as HTMLInputElement;
+    ack.checked = true;
+    ack.dispatchEvent(new Event('change'));
+    await el.updateComplete;
+
+    expect(push().disabled).toBe(false);
+  });
+
+  // The other half: an advisory must not become a way to wave through cargo that
+  // genuinely did not fit, or a gross weight over GVWR.
+  it('still blocks the push on cargo that did not fit', async () => {
+    const el = await mountPlan((p) => {
+      p.loads[0].load_plan!.gvw_status = 'PASS';
+      p.loads[0].load_plan!.axle_loads[1].status = 'PASS';
+      p.loads[0].load_plan!.unplaced = [
+        { sku: 'WRC-2X8-20', quantity: 12, reason: 'TRUCK_FULL', detail: 'truck full' },
+      ];
+    });
+
+    const push = Array.from(el.querySelectorAll('button')).find((b) =>
+      text(b).includes('Push to GableLBM dispatch'),
+    ) as HTMLButtonElement;
+
+    expect(push.disabled).toBe(true);
+    expect(text(el)).toContain('Load capacity not cleared');
+    expect(text(el)).toContain('did not fit and were dropped');
   });
 
   // The push gate must judge each truck's OWN capacity, not just its route: a

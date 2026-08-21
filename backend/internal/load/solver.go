@@ -109,7 +109,23 @@ func computeAxleLoads(plan *Plan, v Vehicle) {
 		loads[i] += cargoLoads[i]
 	}
 
-	plan.TotalWeightLbs = int64(math.Round(cargo)) + v.TareWeightLbs
+	// Cargo that rides without a placement (a dimensionless SKU: nothing to
+	// position, but the yard still loads the box) is real weight on the truck.
+	// It is summed AFTER the conservation check above — that check is about the
+	// per-axle split of PLACED cargo only — so gross stays exact without making
+	// the split look like it lost a pound.
+	//
+	// It is deliberately NOT recorded in ProfileIssues: that field is about the
+	// FLEET profile's completeness, and a dimensionless SKU is a catalog gap, not
+	// a truck one. UnmodeledWeightLbs is the signal for it.
+	var unmodeled float64
+	for _, u := range plan.Unplaced {
+		if u.Rides() {
+			unmodeled += u.WeightLbs
+		}
+	}
+	plan.UnmodeledWeightLbs = int64(math.Round(unmodeled))
+	plan.TotalWeightLbs = int64(math.Round(cargo)) + plan.UnmodeledWeightLbs + v.TareWeightLbs
 
 	worst := statusRank(StatusPass)
 	if len(axles) == 0 {
