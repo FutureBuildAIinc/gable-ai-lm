@@ -52,11 +52,11 @@ func (s *Service) Review(ctx context.Context, id string) (*Plan, error) {
 		return nil, err
 	}
 	if len(p.Loads) == 0 {
-		return nil, fmt.Errorf("no truck loads to review — run assign + pack first")
+		return nil, refusedf("no truck loads to review — run assign + pack first")
 	}
 	for _, l := range p.Loads {
 		if l.LoadPlan == nil {
-			return nil, fmt.Errorf("truck %s is not packed yet — run pack first", l.VehicleName)
+			return nil, refusedf("truck %s is not packed yet — run pack first", l.VehicleName)
 		}
 	}
 

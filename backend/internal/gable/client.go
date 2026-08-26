@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -27,9 +28,20 @@ type Client struct {
 
 // NewClient builds a GableLBM integration client. baseURL is e.g.
 // "http://localhost:8080"; integrationKey is sent as X-Integration-Key.
+//
+// A trailing slash on baseURL is stripped, because GABLE_API_URL is deployment
+// configuration a human types and one keystroke there used to break write-back
+// alone. Every path below starts with "/", so "http://host:8080/" produced
+// "//api/integration/…". Go's http.ServeMux — which is what GableLBM serves
+// with — cleans that path and answers 301 to the single-slash form, and Go's
+// http.Client turns a 301 into a GET and drops the request body. The GETs
+// (vehicles, orders, products) therefore kept working perfectly, while
+// PushDeliveryRoute arrived as a bodyless GET on a POST-only route: the Load
+// Builder looked healthy and only the one call that writes to the dispatch
+// board failed, with a message naming a POST the server never saw.
 func NewClient(baseURL, integrationKey string) *Client {
 	return &Client{
-		baseURL:        baseURL,
+		baseURL:        strings.TrimRight(baseURL, "/"),
 		integrationKey: integrationKey,
 		http:           &http.Client{Timeout: 15 * time.Second},
 	}
@@ -221,7 +233,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+			// Name the call, like the transport and status paths above do. A
+			// bare "decode response: EOF" told an operator that SOMETHING
+			// upstream answered in a shape AI_LM could not read, and nothing
+			// about which of the six routes it was.
+			return fmt.Errorf("decode %s %s response: %w", method, path, err)
 		}
 	}
 	return nil

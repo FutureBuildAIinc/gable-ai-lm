@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,31 @@ const defaultDeckHeightIn = 58.0
 // and maps to 502. Without the distinction an empty POST body reported
 // "GableLBM is down", sending the operator to check an ERP that was fine.
 var ErrInvalidRequest = errors.New("invalid request")
+
+// Refusal is a workflow transition this module DECLINED on its own rules — a
+// push gate, a missing prerequisite step, a request that names a truck this
+// plan does not have. It is not a failure to reach GableLBM or the database.
+//
+// The distinction exists so the message can be shown. Every refusal in this
+// package is a sentence written for a dispatcher, and the dispatch gate is only
+// worth having if the person it stops is told what stopped them: "load capacity
+// not cleared on: Truck 4 - Boom (GVW FAIL; 1 SKU(s) did not fit and were
+// dropped: STONE-STEP-72 ×3 (truck full)) — re-pack or rebalance before
+// pushing" is an instruction, and "Unprocessable Entity" is a shrug.
+//
+// Only a Refusal is forwarded verbatim to a client (see Handler.respondStep).
+// An ordinary error is not, and must not be: `fetch vehicles: gable GET
+// /api/integration/vehicles: status 500: <512 bytes of somebody else's
+// response body>` is a diagnostic for a log, not a sentence for a yard.
+type Refusal struct{ Msg string }
+
+func (r *Refusal) Error() string { return r.Msg }
+
+// refusedf builds a Refusal. Use it for anything a dispatcher should read;
+// keep fmt.Errorf (and %w) for anything that wraps an upstream or storage fault.
+func refusedf(format string, a ...any) error {
+	return &Refusal{Msg: fmt.Sprintf(format, a...)}
+}
 
 // planStore is the persistence seam for workflow plans (satisfied by
 // *Repository). It is declared consumer-side like every other seam in this
@@ -408,7 +434,7 @@ func (s *Service) Pack(ctx context.Context, id string) (*Plan, error) {
 		return nil, err
 	}
 	if len(p.Loads) == 0 {
-		return nil, fmt.Errorf("no truck assignments yet — run assign first")
+		return nil, refusedf("no truck assignments yet — run assign first")
 	}
 
 	vehicles, err := s.gable.ListVehicles(ctx)
@@ -473,9 +499,59 @@ func (s *Service) packLoad(ctx context.Context, p *Plan, l *TruckLoad, vehiclesB
 		v.BedHeightIn = maxHeightIn
 	}
 	lp := load.SolveSequencedBundles(v, stops)
+	prev := l.LoadPlan
 	l.LoadPlan = &lp
 	l.Compliance = nil // packing changed — any previous review is stale
+	invalidateSignOff(l, prev, &lp)
 	return nil
+}
+
+// invalidateSignOff clears the yard sign-off when a re-pack produced a
+// DIFFERENT physical load from the one that was signed for.
+//
+// The proof-of-load gate exists so no truck leaves the yard without a photo of
+// how it was actually loaded and a human attesting to it. AttachProof already
+// encodes half of that rule — new evidence supersedes a prior sign-off — but
+// the other half was missing: the packing itself can change AFTER a sign-off,
+// through Pack, through Resequence, through the compliance reviewer's
+// height-capped LOAD_ADJUST re-pack, and through a cross-truck weight
+// rebalance. None of those touched Proof, so a sign-off taken against one
+// arrangement of the deck still released a truck packed a different way — with
+// different pack steps, a different securement plan, and possibly cargo that no
+// longer fits at all. The signature said "I saw this load"; the manifest was
+// somebody else's.
+//
+// The attachments are deliberately KEPT: they are photographs of a truck, and
+// deleting a dispatcher's evidence is not this function's business. Only the
+// attestation is withdrawn, so the yard re-checks the deck and signs again —
+// which is the same thing AttachProof does when a new photo lands.
+//
+// A re-pack that lands on the identical plan (re-running Pack on an unchanged
+// order, the common accidental double-click) is a no-op, so a dispatcher is not
+// forced to chase a fresh signature for nothing.
+func invalidateSignOff(l *TruckLoad, prev, next *load.Plan) {
+	if l.Proof == nil || !l.Proof.SignedOff || samePacking(prev, next) {
+		return
+	}
+	l.Proof.SignedOff = false
+	l.Proof.SignedAt = nil
+	l.Proof.Note = strings.TrimSpace(l.Proof.Note + " (sign-off withdrawn: this truck was re-packed after it was signed for)")
+}
+
+// samePacking reports whether two solves describe the same physical load: the
+// same units in the same places in the same order, the same cargo left behind,
+// and the same totals. Fail-closed — a nil previous plan is not the same as
+// anything, so the first solve after a sign-off always invalidates it.
+func samePacking(a, b *load.Plan) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.TotalWeightLbs == b.TotalWeightLbs &&
+		a.UnmodeledWeightLbs == b.UnmodeledWeightLbs &&
+		a.MaxLoadHeightIn == b.MaxLoadHeightIn &&
+		reflect.DeepEqual(a.Placements, b.Placements) &&
+		reflect.DeepEqual(a.Unplaced, b.Unplaced) &&
+		reflect.DeepEqual(a.Securement, b.Securement)
 }
 
 // Resequence manually reorders one truck's stops (the dispatcher's packing-
@@ -498,7 +574,7 @@ func (s *Service) Resequence(ctx context.Context, id, vehicleID string, orderIDs
 		}
 	}
 	if l == nil {
-		return nil, fmt.Errorf("no load for vehicle %s in this plan", vehicleID)
+		return nil, refusedf("no load for vehicle %s in this plan", vehicleID)
 	}
 
 	byOrder := make(map[string]Stop, len(l.Stops))
@@ -506,13 +582,13 @@ func (s *Service) Resequence(ctx context.Context, id, vehicleID string, orderIDs
 		byOrder[st.OrderID] = st
 	}
 	if len(orderIDs) != len(l.Stops) {
-		return nil, fmt.Errorf("order_ids must be a permutation of the load's %d stops", len(l.Stops))
+		return nil, refusedf("order_ids must be a permutation of the load's %d stops", len(l.Stops))
 	}
 	reordered := make([]Stop, 0, len(orderIDs))
 	for i, oid := range orderIDs {
 		st, ok := byOrder[oid]
 		if !ok {
-			return nil, fmt.Errorf("order %s is not on this load", oid)
+			return nil, refusedf("order %s is not on this load", oid)
 		}
 		st.Sequence = i + 1
 		reordered = append(reordered, st)
@@ -691,7 +767,7 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		return nil, err
 	}
 	if len(p.Loads) == 0 {
-		return nil, fmt.Errorf("nothing to push — no truck loads")
+		return nil, refusedf("nothing to push — no truck loads")
 	}
 
 	var failing []string
@@ -699,10 +775,10 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	var unsigned []string
 	for _, l := range p.Loads {
 		if l.LoadPlan == nil {
-			return nil, fmt.Errorf("truck %s is not packed yet", l.VehicleName)
+			return nil, refusedf("truck %s is not packed yet", l.VehicleName)
 		}
 		if l.Compliance == nil {
-			return nil, fmt.Errorf("truck %s has not passed route review yet", l.VehicleName)
+			return nil, refusedf("truck %s has not passed route review yet", l.VehicleName)
 		}
 		if l.Compliance.Status == "FAIL" {
 			failing = append(failing, l.VehicleName)
@@ -728,13 +804,13 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		}
 	}
 	if len(failing) > 0 {
-		return nil, fmt.Errorf("compliance FAIL on: %s — resolve before pushing", strings.Join(failing, ", "))
+		return nil, refusedf("compliance FAIL on: %s — resolve before pushing", strings.Join(failing, ", "))
 	}
 	if len(overCapacity) > 0 {
-		return nil, fmt.Errorf("load capacity not cleared on: %s — re-pack or rebalance before pushing", strings.Join(overCapacity, ", "))
+		return nil, refusedf("load capacity not cleared on: %s — re-pack or rebalance before pushing", strings.Join(overCapacity, ", "))
 	}
 	if len(unsigned) > 0 {
-		return nil, fmt.Errorf("yard proof + sign-off required before depart on: %s", strings.Join(unsigned, ", "))
+		return nil, refusedf("yard proof + sign-off required before depart on: %s", strings.Join(unsigned, ", "))
 	}
 
 	for _, l := range p.Loads {
@@ -938,7 +1014,7 @@ func (s *Service) SetPriority(ctx context.Context, id, orderID string, priority 
 	for i := range p.Orders {
 		if p.Orders[i].OrderID == orderID {
 			if priority && !p.Orders[i].Routable {
-				return nil, fmt.Errorf("order %s has no geolocation and cannot be prioritized", orderID)
+				return nil, refusedf("order %s has no geolocation and cannot be prioritized", orderID)
 			}
 			p.Orders[i].Priority = priority
 			found = true
@@ -946,7 +1022,7 @@ func (s *Service) SetPriority(ctx context.Context, id, orderID string, priority 
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("order %s is not part of this plan", orderID)
+		return nil, refusedf("order %s is not part of this plan", orderID)
 	}
 
 	// Reflect the flag onto any materialized stop (assigned or unassigned).
@@ -1008,10 +1084,10 @@ func (s *Service) SetPriority(ctx context.Context, id, orderID string, priority 
 // the truck carrying the order is re-packed and later-stage artifacts cleared.
 func (s *Service) SetLineDimensions(ctx context.Context, id, orderID string, req DimensionOverrideRequest) (*Plan, error) {
 	if req.ProductID == "" && req.SKU == "" {
-		return nil, fmt.Errorf("product_id or sku is required to target a line")
+		return nil, refusedf("product_id or sku is required to target a line")
 	}
 	if req.LengthIn <= 0 || req.WidthIn <= 0 || req.HeightIn <= 0 {
-		return nil, fmt.Errorf("length_in, width_in and height_in must be positive")
+		return nil, refusedf("length_in, width_in and height_in must be positive")
 	}
 
 	p, err := s.repo.Get(ctx, id)
@@ -1027,7 +1103,7 @@ func (s *Service) SetLineDimensions(ctx context.Context, id, orderID string, req
 		}
 	}
 	if order == nil {
-		return nil, fmt.Errorf("order %s is not part of this plan", orderID)
+		return nil, refusedf("order %s is not part of this plan", orderID)
 	}
 
 	tol := req.TolerancePct
@@ -1061,7 +1137,7 @@ func (s *Service) SetLineDimensions(ctx context.Context, id, orderID string, req
 		matched++
 	}
 	if matched == 0 {
-		return nil, fmt.Errorf("no line in order %s matched the override target", orderID)
+		return nil, refusedf("no line in order %s matched the override target", orderID)
 	}
 
 	order.recomputeTotals()

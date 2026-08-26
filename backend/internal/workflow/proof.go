@@ -11,7 +11,6 @@ package workflow
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 )
@@ -23,7 +22,7 @@ func loadByVehicle(p *Plan, vehicleID string) (*TruckLoad, error) {
 			return &p.Loads[i], nil
 		}
 	}
-	return nil, fmt.Errorf("no load for vehicle %s in this plan", vehicleID)
+	return nil, refusedf("no load for vehicle %s in this plan", vehicleID)
 }
 
 // AttachProof records a yard photo/video reference on a packed load (T1-6).
@@ -31,7 +30,7 @@ func loadByVehicle(p *Plan, vehicleID string) (*TruckLoad, error) {
 // re-confirmed.
 func (s *Service) AttachProof(ctx context.Context, id, vehicleID string, req ProofRequest) (*Plan, error) {
 	if strings.TrimSpace(req.URL) == "" {
-		return nil, fmt.Errorf("url is required")
+		return nil, refusedf("url is required")
 	}
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -42,7 +41,7 @@ func (s *Service) AttachProof(ctx context.Context, id, vehicleID string, req Pro
 		return nil, err
 	}
 	if l.LoadPlan == nil {
-		return nil, fmt.Errorf("truck %s is not packed yet — pack before attaching proof", l.VehicleName)
+		return nil, refusedf("truck %s is not packed yet — pack before attaching proof", l.VehicleName)
 	}
 
 	kind := strings.ToUpper(strings.TrimSpace(req.Kind))
@@ -75,7 +74,7 @@ func (s *Service) AttachProof(ctx context.Context, id, vehicleID string, req Pro
 // Requires at least one proof attachment first.
 func (s *Service) SignOffLoad(ctx context.Context, id, vehicleID string, req SignOffRequest) (*Plan, error) {
 	if strings.TrimSpace(req.SignedBy) == "" {
-		return nil, fmt.Errorf("signed_by is required")
+		return nil, refusedf("signed_by is required")
 	}
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -86,7 +85,7 @@ func (s *Service) SignOffLoad(ctx context.Context, id, vehicleID string, req Sig
 		return nil, err
 	}
 	if l.Proof == nil || len(l.Proof.Attachments) == 0 {
-		return nil, fmt.Errorf("truck %s needs at least one proof photo/video before sign-off", l.VehicleName)
+		return nil, refusedf("truck %s needs at least one proof photo/video before sign-off", l.VehicleName)
 	}
 
 	now := time.Now()

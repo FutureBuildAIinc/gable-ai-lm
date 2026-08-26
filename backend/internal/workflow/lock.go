@@ -113,7 +113,7 @@ func (s *Service) SetLock(ctx context.Context, id string, req LockRequest) (*Pla
 
 	window := strings.ToUpper(strings.TrimSpace(req.Window))
 	if window == LockWindowCustom && req.LockAt == "" {
-		return nil, fmt.Errorf("lock_at (HH:MM) is required for a CUSTOM window")
+		return nil, refusedf("lock_at (HH:MM) is required for a CUSTOM window")
 	}
 	lockAt := req.LockAt
 	if window != "" && window != LockWindowCustom {
@@ -160,7 +160,7 @@ func (s *Service) Unlock(ctx context.Context, id, reason, by string) (*Plan, err
 // it); when unlocked it is recorded APPROVED for the dispatcher to re-assign.
 func (s *Service) AddLateOrder(ctx context.Context, id string, req LateAddRequest) (*Plan, error) {
 	if req.OrderID == "" {
-		return nil, fmt.Errorf("order_id is required")
+		return nil, refusedf("order_id is required")
 	}
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -170,7 +170,7 @@ func (s *Service) AddLateOrder(ctx context.Context, id string, req LateAddReques
 
 	for _, a := range p.Orders {
 		if a.OrderID == req.OrderID {
-			return nil, fmt.Errorf("order %s is already on this run", req.OrderID)
+			return nil, refusedf("order %s is already on this run", req.OrderID)
 		}
 	}
 
@@ -186,7 +186,7 @@ func (s *Service) AddLateOrder(ctx context.Context, id string, req LateAddReques
 		}
 	}
 	if found == nil {
-		return nil, fmt.Errorf("order %s is not a confirmed GableLBM order for %s", req.OrderID, p.PlanDate)
+		return nil, refusedf("order %s is not a confirmed GableLBM order for %s", req.OrderID, p.PlanDate)
 	}
 
 	products, err := s.catalog.ListEffectiveProducts(ctx)
@@ -236,10 +236,10 @@ func (s *Service) ResolveLateAdd(ctx context.Context, id, orderID string, req La
 		}
 	}
 	if idx < 0 {
-		return nil, fmt.Errorf("no queued late add for order %s", orderID)
+		return nil, refusedf("no queued late add for order %s", orderID)
 	}
 	if p.LateAdds[idx].Status != LateAddPending {
-		return nil, fmt.Errorf("late add for order %s is already %s", orderID, p.LateAdds[idx].Status)
+		return nil, refusedf("late add for order %s is already %s", orderID, p.LateAdds[idx].Status)
 	}
 
 	if req.Reject {

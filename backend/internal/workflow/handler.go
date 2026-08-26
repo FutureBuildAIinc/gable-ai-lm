@@ -144,6 +144,14 @@ func (h *Handler) step(w http.ResponseWriter, r *http.Request, fn func(ctx conte
 
 // respondStep is the shared success/error mapping for workflow transitions. A
 // locked run (T2-3) maps to 423 Locked so the UI can prompt for approval.
+//
+// A *Refusal — a gate this module closed on its own rules — is answered with
+// its OWN sentence. That sentence is the product: the dispatch gate names the
+// truck and the reason it will not go ("yard proof + sign-off required before
+// depart on: Truck 1 - Flatbed"), and until this branch existed every one of
+// them collapsed into a bare "workflow step failed" that the operator never saw
+// anyway. Anything else stays generic here, because a wrapped upstream error
+// carries a URL and up to 512 bytes of GableLBM's response body.
 func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan, err error) {
 	if errors.Is(err, ErrNotFound) {
 		httputil.RespondError(w, r, "plan not found", http.StatusNotFound, err)
@@ -157,6 +165,11 @@ func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan
 	// applied — 409 tells the UI to reload the current plan and retry.
 	if errors.Is(err, ErrVersionConflict) {
 		httputil.RespondError(w, r, err.Error(), http.StatusConflict, err)
+		return
+	}
+	var refusal *Refusal
+	if errors.As(err, &refusal) {
+		httputil.RespondError(w, r, refusal.Msg, http.StatusUnprocessableEntity, err)
 		return
 	}
 	if err != nil {

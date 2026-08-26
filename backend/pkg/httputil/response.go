@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 )
 
 // ErrorResponse is the standard JSON error envelope returned to clients.
@@ -36,8 +37,30 @@ func RespondJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 // RespondError sends a structured JSON error to the client and logs the full
-// error server-side with request context. This prevents internal error details
-// (DB schema, query structure, service names) from leaking to clients.
+// error server-side with request context.
+//
+// The two arguments are for two different audiences and only one of them is
+// ever serialized:
+//
+//   - msg is the CLIENT's sentence. Every caller writes it by hand, and it is
+//     what the app renders (`aiLmService.jsonOrThrow` reads `error.message`
+//     verbatim). Callers must therefore keep it free of schema, query and
+//     internal identifiers — the same discipline they already apply, because
+//     it is also the log line.
+//   - err is the DIAGNOSTIC. It is logged and NEVER sent. That is what keeps
+//     a pgx error, a wrapped upstream URL, or 512 bytes of another service's
+//     response body out of a browser.
+//
+// msg used to be logged and then thrown away, replaced on the wire by
+// genericMessage(code). The intent was leak prevention, and the effect was to
+// silence a module whose whole job is refusing unsafe work out loud: a
+// dispatcher blocked from sending an overweight truck was told "Unprocessable
+// Entity", and a locked run's approval prompt lost the cutoff time it needed to
+// ask for. The leak the substitution guarded against lives in err, which was
+// never on the wire in the first place.
+//
+// A blank msg still falls back to the generic phrase, so a caller that has
+// nothing specific to say cannot accidentally send an empty message.
 func RespondError(w http.ResponseWriter, r *http.Request, msg string, code int, err error) {
 	reqID := w.Header().Get("X-Request-ID")
 	if reqID == "" {
@@ -52,8 +75,13 @@ func RespondError(w http.ResponseWriter, r *http.Request, msg string, code int, 
 		"request_id", reqID,
 	)
 
+	clientMsg := strings.TrimSpace(msg)
+	if clientMsg == "" {
+		clientMsg = genericMessage(code)
+	}
+
 	RespondJSON(w, code, ErrorResponse{
-		Error: ErrorDetail{Code: errorCode(code), Message: genericMessage(code)},
+		Error: ErrorDetail{Code: errorCode(code), Message: clientMsg},
 		Meta:  ErrorMeta{RequestID: reqID},
 	})
 }

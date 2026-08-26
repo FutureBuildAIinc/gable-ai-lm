@@ -57,24 +57,32 @@ func computeSecurement(plan *Plan, v Vehicle) {
 
 	aggregate := int64(math.Ceil(cargo * rs.AggregateWLLFraction))
 
-	// Per-strap WLL share; escalate the count until a 4" winch strap covers it
-	// (never below the ruleset minimum).
+	// Strap count: the ruleset minimum, escalated until a 4" winch strap can
+	// carry each share.
 	n := required
 	if n < 1 {
 		n = 1
 	}
-	perStrap := int64(math.Ceil(float64(aggregate) / float64(n)))
-	for perStrap > wll4InWinchLbs {
+	for int64(math.Ceil(float64(aggregate)/float64(n))) > wll4InWinchLbs {
 		n++
-		perStrap = int64(math.Ceil(float64(aggregate) / float64(n)))
 	}
+
+	positions, snapped := anchorPositions(minX, maxX, spacing, n)
+	if len(positions) == 0 {
+		return // unreachable: n ≥ 1 always yields at least one position
+	}
+
+	// The per-strap WLL share is derived from the straps ACTUALLY emitted, so
+	// the sum of Strap.RequiredWLLLbs always meets MinAggregateWLLLbs. Deriving
+	// it from a count the positions could not deliver is exactly how this plan
+	// came to recommend a single 2,500 lb strap for a load whose own note
+	// demanded 5,000 lb of aggregate WLL — see anchorPositions.
+	perStrap := int64(math.Ceil(float64(aggregate) / float64(len(positions))))
 	recommended := fmt.Sprintf("2\" ratchet strap (WLL %d lb)", wll2InRatchetLbs)
 	if perStrap > wll2InRatchetLbs {
 		recommended = fmt.Sprintf("4\" winch strap (WLL %d lb)", wll4InWinchLbs)
 	}
 
-	// Optimize placement: even spread across the load span, snapped to anchors.
-	positions := anchorPositions(minX, maxX, spacing, n)
 	straps := make([]Strap, 0, len(positions))
 	for i, pos := range positions {
 		straps = append(straps, Strap{
@@ -85,11 +93,20 @@ func computeSecurement(plan *Plan, v Vehicle) {
 		})
 	}
 
+	anchorNote := fmt.Sprintf("Straps snapped to the bed's %.0f in anchor pitch (winch track / stake pockets).", spacing)
+	if !snapped {
+		// Say so rather than claim a snap that did not happen: the count is the
+		// legal minimum and it wins, but the yard needs to know these positions
+		// are approximate and to use the nearest real anchor to each.
+		anchorNote = fmt.Sprintf(
+			"This load spans fewer than %d of the bed's %.0f in anchors, so strap positions are spread across the load rather than snapped — use the nearest real anchor to each.",
+			len(positions), spacing)
+	}
 	notes := []string{
 		fmt.Sprintf("Aggregate WLL must be ≥ %.0f%% of cargo weight (%d lb) — %s.",
 			rs.AggregateWLLFraction*100, aggregate, rs.Name),
 		rs.Basis,
-		fmt.Sprintf("Straps snapped to the bed's %.0f in anchor pitch (winch track / stake pockets).", spacing),
+		anchorNote,
 		"Use edge protectors wherever a strap crosses a board edge.",
 		"Tighten winches/ratchets after the first 50 miles and re-check at every stop.",
 		"Load is tiered by stop — re-strap the remaining tiers after each delivery.",
@@ -109,53 +126,83 @@ func computeSecurement(plan *Plan, v Vehicle) {
 	}
 }
 
-// anchorPositions chooses n tie-down positions spread evenly across the load
-// span and snapped to the modeled bed anchor grid (a multiple of spacing). The
-// returned positions are unique and sorted; collisions are resolved to the
-// nearest free anchor so two straps never share one anchor.
-func anchorPositions(minX, maxX, spacing float64, n int) []float64 {
+// anchorPositions chooses n tie-down positions across the load span. It returns
+// EXACTLY n positions whenever n > 0, sorted front→back, and reports whether
+// every one of them landed on a modeled bed anchor.
+//
+// Positions are spread evenly and snapped to the anchor grid (a multiple of
+// spacing) whenever the span contains at least n distinct anchors — the normal
+// case for a lumber load, and what the second return value reports as true.
+// Collisions are resolved to the nearest free anchor so two straps never share
+// one.
+//
+// When the span does NOT contain n anchors — a short, heavy article on a coarse
+// anchor pitch, e.g. a 40 in pallet of block on a 24 in winch track — the
+// positions are spread across the span WITHOUT snapping instead of dropping the
+// surplus straps. The anchor pitch is a model of the deck (and is defaulted
+// outright when the fleet profile carries none); the tie-down count is a legal
+// minimum from the ruleset. Letting the model shorten the list under-secured
+// the load twice over: fewer straps than the ruleset itself demanded, AND — far
+// worse — an aggregate WLL below the ruleset minimum, because the per-strap
+// share had been sized for the count that was never emitted. Two 40 in pallets
+// weighing 10,000 lb came back with ONE 2,500 lb strap against a stated 5,000 lb
+// minimum.
+func anchorPositions(minX, maxX, spacing float64, n int) (positions []float64, snapped bool) {
+	if n <= 0 {
+		return nil, true
+	}
+	if spacing > 0 && maxX > minX {
+		// Anchor slots that fall within the load span.
+		lo := math.Ceil(minX/spacing) * spacing
+		hi := math.Floor(maxX/spacing) * spacing
+		var slots []float64
+		for x := lo; x <= hi+1e-9; x += spacing {
+			slots = append(slots, x)
+		}
+		if len(slots) >= n {
+			used := make([]bool, len(slots))
+			chosen := make([]float64, 0, n)
+			for i := 0; i < n; i++ {
+				frac := 0.5
+				if n > 1 {
+					frac = float64(i) / float64(n-1)
+				}
+				idx := int(math.Round(frac * float64(len(slots)-1)))
+				idx = nearestFreeSlot(used, idx)
+				used[idx] = true
+				chosen = append(chosen, slots[idx])
+			}
+			sort.Float64s(chosen)
+			return chosen, true
+		}
+	}
+	return evenSpread(minX, maxX, n), false
+}
+
+// evenSpread places exactly n positions across [minX, maxX]: both ends plus an
+// even interior pitch. A degenerate span puts them all at the centre — the
+// count is still honoured, because it is the aggregate WLL that carries the
+// load and the count is what divides it.
+func evenSpread(minX, maxX float64, n int) []float64 {
 	if n <= 0 {
 		return nil
 	}
-	if spacing <= 0 || maxX <= minX {
-		// Degenerate span — stack everything at the centre.
-		return []float64{(minX + maxX) / 2}
-	}
-
-	// Anchor slots that fall within the load span.
-	lo := math.Ceil(minX/spacing) * spacing
-	hi := math.Floor(maxX/spacing) * spacing
-	var slots []float64
-	for x := lo; x <= hi+1e-9; x += spacing {
-		slots = append(slots, x)
-	}
-	if len(slots) == 0 {
-		// Span shorter than one anchor cell — snap the centre to an anchor.
-		mid := math.Round((minX+maxX)/2/spacing) * spacing
-		return []float64{mid}
-	}
-	if n >= len(slots) {
-		return slots // use every anchor in the span
-	}
-
-	used := make([]bool, len(slots))
-	chosen := make([]float64, 0, n)
-	for i := 0; i < n; i++ {
-		frac := 0.5
-		if n > 1 {
-			frac = float64(i) / float64(n-1)
+	out := make([]float64, 0, n)
+	if n == 1 || maxX <= minX {
+		mid := (minX + maxX) / 2
+		for i := 0; i < n; i++ {
+			out = append(out, mid)
 		}
-		idx := int(math.Round(frac * float64(len(slots)-1)))
-		idx = nearestFreeSlot(used, idx)
-		used[idx] = true
-		chosen = append(chosen, slots[idx])
+		return out
 	}
-	sort.Float64s(chosen)
-	return chosen
+	for i := 0; i < n; i++ {
+		out = append(out, minX+(maxX-minX)*float64(i)/float64(n-1))
+	}
+	return out
 }
 
 // nearestFreeSlot returns idx if free, else the closest free index searching
-// outward. Assumes at least one slot is free (guaranteed: n < len(slots)).
+// outward. Assumes at least one slot is free (guaranteed: n ≤ len(slots)).
 func nearestFreeSlot(used []bool, idx int) int {
 	if idx < 0 {
 		idx = 0
