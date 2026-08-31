@@ -479,3 +479,63 @@ func TestDepotNoteSurvivesThePayloadRoundTrip(t *testing.T) {
 		t.Fatalf("order branch did not round-trip: %+v", out.Orders)
 	}
 }
+
+// TestIngestWithoutBranchIDsNeverAsksForTheBranchList: the branch lookup is a
+// round-trip to the ERP on every single ingest, and a day whose orders name no
+// yard has nothing for it to answer — the list came back, was handed to the
+// ladder and was ignored. Worse, the deployments that pay for that call are
+// exactly the ones least able to serve it: a GableLBM predating
+// orders.branch_id generally predates /api/integration/locations too, so the
+// call is a guaranteed 404 whose result cannot change the origin. The routing
+// endpoint already gated the fetch on "could this change the answer?"; this
+// pins the same gate here, and pins that gating it changes nothing about WHERE
+// the run is rooted.
+func TestIngestWithoutBranchIDsNeverAsksForTheBranchList(t *testing.T) {
+	store := newFakePlanStore()
+	g := &fakeGable{
+		orders:    texasOrders(), // no branch_id at all
+		locations: texasBranches(),
+	}
+	svc := newTestService(store, g, Config{DepotLat: fptr(30.2672), DepotLng: fptr(-97.7431)})
+
+	p, err := svc.Ingest(context.Background(), IngestRequest{Date: "2026-06-26"})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if g.locationCalls != 0 {
+		t.Fatalf("the branch list was fetched %d times for a day whose orders name no yard", g.locationCalls)
+	}
+	// The origin is the only thing that must not move.
+	if p.DepotSource != DepotSourceConfig ||
+		math.Abs(p.DepotLat-30.2672) > 1e-6 || math.Abs(p.DepotLng-(-97.7431)) > 1e-6 {
+		t.Fatalf("skipping the fetch moved the origin: (%v, %v) source %q",
+			p.DepotLat, p.DepotLng, p.DepotSource)
+	}
+	if p.DepotNote != "" {
+		t.Fatalf("nothing was declined; note = %q", p.DepotNote)
+	}
+}
+
+// TestIngestWithBranchIDsStillAsksForTheBranchList is the other half of that
+// gate: the fetch is skipped because it cannot change the answer, never because
+// it is inconvenient. A day whose orders DO name a yard must still be looked up.
+func TestIngestWithBranchIDsStillAsksForTheBranchList(t *testing.T) {
+	store := newFakePlanStore()
+	g := &fakeGable{
+		orders:    shippingFrom(texasOrders(), dallasYardID),
+		locations: texasBranches(),
+	}
+	svc := newTestService(store, g, Config{DepotLat: fptr(30.2672), DepotLng: fptr(-97.7431)})
+
+	p, err := svc.Ingest(context.Background(), IngestRequest{Date: "2026-06-26"})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if g.locationCalls != 1 {
+		t.Fatalf("branch lookups = %d, want exactly 1 for a day whose orders name a yard", g.locationCalls)
+	}
+	if p.DepotSource != DepotSourceBranch || math.Abs(p.DepotLat-dallasYardLat) > 1e-6 {
+		t.Fatalf("depot = (%v, %v) source %q, want the orders' Dallas yard",
+			p.DepotLat, p.DepotLng, p.DepotSource)
+	}
+}

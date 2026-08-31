@@ -178,6 +178,20 @@ func resolveBranch(ids []string, branches []gable.Location) (lat, lng float64, o
 	return *b.Latitude, *b.Longitude, true, ""
 }
 
+// ResolveBranch is the branch rung on its own: "is this ONE yard, and do we
+// know where it is?", with the same answer and the same sentence the ladder
+// itself would produce.
+//
+// It is exported because a caller can hold TWO candidate answers at once. The
+// routing endpoint has the yard its caller named explicitly AND the yards its
+// orders ship from; the request outranks the orders, but only while it is
+// usable, and "usable" is precisely this question. Asking it here means the
+// caller never re-implements the not-in-the-list / never-geocoded /
+// out-of-range checks, and never invents its own words for them.
+func ResolveBranch(ids []string, branches []gable.Location) (lat, lng float64, ok bool, why string) {
+	return resolveBranch(ids, branches)
+}
+
 // DistinctBranchIDs lists the yards a run ships from, in the order they first
 // appear: empty ids contribute nothing, and a repeated id collapses to one.
 //
@@ -226,6 +240,77 @@ func SpanningBranchesPhrase(ids []string, branches []gable.Location) string {
 	sort.Strings(labels)
 	return fmt.Sprintf("this run's orders ship from %d different branches (%s)",
 		len(labels), strings.Join(labels, ", "))
+}
+
+// RequestedBranchMismatchPhrase reports that a run is being rooted at the yard
+// its caller named while its orders name some OTHER yard — which is a fact
+// about wrongness, not about span.
+//
+// The distinction matters because the two are not the same set, and the more
+// dangerous case is the one that is not a span at all. A day whose orders are
+// split Dallas/Plano and rooted at Dallas has half its stops leaving from the
+// wrong yard; a day whose orders ALL ship from Fort Worth and is rooted at
+// Dallas has every one of them leaving from the wrong yard. Warning on span
+// alone reports the first and stays silent on the second, which is exactly
+// backwards. So the condition here is "the orders name a yard that is not the
+// requested one", and both cases name the requested yard and the yard the
+// orders actually ship from.
+//
+// It returns "" when there is nothing to warn about: no requested yard, no
+// order naming a yard, or every order naming the requested one.
+//
+// Like every other sentence in this package it lives here rather than in the
+// caller, so that the note an operator reads is byte-identical whichever module
+// wrote it.
+func RequestedBranchMismatchPhrase(requested string, orderIDs []string, branches []gable.Location) string {
+	distinct := DistinctBranchIDs(orderIDs)
+	if requested == "" || len(distinct) == 0 {
+		return ""
+	}
+	if len(distinct) == 1 && distinct[0] == requested {
+		return "" // the request and the orders agree; nothing happened.
+	}
+
+	byID := indexBranches(branches)
+	wantedLabel := describeBranch(byID, requested)
+
+	for _, id := range distinct {
+		if id == requested {
+			// Some of the day ships from the requested yard, some does not.
+			return SpanningBranchesPhrase(distinct, branches) +
+				", and this plan is rooted at the branch named on the request (" + wantedLabel +
+				"), so the stops belonging to the other yards are routed from there too"
+		}
+	}
+
+	// None of it does: every stop is being routed from a yard no order on this
+	// date ships from.
+	head := SpanningBranchesPhrase(distinct, branches) +
+		", none of them the branch named on the request (" + wantedLabel + ")"
+	if len(distinct) == 1 {
+		head = fmt.Sprintf("this run's orders all ship from %s, not the branch named on the request (%s)",
+			describeBranch(byID, distinct[0]), wantedLabel)
+	}
+	return head + ", and this plan is rooted at the requested branch anyway, so every stop is routed from a yard none of them ships from"
+}
+
+// OrdersOwnBranchPhrase completes a note by naming the yard a run was rooted at
+// once the yard its caller ASKED for turned out to be unusable. It is the
+// BRANCH-rung sibling of FallbackPhrase: the requested yard is unknown,
+// ungeocoded or out of range, the orders name a yard that is none of those
+// things, and the doctrine is BRANCH before CONFIG — so the run roots at the
+// orders' own yard rather than skipping a live branch answer because a
+// different branch failed.
+//
+// It returns "" unless the orders name exactly one yard, which is the only
+// shape the branch rung can accept.
+func OrdersOwnBranchPhrase(ids []string, branches []gable.Location) string {
+	distinct := DistinctBranchIDs(ids)
+	if len(distinct) != 1 {
+		return ""
+	}
+	return fmt.Sprintf("rooted at the branch this run's orders ship from (%s) instead",
+		describeBranch(indexBranches(branches), distinct[0]))
 }
 
 // indexBranches keys GableLBM's branch list by id for lookup and labelling.

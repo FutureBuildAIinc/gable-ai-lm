@@ -207,24 +207,30 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		analyses = append(analyses, analyzeOrder(o, byProduct))
 	}
 
-	// Branch lookup is best effort and deliberately skipped when the request
-	// already named a depot (nothing could outrank it anyway). A GableLBM that
-	// predates /api/integration/locations answers 404 here; that must degrade
-	// to the previous behaviour, not fail every plan for the day.
+	// Branch lookup is best effort and deliberately skipped whenever it cannot
+	// change the answer: a request that already named a depot outranks every
+	// yard, and a day whose orders name no yard at all has nothing to look up —
+	// the branch list would be fetched, handed to the ladder and ignored. That
+	// is a round-trip to the ERP per ingest, on exactly the deployments (a
+	// GableLBM predating orders.branch_id) least able to answer it. A GableLBM
+	// that predates /api/integration/locations answers 404 here; that must
+	// degrade to the previous behaviour, not fail every plan for the day.
+	orderBranches := branchIDs(analyses)
 	var branches []gable.Location
 	var branchesErr error
-	if req.DepotLat == nil || req.DepotLng == nil {
+	if (req.DepotLat == nil || req.DepotLng == nil) && len(orderBranches) > 0 {
 		if branches, branchesErr = s.gable.ListLocations(ctx); branchesErr != nil {
 			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
-				"date", req.Date, "err", branchesErr)
+				"date", req.Date, "branch_ids", orderBranches, "err", branchesErr)
 			branches = nil
 		}
 	}
 
 	depotLat, depotLng, depotSource, depotNote := resolveDepot(req, s.cfg, analyses, branches)
-	if branchesErr != nil && len(branchIDs(analyses)) > 0 {
-		// The orders DID name a yard; we simply could not look it up. Say that,
-		// rather than letting the note claim the branch was unknown.
+	if branchesErr != nil {
+		// The orders DID name a yard — the lookup is not even attempted
+		// otherwise; we simply could not read it. Say that, rather than letting
+		// the note claim the branch was unknown.
 		depotNote = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(depotSource))
 	}
 	if depotSource == DepotSourceNone {

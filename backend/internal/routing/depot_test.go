@@ -21,10 +21,13 @@ func sptr(s string) *string   { return &s }
 // so its coordinate keys are absent and arrive here as nil.
 const (
 	dallasYardID    = "77777777-7777-4777-8777-000000000001"
+	fortWorthYardID = "77777777-7777-4777-8777-000000000002"
 	planoYardID     = "77777777-7777-4777-8777-000000000003"
 	closedYardID    = "77777777-7777-4777-8777-000000000009"
 	dallasYardLat   = 32.7767
 	dallasYardLng   = -96.7970
+	fortWorthLat    = 32.7555
+	fortWorthLng    = -97.3308
 	austinConfigLat = 30.2672
 	austinConfigLng = -97.7431
 )
@@ -32,6 +35,7 @@ const (
 func routingBranches() []gable.Location {
 	return []gable.Location{
 		{ID: dallasYardID, Name: "Dallas Yard", Latitude: fptr(dallasYardLat), Longitude: fptr(dallasYardLng)},
+		{ID: fortWorthYardID, Name: "Fort Worth Yard", Latitude: fptr(fortWorthLat), Longitude: fptr(fortWorthLng)},
 		{ID: planoYardID, Name: "Plano Yard"}, // never geocoded — nil, NOT 0,0
 	}
 }
@@ -469,5 +473,124 @@ func TestRequestDepotStillSilencesEverything(t *testing.T) {
 	}
 	if g.locationCalls != 0 {
 		t.Fatalf("the branch list was fetched %d times for a request that already named a depot", g.locationCalls)
+	}
+}
+
+// --- The explicit-branch path: wrongness, not span ---------------------------
+//
+// The three tests below cover the two ways an explicit branch id could quietly
+// produce a plan rooted at a yard that has nothing to do with the day's work.
+// Both were reachable, neither was covered, and the more dangerous of the two
+// was the one that said nothing at all.
+
+// TestExplicitBranchWithEveryOrderInAnotherYardIsNotSilent is the
+// currently-silent, 100%-wrong case. The warning used to fire off the SPAN of
+// the day's orders — two or more distinct yards — so a day split Dallas/Plano
+// and rooted at Dallas warned about its Plano half, while a day whose orders
+// ALL ship from Fort Worth and is rooted at Dallas warned about nothing. The
+// severity was inverted: the plan where every single stop leaves from a yard no
+// order ships from was the quiet one. The condition is wrongness — "the orders
+// name a yard that is not the requested one" — not span.
+func TestExplicitBranchWithEveryOrderInAnotherYardIsNotSilent(t *testing.T) {
+	g := &fakeGable{
+		orders:    shippingFrom(routingOrders(), fortWorthYardID),
+		locations: routingBranches(),
+	}
+	cfg := Config{DepotLat: fptr(austinConfigLat), DepotLng: fptr(austinConfigLng)}
+	req := PlanRequest{Date: "2026-06-26", BranchID: sptr(dallasYardID)}
+
+	lat, lng, source, note := resolveWith(t, g, cfg, req)
+
+	// The request is still the caller's answer: the origin does not move.
+	if source != depot.SourceBranch ||
+		math.Abs(lat-dallasYardLat) > 1e-6 || math.Abs(lng-dallasYardLng) > 1e-6 {
+		t.Fatalf("depot = (%v, %v) source %q, want the requested Dallas yard", lat, lng, source)
+	}
+	if note == "" {
+		t.Fatal("every stop is routed from a yard none of the orders ships from, and the plan says nothing")
+	}
+	// Both yards have to be named: the one that was asked for and the one the
+	// work actually leaves from.
+	for _, want := range []string{"Dallas Yard", "Fort Worth Yard", "all ship from", "named on the request"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note = %q, want it to mention %q", note, want)
+		}
+	}
+}
+
+// TestUngeocodedRequestedBranchFallsToTheOrdersOwnYard: an unusable branch id is
+// not an answer, and it must not take the orders' own yard down with it. The
+// request named Plano, which GableLBM has never geocoded; every order ships from
+// Dallas, which it has. Rooting the day at this install's Austin depot — 180
+// miles from every stop — skips a live BRANCH answer because a DIFFERENT branch
+// failed, and the package doctrine is BRANCH before CONFIG.
+func TestUngeocodedRequestedBranchFallsToTheOrdersOwnYard(t *testing.T) {
+	g := &fakeGable{
+		orders:    shippingFrom(routingOrders(), dallasYardID),
+		locations: routingBranches(),
+	}
+	cfg := Config{DepotLat: fptr(austinConfigLat), DepotLng: fptr(austinConfigLng)}
+
+	lat, lng, source, note := resolveWith(t, g, cfg,
+		PlanRequest{Date: "2026-06-26", BranchID: sptr(planoYardID)})
+
+	if source != depot.SourceBranch ||
+		math.Abs(lat-dallasYardLat) > 1e-6 || math.Abs(lng-dallasYardLng) > 1e-6 {
+		t.Fatalf("depot = (%v, %v) source %q, want the orders' own Dallas yard — an unusable "+
+			"request branch must not skip the BRANCH rung down to CONFIG", lat, lng, source)
+	}
+	// The note owes the dispatcher both facts: why the yard they asked for was
+	// unusable, and which yard the run was rooted at instead.
+	for _, want := range []string{"Plano Yard", "never been geocoded", "Dallas Yard", "orders ship from"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note = %q, want it to mention %q", note, want)
+		}
+	}
+}
+
+// TestUnknownRequestedBranchFallsToTheOrdersOwnYard is the same defect through
+// the other door: an inactive or simply unknown branch id is absent from
+// GableLBM's list rather than present-and-null, and must fall the same way.
+func TestUnknownRequestedBranchFallsToTheOrdersOwnYard(t *testing.T) {
+	g := &fakeGable{
+		orders:    shippingFrom(routingOrders(), dallasYardID),
+		locations: routingBranches(),
+	}
+	cfg := Config{DepotLat: fptr(austinConfigLat), DepotLng: fptr(austinConfigLng)}
+
+	lat, lng, source, note := resolveWith(t, g, cfg,
+		PlanRequest{Date: "2026-06-26", BranchID: sptr(closedYardID)})
+
+	if source != depot.SourceBranch ||
+		math.Abs(lat-dallasYardLat) > 1e-6 || math.Abs(lng-dallasYardLng) > 1e-6 {
+		t.Fatalf("depot = (%v, %v) source %q, want the orders' own Dallas yard", lat, lng, source)
+	}
+	for _, want := range []string{closedYardID, "active branch list", "Dallas Yard"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note = %q, want it to mention %q", note, want)
+		}
+	}
+}
+
+// TestUnusableRequestedBranchWithNoOrderYardStillFallsToConfig pins the other
+// side of that change: falling through to the orders' yards is not the same as
+// ignoring the failure. With no order naming a yard there is nothing below the
+// branch rung but the configured depot, and the note must still explain the
+// requested yard rather than going quiet.
+func TestUnusableRequestedBranchWithNoOrderYardStillFallsToConfig(t *testing.T) {
+	g := &fakeGable{orders: routingOrders(), locations: routingBranches()} // no branch_id on any order
+	cfg := Config{DepotLat: fptr(austinConfigLat), DepotLng: fptr(austinConfigLng)}
+
+	lat, lng, source, note := resolveWith(t, g, cfg,
+		PlanRequest{Date: "2026-06-26", BranchID: sptr(planoYardID)})
+
+	if source != depot.SourceConfig ||
+		math.Abs(lat-austinConfigLat) > 1e-6 || math.Abs(lng-austinConfigLng) > 1e-6 {
+		t.Fatalf("depot = (%v, %v) source %q, want the configured Austin yard", lat, lng, source)
+	}
+	for _, want := range []string{"Plano Yard", "never been geocoded", "configured depot"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note = %q, want it to mention %q", note, want)
+		}
 	}
 }

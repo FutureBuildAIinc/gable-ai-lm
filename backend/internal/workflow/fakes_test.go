@@ -163,6 +163,11 @@ type fakeGable struct {
 	// including one that predates /api/integration/locations entirely.
 	locErr error
 
+	// locationCalls counts branch lookups. The lookup is a round-trip to the
+	// ERP on every ingest, so "was it even asked?" is a behaviour worth
+	// asserting, not just an implementation detail.
+	locationCalls int
+
 	pushed  []gable.DeliveryRoute
 	pushErr error
 }
@@ -172,6 +177,7 @@ func (f *fakeGable) ListOrdersForDate(context.Context, string) ([]gable.Order, e
 }
 func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) { return f.vehicles, nil }
 func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
+	f.locationCalls++
 	if f.locErr != nil {
 		return nil, f.locErr
 	}

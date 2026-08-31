@@ -183,17 +183,28 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 //
 // req.BranchID keeps its meaning on top of that: it is the caller's own
 // statement of which yard this plan is FOR, so it decides where the route is
-// rooted. What it does not do is settle whether the dispatcher hears about a
-// run whose stops are spread across yards — asking for Dallas does not move the
-// Plano stops, and a plan that quietly routes half a day from the wrong yard is
-// the failure this whole ladder exists to prevent. So an explicit branch
-// overrides the origin and the span is still reported.
+// rooted. Two things it does NOT do:
+//
+// It does not settle whether the dispatcher hears that the orders name a
+// different yard. Asking for Dallas does not move the Fort Worth stops, and a
+// plan that quietly routes a day from the wrong yard is the failure this whole
+// ladder exists to prevent. The warning therefore fires on WRONGNESS, not on
+// span: whenever the requested yard is not the only one the orders name —
+// including when they unanimously name a different one, which is the 100%-wrong
+// case and used to be the silent one.
+//
+// And it does not outrank the orders when it cannot be used at all. An unknown,
+// inactive or never-geocoded branch id is not an answer, and the package
+// doctrine is BRANCH before CONFIG — so a requested yard that will not resolve
+// falls through to the yard the ORDERS ship from before it falls to this
+// install's configured depot. Skipping a live branch answer because a different
+// branch failed is how a Dallas day ends up rooted in Austin.
 //
 // The branch list is only fetched when it can actually change the answer: an
-// explicit request depot outranks it, and a run naming no branch anywhere has
-// nothing to look up. The fetch is best effort — a GableLBM that predates
-// /api/integration/locations answers 404, and that must cost this plan its
-// branch origin, not the plan itself.
+// explicit request depot outranks it, and a run naming no branch anywhere —
+// neither on the request nor on any order — has nothing to look up. The fetch
+// is best effort — a GableLBM that predates /api/integration/locations answers
+// 404, and that must cost this plan its branch origin, not the plan itself.
 //
 // The result is not persisted: route_plans is a column-backed table and adding
 // a depot_source column is a migration. The caller logs it instead, once per
@@ -208,26 +219,36 @@ func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, orders []ga
 		explicit = *req.BranchID
 	}
 
-	// An explicit branch is the caller's answer and outranks what the orders
-	// imply; with none, the orders speak for themselves.
-	wanted := orderBranches
-	if explicit != "" {
-		wanted = []string{explicit}
-	}
-
 	// A request depot outranks every branch, so with one there is nothing a
-	// branch lookup could change — including the span sentence below, which is
-	// held to the same rule the workflow ingest applies: an operator who gave
+	// branch lookup could change — including the mismatch sentence below, which
+	// is held to the same rule the workflow ingest applies: an operator who gave
 	// this run its own coordinate has already answered the question.
 	branchRungInPlay := req.DepotLat == nil || req.DepotLng == nil
 
 	var branches []gable.Location
 	var branchesErr error
-	if len(wanted) > 0 && branchRungInPlay {
+	if branchRungInPlay && (explicit != "" || len(orderBranches) > 0) {
 		if branches, branchesErr = s.locations.ListLocations(ctx); branchesErr != nil {
 			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
-				"date", req.Date, "branch_ids", wanted, "err", branchesErr)
+				"date", req.Date, "requested_branch", explicit, "order_branches", orderBranches, "err", branchesErr)
 			branches = nil
+		}
+	}
+
+	// An explicit branch is the caller's answer and outranks what the orders
+	// imply — while it is usable. When it is not (unknown, inactive, never
+	// geocoded, out of range) it is not an answer at all, and the run falls to
+	// the yard its orders actually ship from BEFORE it falls to the configured
+	// depot: BRANCH outranks CONFIG, and the branch that failed is not the
+	// branch being asked about. With no explicit branch, the orders speak for
+	// themselves.
+	wanted := orderBranches
+	requestedWhy := ""
+	if explicit != "" && branchRungInPlay {
+		if _, _, ok, why := depot.ResolveBranch([]string{explicit}, branches); ok {
+			wanted = []string{explicit}
+		} else {
+			requestedWhy = why
 		}
 	}
 
@@ -240,19 +261,36 @@ func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, orders []ga
 		ConfigLng:  s.cfg.DepotLng,
 		Stops:      stops,
 	})
+
+	if requestedWhy != "" {
+		// The yard the caller asked for could not be used. The note owes the
+		// dispatcher both halves: why that yard was unusable, and where the run
+		// went instead — the orders' own yard when they name a usable one, and
+		// otherwise whatever rung below it answered.
+		switch {
+		case source == depot.SourceBranch:
+			note = requestedWhy + "; " + depot.OrdersOwnBranchPhrase(wanted, branches)
+		case note != "":
+			// The orders' own yards were tried and declined too; the ladder has
+			// already written that half of the sentence.
+			note = requestedWhy + "; " + note
+		default:
+			note = requestedWhy + "; " + depot.FallbackPhrase(source)
+		}
+	}
 	if branchesErr != nil {
 		// A yard WAS named; we simply could not look it up. Say that, rather
 		// than letting the note claim the branch was unknown.
 		note = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(source))
 	}
-	if explicit != "" && branchRungInPlay {
+	if explicit != "" && branchRungInPlay && requestedWhy == "" {
 		// The ladder only sees the one yard the request named, so it cannot
-		// notice that the orders disagree. When they do, that fact still has to
-		// reach the note: the plan is rooted where it was asked to be, and the
-		// dispatcher is told which stops that leaves in another yard.
-		if span := depot.SpanningBranchesPhrase(orderBranches, branches); span != "" {
-			note = joinNotes(note, span+", and this plan is rooted at the branch named on the request ("+
-				explicit+"), so the stops belonging to the other yards are routed from there too")
+		// notice that the orders name another. When they do, that fact has to
+		// reach the note whether it is half the day or all of it: the plan is
+		// rooted where it was asked to be, and the dispatcher is told which
+		// stops that leaves in a yard they do not ship from.
+		if mismatch := depot.RequestedBranchMismatchPhrase(explicit, orderBranches, branches); mismatch != "" {
+			note = joinNotes(note, mismatch)
 		}
 	}
 	return lat, lng, source, note

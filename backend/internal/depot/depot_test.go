@@ -273,3 +273,90 @@ func TestValidCoords(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestedBranchMismatchPhrase pins the condition the phrase fires on,
+// which is the whole point of it existing: WRONGNESS, not span. The sentence
+// warned about a run whose orders spanned two yards and stayed silent about a
+// run whose orders unanimously named the wrong one — reporting the half-wrong
+// plan and hiding the fully-wrong one.
+func TestRequestedBranchMismatchPhrase(t *testing.T) {
+	cases := []struct {
+		name      string
+		requested string
+		orders    []string
+		wantEmpty bool
+		mentions  []string
+	}{
+		{
+			name:      "every order in a different yard is the loudest case, not the quietest",
+			requested: dallasYardID, orders: []string{fortWorthYardID, fortWorthYardID},
+			mentions: []string{"Dallas Yard", "Fort Worth Yard", "all ship from", "named on the request"},
+		},
+		{
+			name:      "part of the day elsewhere still reports the span and the request",
+			requested: dallasYardID, orders: []string{dallasYardID, planoYardID},
+			mentions: []string{"2 different branches", "Dallas Yard", "Plano Yard", "named on the request"},
+		},
+		{
+			name:      "no order in the requested yard, and they do not agree with each other either",
+			requested: dallasYardID, orders: []string{fortWorthYardID, planoYardID},
+			mentions: []string{"2 different branches", "none of them", "Dallas Yard"},
+		},
+		{
+			name:      "request and orders agree — silence is correct",
+			requested: dallasYardID, orders: []string{dallasYardID, dallasYardID}, wantEmpty: true,
+		},
+		{
+			name:      "orders name no yard at all — a pre-branch ERP draws no note",
+			requested: dallasYardID, orders: []string{"", ""}, wantEmpty: true,
+		},
+		{
+			name:      "no yard was requested, so nothing was overridden",
+			requested: "", orders: []string{dallasYardID, planoYardID}, wantEmpty: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RequestedBranchMismatchPhrase(tc.requested, tc.orders, texasBranches())
+			if tc.wantEmpty {
+				if got != "" {
+					t.Fatalf("phrase = %q, want silence", got)
+				}
+				return
+			}
+			if got == "" {
+				t.Fatal("the orders name a yard the request did not, and nothing was said")
+			}
+			for _, want := range tc.mentions {
+				if !strings.Contains(got, want) {
+					t.Errorf("phrase = %q, want it to mention %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOrdersOwnBranchPhraseAndResolveBranch covers the second half of the
+// unusable-request-branch note: a caller that has to try two candidate yards
+// asks this package both times, and gets this package's words both times.
+func TestOrdersOwnBranchPhraseAndResolveBranch(t *testing.T) {
+	branches := texasBranches()
+
+	if _, _, ok, why := ResolveBranch([]string{planoYardID}, branches); ok ||
+		!strings.Contains(why, "never been geocoded") {
+		t.Fatalf("ResolveBranch(Plano) = ok %v why %q, want a refusal that says why", ok, why)
+	}
+	lat, lng, ok, why := ResolveBranch([]string{dallasYardID}, branches)
+	if !ok || why != "" || math.Abs(lat-dallasYardLat) > 1e-6 || math.Abs(lng-dallasYardLng) > 1e-6 {
+		t.Fatalf("ResolveBranch(Dallas) = (%v, %v) ok %v why %q, want the Dallas yard", lat, lng, ok, why)
+	}
+
+	got := OrdersOwnBranchPhrase([]string{dallasYardID, dallasYardID}, branches)
+	if !strings.Contains(got, "Dallas Yard") || !strings.Contains(got, "instead") {
+		t.Fatalf("phrase = %q, want it to name the yard the run was rooted at instead", got)
+	}
+	// Two yards is not a branch answer, so there is no such sentence to write.
+	if got := OrdersOwnBranchPhrase([]string{dallasYardID, planoYardID}, branches); got != "" {
+		t.Fatalf("phrase = %q, want silence — a run spanning two yards has no single origin", got)
+	}
+}
