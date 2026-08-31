@@ -21,6 +21,7 @@ import (
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/load"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/routing"
+	"github.com/FutureBuildAIinc/gable-ai-lm/pkg/metrics"
 )
 
 // Depot origin sources, recorded on the plan so the UI (and support) can see
@@ -150,10 +151,25 @@ type Service struct {
 	checker routeChecker
 	ai      aiBriefer
 	cfg     Config
+	meter   *metrics.Meter
 }
 
 func NewService(repo planStore, g gableSource, c catalogSource, f fleetProfiles, rc routeChecker, briefer aiBriefer, cfg Config) *Service {
 	return &Service{repo: repo, gable: g, catalog: c, fleet: f, checker: rc, ai: briefer, cfg: cfg}
+}
+
+// WithMeter attaches the business-metering counters (pkg/metrics) so this
+// module's three value events — a plan created, a truck packed, a route pushed
+// — land on /metrics under this deployment's licence labels. cmd/server calls
+// it once at boot.
+//
+// It is a setter rather than a constructor argument because the meter is nil-
+// safe by design: a Service built without one meters nothing and behaves
+// exactly as it did before the seam existed, which is what makes reverting this
+// work a single commit with nothing to unpick.
+func (s *Service) WithMeter(m *metrics.Meter) *Service {
+	s.meter = m
+	return s
 }
 
 // Get returns a plan by id, with any scheduled lock evaluated for display.
@@ -256,6 +272,10 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	if err := s.repo.Create(ctx, plan); err != nil {
 		return nil, err
 	}
+	// Metered only once the plan is STORED. A plan that failed to persist is
+	// not a plan, and counting the attempt would bill a dealer for a database
+	// error.
+	s.meter.PlanCreated()
 	return plan, nil
 }
 
@@ -507,6 +527,11 @@ func (s *Service) Pack(ctx context.Context, id string) (*Plan, error) {
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
+	// Every load in the plan was solved above — the loop returns on the first
+	// failure, so reaching here means all of them, and the write that stored
+	// them succeeded. Re-packing the same plan counts again on purpose: the
+	// solver ran again, which is the work being metered.
+	s.meter.TrucksPacked(len(p.Loads))
 	return p, nil
 }
 
@@ -882,6 +907,11 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		if err := s.gable.PushDeliveryRoute(ctx, route); err != nil {
 			return nil, fmt.Errorf("write back to GableLBM (truck %s): %w", l.VehicleName, err)
 		}
+		// Metered per route, inside the loop, because that is where the value
+		// actually occurs: a push that fails on the fourth truck still put
+		// three real routes on the dealer's dispatch board, and they do not
+		// un-happen because the fifth call errored.
+		s.meter.RoutesPushed(1)
 	}
 
 	p.Status = StatusPushed

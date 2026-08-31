@@ -87,6 +87,12 @@ func Register() {
 		DBPoolIdleConns,
 		DBPoolAcquireCount,
 		DBPoolAcquireDuration,
+		// Business metering (see business.go). These are the only series that
+		// say what the service is FOR rather than how hard it is working.
+		PlansCreatedTotal,
+		TrucksPackedTotal,
+		RoutesPushedTotal,
+		CatalogPullsTotal,
 	)
 
 	// Go runtime metrics (goroutines, memory, GC)

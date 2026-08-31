@@ -113,6 +113,9 @@ GableLBM (source of truth)            AI_LM
 - **Solver/optimizer are deterministic heuristics behind interfaces** (`load.Solver`,
   nearest-neighbor + 2-opt routing, haversine restricted-point buffering) so an
   AI/optimizer can replace them later without touching callers.
+- **`internal/license` is the entitlement seam** (see "Licensing & Metering Seam"
+  below). Loaded once in `main.go`, offline, no network. It **gates nothing** in
+  this version: `Allow()` returns true for every feature in every edition.
 - **API surface:** REST JSON at `/api/v1/*`; public `/health`, `/healthz/live`,
   `/healthz/ready`, `/metrics`.
 
@@ -195,7 +198,8 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
 ### Backend Code
 - Config: env vars with `godotenv` fallback (`internal/config/config.go`). Default DB URL
   points to **:5434** (docker-compose mapping). Integration: `GABLE_API_URL`,
-  `GABLE_INTEGRATION_KEY`.
+  `GABLE_INTEGRATION_KEY`. Licensing: `LICENSE_TOKEN` / `LICENSE_FILE` /
+  `LICENSE_PUBLIC_KEY`, all optional (see below).
 - Server entry point: `backend/cmd/server/main.go` — wires every module repo→service→handler.
 - Error envelope (`pkg/httputil`): `{ "error": { "code", "message" }, "meta": { "request_id" } }`.
 
@@ -237,6 +241,8 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
 go run ./cmd/server                # run API (port 8090, needs DB on :5434)
 go run ./cmd/migrate               # apply SQL migrations
 go run ./cmd/seed                  # seed demo fleet profiles + restricted points
+go run ./cmd/keygen -genkey        # mint an Ed25519 licence keypair (no private key is committed)
+go run ./cmd/keygen -h             # mint a licence token; see internal/license
 go build ./... && go vet ./... && go test -race ./...   # CI uses -race; make test does not
 make run | migrate | seed | build | vet | test | tidy
 ```
@@ -291,6 +297,63 @@ AI_LM consumes these GableLBM endpoints (all `X-Integration-Key` gated; base URL
   `entitled` is true AI_LM mints its own session JWT (it never stores credentials).
 
 A different ERP can satisfy this contract to reuse AI_LM unchanged.
+
+## Licensing & Metering Seam (`backend/internal/license`)
+
+**The default is no token, and that is correct.** An AI_LM instance with no
+`LICENSE_TOKEN` reports `edition=evaluation`, `subject=unlicensed`, and boots
+normally. This is **not** a gap waiting to be closed into a lockout: AI_LM is
+governed by `LicenseRef-OpenLBM-Community-Source-1.0`, and **§1 (Grant) gives
+everyone the right to make non-production use of the Licensed Work**. An
+unlicensed instance is exercising a grant it already holds. See
+`LICENSES/LicenseRef-OpenLBM-Community-Source-1.0.txt` §1, and the package doc in
+`internal/license/license.go`.
+
+If you are here because an unlicensed instance "should" refuse to start: it
+should not, and changing that would break every evaluation, development and
+air-gapped install in the name of a licence that explicitly permits them.
+
+The four editions are the licence's own states, not invented tiers:
+
+| `edition` | Who | Basis |
+|---|---|---|
+| `evaluation` | anyone, non-production — **no token needed** | §1 Grant |
+| `community` | a Community Member, in production, free | §2 Additional Use Grant |
+| `commercial` | anyone else in production, separate licence | §3 Production-Use Condition |
+| `agpl` | any version past its Change Date (availability + 5y) | §4 Conversion |
+
+**What fails closed.** A *present but invalid* token — malformed, bad signature,
+unknown signing key, a claim edited after issue — is a **hard startup failure**,
+never a silent downgrade. So is a token with `competing_use_acknowledged: true`
+(Competing Use is outside the grant for everyone regardless of size). An
+**expired** token is neither: it drops to `evaluation`, logs a WARN naming the
+date, and keeps running, because an expiry must not take a dealer's dispatch
+offline mid-shift.
+
+**What it gates: nothing.** `(*License).Allow(feature)` returns true for every
+feature in every edition, pinned by `TestAllowGatesNothing`. If that test fails,
+somebody is changing product policy — review it as such.
+
+**No network, ever.** `internal/license/imports_test.go` fails the build if the
+package acquires an import that could reach one. A licence check that fails when
+the internet does takes a dispatch board down for a DNS outage.
+
+**Metering** lives in `pkg/metrics` on the existing `/metrics` endpoint:
+`ailm_plans_created_total`, `ailm_trucks_packed_total`, `ailm_routes_pushed_total`,
+`ailm_catalog_pulls_total`, each labelled `edition` and `subject`. They are
+incremented where the value actually occurs — after the write, not before it.
+Scrape-only; there is no outbound usage feed by design.
+
+```bash
+# Mint a keypair and a token, then run against it.
+go run ./cmd/keygen -genkey
+go run ./cmd/keygen -key "$LICENSE_PRIVATE_KEY" -subject acme-lumber \
+    -edition community -licensed-version "AI_LM 1.0.0" \
+    -availability-date 2026-01-15 -independent-operator -locations 12 -production-use
+```
+
+The signing **private key is never committed**; the test suite generates its own
+at test time via `license.Mint`.
 
 ## Pre-Flight Checks (before declaring work done)
 - `cd app && npx tsc --noEmit` (or `npm run build`)
@@ -349,5 +412,7 @@ A different ERP can satisfy this contract to reuse AI_LM unchanged.
 - Mesh/GLTF product assets (parametric boxes only; `geometry_source` reserves the seam).
 - ML-based placement (MVP solver is deterministic behind `load.Solver`).
 - PostGIS geometry (MVP uses lat/lng + haversine buffer).
-- Commercial multi-ERP adapters + licensing/metering (API shape is designed for it).
+- Commercial multi-ERP adapters (API shape is designed for it). The licensing and
+  metering *seam* has landed (`internal/license`, `ailm_*` counters); what is out of
+  scope is enforcing anything with it.
 - Horizontal scaling (single instance; in-memory middleware).

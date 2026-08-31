@@ -81,3 +81,47 @@ func TestLoadDepotFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestLicenseConfigIsPlumbedFromTheEnvironment. The licence seam reads nothing
+// from the environment itself — cmd/server hands it these three values — so if
+// they do not land on the Config, a deployment that set LICENSE_TOKEN would
+// silently run unlicensed. Which is a legitimate state, and therefore exactly
+// the kind of misconfiguration that would never be noticed.
+func TestLicenseConfigIsPlumbedFromTheEnvironment(t *testing.T) {
+	t.Setenv("AUTH_MODE", "dev")
+	t.Setenv("LICENSE_TOKEN", "ailm1.deadbeefdeadbeef.eyJ9.c2ln")
+	t.Setenv("LICENSE_FILE", "/run/secrets/ai_lm.lic")
+	t.Setenv("LICENSE_PUBLIC_KEY", "AAAA,BBBB")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.LicenseToken != "ailm1.deadbeefdeadbeef.eyJ9.c2ln" {
+		t.Errorf("LicenseToken = %q", cfg.LicenseToken)
+	}
+	if cfg.LicenseFile != "/run/secrets/ai_lm.lic" {
+		t.Errorf("LicenseFile = %q", cfg.LicenseFile)
+	}
+	if cfg.LicensePublicKeys != "AAAA,BBBB" {
+		t.Errorf("LicensePublicKeys = %q", cfg.LicensePublicKeys)
+	}
+}
+
+// TestUnsetLicenseIsTheDefaultAndNotAnError pins the shape of the default
+// deployment: no licence configuration at all, and Load does not mind. An
+// instance with no token reports edition "evaluation", which is what §1 of the
+// OpenLBM Community Source License grants to everyone. Do not "fix" this into a
+// required field.
+func TestUnsetLicenseIsTheDefaultAndNotAnError(t *testing.T) {
+	t.Setenv("AUTH_MODE", "dev")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("an unlicensed deployment must configure cleanly: %v", err)
+	}
+	if cfg.LicenseToken != "" || cfg.LicenseFile != "" || cfg.LicensePublicKeys != "" {
+		t.Errorf("expected empty licence config by default, got %q / %q / %q",
+			cfg.LicenseToken, cfg.LicenseFile, cfg.LicensePublicKeys)
+	}
+}
