@@ -326,10 +326,18 @@ type Plan struct {
 }
 
 // IngestRequest starts a workflow run for a date.
+//
+// Override authorizes re-planning a date whose EXISTING plan still has routes
+// on GableLBM's dispatch board; approving it recalls every one of them before
+// the new plan is created. It mirrors AssignRequest rather than inventing a
+// third approval shape, so the UI has one override prompt for every 423 this
+// module can answer.
 type IngestRequest struct {
-	Date     string   `json:"date"` // YYYY-MM-DD
-	DepotLat *float64 `json:"depot_lat,omitempty"`
-	DepotLng *float64 `json:"depot_lng,omitempty"`
+	Date       string   `json:"date"` // YYYY-MM-DD
+	DepotLat   *float64 `json:"depot_lat,omitempty"`
+	DepotLng   *float64 `json:"depot_lng,omitempty"`
+	Override   bool     `json:"override,omitempty"`
+	ApprovedBy string   `json:"approved_by,omitempty"`
 }
 
 // ResequenceRequest manually reorders one truck's stops (triggers a re-pack).

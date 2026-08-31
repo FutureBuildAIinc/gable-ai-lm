@@ -25,6 +25,12 @@ package workflow
 //	review               -         -       ok       ok     refused
 //	push                 -         -        -       ok     refused
 //
+// Re-ingest is deliberately absent. It does not move a plan through this table;
+// it mints a NEW plan for a date and leaves the old one behind, so no cell of
+// any row describes it. It is gated by gateSupersede, which asks the one
+// question the table cannot: does the plan this re-ingest replaces still have
+// routes on the dealer's board?
+//
 // Three kinds of cell, and the difference between them is the product decision:
 //
 //   - ok — the transition runs.
@@ -69,6 +75,10 @@ const (
 	actionDimensions = "dimensions"
 	actionReview     = "review"
 	actionPush       = "push"
+	// actionSupersede is not a transition OF a plan and so has no row in the
+	// table below: it is a plan being REPLACED by a fresh ingest of its date.
+	// See gateSupersede for why it keys on the ledger alone.
+	actionSupersede = "supersede"
 )
 
 // allowance is one cell of the transition table.
@@ -243,22 +253,8 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 		return nil
 
 	case needsApproval:
-		if !override {
-			return fmt.Errorf("%w (%s) — %s requires manual approval (override), and will recall the route of any truck it drops",
-				ErrPushed, liveRouteNames(live), t.gerund)
-		}
-		who := approvedBy
-		if who == "" {
-			who = "an approver"
-		}
-		p.PushedOverrides = append(p.PushedOverrides, PushedOverride{
-			Action:     action,
-			ApprovedBy: who,
-			ApprovedAt: time.Now(),
-			Note: fmt.Sprintf("%s approved with %d route(s) live on the dispatch board (%s)",
-				t.gerund, len(live), liveRouteNames(live)),
-		})
-		return nil
+		return requireApproval(p, action, t.gerund,
+			"will recall the route of any truck it drops", override, approvedBy)
 
 	default: // notListed
 		if p.Status == StatusPushed {
@@ -267,6 +263,68 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 		}
 		return refusedf("cannot %s: this plan is %s — %s", t.verb, statusLabel(p.Status), t.prereq)
 	}
+}
+
+// gateSupersede is the ingest-side gate, and it exists because gateTransition
+// structurally cannot see the harm it closes.
+//
+// Ingest does not mutate a plan — it mints a new one for a date and leaves the
+// old one behind. Every gate above keys on p.Status and p.LiveRoutes of the
+// plan being changed, and the new plan has neither: it is born ANALYZED with an
+// empty ledger. So a dispatcher who says "the day changed, re-run it" on a date
+// whose routes are already live used to get a brand-new plan whose recall
+// machinery was scoped to its own empty ledger and could therefore NEVER
+// withdraw what the superseded plan had left on the dealer's board. That is the
+// same orphan the state machine was written to remove — "the yard loads a truck
+// for a run that no longer exists" — reached by what is plausibly the more
+// common dispatcher action of the two.
+//
+// So the gate keys on the ledger of the plan being SUPERSEDED, and on nothing
+// else. Not on its status: a plan that reached PUSHED and has since had every
+// route recalled has nothing on the board, and re-planning that date must stay
+// exactly as frictionless as it is today. "Are there live routes?" is the whole
+// question.
+//
+// The refusal is ErrPushed with an approver — the same 423 idiom as the lock
+// and as every other live-route gate — and an exercised override is recorded on
+// the superseded plan, where the recall it authorizes will be tombstoned.
+func gateSupersede(prev *Plan, date string, override bool, approvedBy string) error {
+	// No previous plan for this date, or one that put nothing on the board (or
+	// has already taken it all off): the common case, and it must cost nothing.
+	if prev == nil || len(liveRoutes(prev)) == 0 {
+		return nil
+	}
+	return requireApproval(prev, actionSupersede,
+		fmt.Sprintf("re-planning %s", date),
+		fmt.Sprintf("will recall every route %s left on the dispatch board", prev.ID),
+		override, approvedBy)
+}
+
+// requireApproval writes the live-route refusal, and — when the override is
+// exercised — records the approval on the plan.
+//
+// It is one function rather than one per gate so that every 423 in this package
+// reads the same way and every approval lands in the same audit field. The
+// callers supply only what differs: the gerund naming the operation, and the
+// consequence clause promising what an approval will do to the dealer's board.
+func requireApproval(p *Plan, action, gerund, consequence string, override bool, approvedBy string) error {
+	live := liveRoutes(p)
+	if !override {
+		return fmt.Errorf("%w (%s) — %s requires manual approval (override), and %s",
+			ErrPushed, liveRouteNames(live), gerund, consequence)
+	}
+	who := approvedBy
+	if who == "" {
+		who = "an approver"
+	}
+	p.PushedOverrides = append(p.PushedOverrides, PushedOverride{
+		Action:     action,
+		ApprovedBy: who,
+		ApprovedAt: time.Now(),
+		Note: fmt.Sprintf("%s approved with %d route(s) live on the dispatch board (%s)",
+			gerund, len(live), liveRouteNames(live)),
+	})
+	return nil
 }
 
 // walkBackAfterReshuffle invalidates the later-stage artifacts a mid-workflow

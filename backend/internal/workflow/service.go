@@ -203,12 +203,32 @@ func (s *Service) GetLatestForDate(ctx context.Context, date string) (*Plan, err
 
 // Ingest pulls every confirmed order scheduled for the date and analyzes each
 // one: per-line effective geometry/weight, totals, shape profile, issues.
+//
+// It also gates the date. A re-ingest ("the day changed, re-run it") used to
+// mint a new plan with no reference to — and no gate against — the plan already
+// holding that date, so a date whose routes were LIVE on the dealer's dispatch
+// board could be re-planned silently. The new plan's recall machinery is scoped
+// to its own ledger, which starts empty, so the superseded plan's routes could
+// never be withdrawn by anything: exactly the orphan the rest of this work
+// removed, reached from the other side. See gateSupersede.
 func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) {
 	if req.Date == "" {
 		return nil, fmt.Errorf("%w: date is required", ErrInvalidRequest)
 	}
 	if _, err := time.Parse("2006-01-02", req.Date); err != nil {
 		return nil, fmt.Errorf("%w: invalid date %q; expected YYYY-MM-DD", ErrInvalidRequest, req.Date)
+	}
+
+	// Gate BEFORE the ERP is touched. A refused re-ingest is a dispatcher who
+	// needs an approver, not a reason to pull a day of orders and a catalog and
+	// throw them away. The lookup itself is one indexed read of a table this
+	// module owns; it costs the common case nothing upstream.
+	superseded, err := s.supersededPlan(ctx, req.Date)
+	if err != nil {
+		return nil, err
+	}
+	if err := gateSupersede(superseded, req.Date, req.Override, req.ApprovedBy); err != nil {
+		return nil, err
 	}
 
 	orders, err := s.gable.ListOrdersForDate(ctx, req.Date)
@@ -276,6 +296,14 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		Loads:            []TruckLoad{},
 		UnassignedOrders: []Stop{},
 	}
+	// The approval given above is exercised HERE, as late as possible: the
+	// superseded plan's routes come off the dealer's board only once this
+	// ingest is certain it has a replacement to put there. A recall failure
+	// aborts and creates NOTHING — a half-recalled board with a new plan on top
+	// is worse than refusing outright.
+	if err := s.supersede(ctx, superseded, plan, req.ApprovedBy); err != nil {
+		return nil, err
+	}
 	if err := s.repo.Create(ctx, plan); err != nil {
 		return nil, err
 	}
@@ -284,6 +312,62 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	// error.
 	s.meter.PlanCreated()
 	return plan, nil
+}
+
+// supersededPlan returns the plan a re-ingest of this date would replace, or
+// nil when the date has never been planned. A date with no plan is the ordinary
+// first ingest and is not an error.
+func (s *Service) supersededPlan(ctx context.Context, date string) (*Plan, error) {
+	prev, err := s.repo.GetLatestForDate(ctx, date)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("look up the existing plan for %s: %w", date, err)
+	}
+	return prev, nil
+}
+
+// supersede takes the previous plan's routes off the dealer's dispatch board
+// before next replaces it, and records on that plan both the approval and the
+// tombstones.
+//
+// EVERY live route goes, not a subset: unlike a re-assignment, which keeps the
+// trucks it did not drop, a re-ingest keeps nothing. The new plan is built from
+// GableLBM's orders as they now stand and has no idea these routes exist, so a
+// route left behind here is left behind for good.
+//
+// Ordering is deliberate. Recall first, then persist the tombstones, then let
+// the caller create the new plan. Each step can only fail into a state that
+// converges on retry: a recall that fails leaves the board and the plan exactly
+// as they were; a persist that fails leaves the board clean and the old plan
+// still claiming those routes, so the next attempt recalls them again and
+// GableLBM answers the idempotent "nothing there" success. Over-reporting what
+// is live costs a redundant call. Under-reporting costs a truck loading for a
+// run that no longer exists.
+func (s *Service) supersede(ctx context.Context, prev, next *Plan, approvedBy string) error {
+	if prev == nil {
+		return nil
+	}
+	doomed := liveRoutes(prev)
+	if len(doomed) == 0 {
+		// Nothing on the board, so gateSupersede recorded no approval and
+		// there is nothing to write. The common re-ingest never reaches the
+		// ERP or the store on this path at all.
+		return nil
+	}
+	if err := s.recallRoutes(ctx, prev, doomed, approvedBy,
+		fmt.Sprintf("superseded by a re-plan of %s", next.PlanDate),
+		"this date cannot be re-planned around it"); err != nil {
+		return err
+	}
+	if err := s.repo.Update(ctx, prev); err != nil {
+		return fmt.Errorf("record the recall on superseded plan %s: %w", prev.ID, err)
+	}
+	slog.Info("superseded a plan whose routes were live on the dispatch board",
+		"superseded_plan", prev.ID, "date", prev.PlanDate,
+		"recalled", len(doomed), "approved_by", approvedBy)
+	return nil
 }
 
 // resolveDepot picks a run's routing origin. The ladder itself —
@@ -536,20 +620,47 @@ func (s *Service) Assign(ctx context.Context, id string, override bool, approved
 // routes are stale, not orphaned, and the push upstream is create-or-replace,
 // so the next push corrects them. Recalling one would cancel a good route.
 func (s *Service) recallDroppedRoutes(ctx context.Context, p *Plan, priorLive []LiveRoute, approvedBy, action string) error {
-	if len(priorLive) == 0 {
-		return nil
-	}
 	kept := make(map[string]bool, len(p.Loads))
 	for _, l := range p.Loads {
 		kept[l.VehicleID] = true
 	}
-
-	now := time.Now()
-	note := fmt.Sprintf("dropped by %s", action)
+	doomed := make([]LiveRoute, 0, len(priorLive))
 	for _, r := range priorLive {
-		if kept[r.VehicleID] {
-			continue
+		if !kept[r.VehicleID] {
+			doomed = append(doomed, r)
 		}
+	}
+	return s.recallRoutes(ctx, p, doomed, approvedBy,
+		fmt.Sprintf("dropped by %s", action),
+		"this plan cannot be re-assigned without it")
+}
+
+// recallRoutes is THE recall path: it withdraws each named route from
+// GableLBM's dispatch board and tombstones it on the plan that put it there.
+//
+// It is one function, not one per caller, because "which routes are doomed?" is
+// the only thing the callers disagree about. A re-assignment dooms the trucks
+// the new assignment drops (recallDroppedRoutes). A re-ingest dooms ALL of
+// them, because the plan itself is being replaced and nothing in the new plan
+// will remember these routes existed. Everything after that decision — the
+// wire call, the idempotent-success reading, the terminal 409, the tombstone,
+// the abort-on-first-failure rule — is identical, and a second copy of it is
+// how one of the two paths would quietly stop tombstoning.
+//
+// It returns on the first failure having written nothing further: a
+// half-recalled board that the plan has half-forgotten is worse than a stale
+// one it still remembers in full. Callers must not persist p when this errors.
+//
+// note is recorded upstream and on the tombstone ("why did this route vanish").
+// blocked completes the one terminal refusal ("...so <blocked>; call the driver
+// first"), because a truck already on the road stops a re-assignment and a
+// re-plan for different reasons and the dispatcher must read the right one.
+func (s *Service) recallRoutes(ctx context.Context, p *Plan, doomed []LiveRoute, approvedBy, note, blocked string) error {
+	if len(doomed) == 0 {
+		return nil
+	}
+	now := time.Now()
+	for _, r := range doomed {
 		res, err := s.gable.RecallDeliveryRoute(ctx, gable.RouteRecall{
 			VehicleID:     r.VehicleID,
 			ScheduledDate: p.PlanDate,
@@ -560,7 +671,7 @@ func (s *Service) recallDroppedRoutes(ctx context.Context, p *Plan, priorLive []
 			slog.Error("could not recall an orphaned route from GableLBM",
 				"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName, "vehicle_id", r.VehicleID, "error", err)
 			if errors.Is(err, gable.ErrRouteDispatched) {
-				return refusedf("truck %s has already left the yard on this run — its route cannot be recalled, so this plan cannot be re-assigned without it; call the driver first", nameOrID(r))
+				return refusedf("truck %s has already left the yard on this run — its route cannot be recalled, so %s; call the driver first", nameOrID(r), blocked)
 			}
 			return fmt.Errorf("recall route from GableLBM (truck %s): %w", nameOrID(r), err)
 		}

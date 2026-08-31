@@ -77,6 +77,27 @@ func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondError(w, r, err.Error(), http.StatusBadRequest, err)
 		return
 	}
+	// Re-planning a date whose previous plan still has routes on the dispatch
+	// board needs an approver, and answers 423 with its own sentence — the same
+	// prompt the lock and the assign/pack gates open. A 502 here would tell the
+	// dispatcher GableLBM was down, when in fact it is holding live routes that
+	// somebody has to agree to withdraw.
+	if errors.Is(err, ErrPushed) {
+		httputil.RespondError(w, r, err.Error(), http.StatusLocked, err)
+		return
+	}
+	// A truck that has already left the yard cannot have its route recalled, so
+	// the re-plan is refused with the sentence naming it (422), not a shrug.
+	var refusal *Refusal
+	if errors.As(err, &refusal) {
+		httputil.RespondError(w, r, refusal.Msg, http.StatusUnprocessableEntity, err)
+		return
+	}
+	// Someone else wrote the superseded plan between our read and our write.
+	if errors.Is(err, ErrVersionConflict) {
+		httputil.RespondError(w, r, err.Error(), http.StatusConflict, err)
+		return
+	}
 	if err != nil {
 		httputil.RespondError(w, r, "ingest failed", http.StatusBadGateway, err)
 		return

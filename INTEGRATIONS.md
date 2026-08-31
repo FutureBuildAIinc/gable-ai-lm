@@ -45,7 +45,7 @@ client is `internal/gable.Client`; config resolution is in `internal/config/conf
 | `GET` | `/api/integration/orders` | `internal/catalog` / routing | Orders + line items + delivery geo + `branch_id` |
 | `GET` | `/api/integration/locations` | `internal/workflow` (depot) | Dealer branches (yards) + nullable coordinates |
 | `POST` | `/api/integration/delivery-routes` | `internal/routing` (approve), `internal/workflow` (push) | Write-back of an approved route plan |
-| `POST` | `/api/integration/delivery-routes/recall` | `internal/workflow` (re-assign) | Withdraw a pushed route the plan no longer contains |
+| `POST` | `/api/integration/delivery-routes/recall` | `internal/workflow` (re-assign, re-ingest) | Withdraw a pushed route the plan no longer contains |
 | `POST` | `/api/integration/validate-staff` | `gable.Client.ValidateStaff` | Staff login entitlement check (pillar 4) |
 
 > GableLBM also exposes quote endpoints (`bulk-price`, `quotes`, `accept-and-convert`) on
@@ -152,8 +152,16 @@ The yard would load a truck for a run that no longer existed.
 
 Request `{ vehicle_id, scheduled_date, reason?, recalled_by? }`; response
 `{ recalled, route_id?, stop_count, reason? }`. Consumed by
-`gable.Client.RecallDeliveryRoute`, called from `workflow.Assign` for exactly the trucks a
-re-assignment drops.
+`gable.Client.RecallDeliveryRoute`, called through the one recall path
+(`Service.recallRoutes`) from two places, which differ only in which routes they doom:
+
+- `workflow.Assign` dooms exactly the trucks a re-assignment **drops**. The survivors are
+  stale, not orphaned, and the next push replaces them; recalling one would cancel a good run.
+- `workflow.Ingest` dooms **every** live route of the plan it supersedes. A re-ingest keeps
+  nothing — the new plan is rebuilt from GableLBM's orders as they now stand and has no idea
+  the old routes exist, so a route left behind here is left behind for good. This is the
+  `"the day changed, re-run it"` path, and until it was gated it produced exactly the orphan
+  this endpoint exists to prevent, because the new plan's ledger starts empty.
 
 Three contract points that shape the AI_LM side:
 

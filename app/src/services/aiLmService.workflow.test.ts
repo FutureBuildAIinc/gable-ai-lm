@@ -217,12 +217,22 @@ describe('aiLmService — compliance registry', () => {
 });
 
 describe('aiLmService — guided workflow lifecycle', () => {
-  it('ingests a day by date', async () => {
+  it('ingests a day by date, carrying the same approval fields as every other write', async () => {
     await aiLmService.ingestWorkflow('2026-08-12');
     expect(lastCall()).toEqual({
       url: '/api/v1/workflow/plans',
       method: 'POST',
-      body: { date: '2026-08-12' },
+      body: { date: '2026-08-12', override: false, approved_by: '' },
+    });
+
+    // Re-planning a date whose previous plan still has routes on the dealer's
+    // dispatch board answers 423; the override recalls them, and it is the same
+    // two fields as assign/pack rather than a third approval shape.
+    await aiLmService.ingestWorkflow('2026-08-12', true, 'dispatcher@dealer.com');
+    expect(lastCall()).toEqual({
+      url: '/api/v1/workflow/plans',
+      method: 'POST',
+      body: { date: '2026-08-12', override: true, approved_by: 'dispatcher@dealer.com' },
     });
   });
 

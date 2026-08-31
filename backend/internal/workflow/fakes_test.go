@@ -25,9 +25,14 @@ import (
 // guarded by the plan's optimistic-concurrency version exactly as
 // `UPDATE ... WHERE id=$1 AND version=$expected` is.
 type fakePlanStore struct {
-	mu     sync.Mutex
-	plans  map[string]*Plan
-	nextID int
+	mu    sync.Mutex
+	plans map[string]*Plan
+	// created is the insertion order of plan ids, so GetLatestForDate can mean
+	// LATEST — the repository orders by created_at DESC, and map iteration
+	// order does not. It matters now that a date can legitimately hold more
+	// than one plan (a re-ingest supersedes rather than replaces).
+	created []string
+	nextID  int
 
 	updates   int
 	conflicts int
@@ -41,14 +46,19 @@ type fakePlanStore struct {
 func newFakePlanStore(seed ...*Plan) *fakePlanStore {
 	s := &fakePlanStore{plans: map[string]*Plan{}}
 	for _, p := range seed {
+		// nextID advances for EVERY seeded plan, named or not. It used to
+		// advance only for unnamed ones, so a store seeded with "plan-1" then
+		// minted "plan-1" again on the first Create and silently overwrote the
+		// seed — invisible until a date could legitimately hold two plans.
+		s.nextID++
 		if p.ID == "" {
-			s.nextID++
 			p.ID = fmt.Sprintf("plan-%d", s.nextID)
 		}
 		if p.Version == 0 {
 			p.Version = 1
 		}
 		s.plans[p.ID] = clonePlan(p)
+		s.created = append(s.created, p.ID)
 	}
 	return s
 }
@@ -74,6 +84,7 @@ func (s *fakePlanStore) Create(_ context.Context, p *Plan) error {
 	p.CreatedAt = time.Now()
 	p.UpdatedAt = p.CreatedAt
 	s.plans[p.ID] = clonePlan(p)
+	s.created = append(s.created, p.ID)
 	return nil
 }
 
@@ -121,12 +132,20 @@ func (s *fakePlanStore) Get(_ context.Context, id string) (*Plan, error) {
 func (s *fakePlanStore) GetLatestForDate(_ context.Context, date string) (*Plan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, p := range s.plans {
-		if p.PlanDate == date {
+	for i := len(s.created) - 1; i >= 0; i-- {
+		if p, ok := s.plans[s.created[i]]; ok && p.PlanDate == date {
 			return clonePlan(p), nil
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// count reports how many plans are stored (test-only accessor). "Did the
+// refused ingest create one anyway?" is not answerable without it.
+func (s *fakePlanStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.plans)
 }
 
 // stored returns the currently persisted plan (test-only accessor).

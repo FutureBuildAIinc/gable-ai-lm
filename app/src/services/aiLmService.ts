@@ -636,10 +636,15 @@ class AiLmService {
   }
 
   // workflow (guided end-to-end dispatch)
-  ingestWorkflow(date: string): Promise<WorkflowPlan> {
+  //
+  // override authorizes re-planning a date whose EXISTING plan still has routes
+  // on the dealer's dispatch board; approving it recalls every one of them
+  // before the new plan is created. It carries the same two fields as every
+  // other approval on this surface, so the one override prompt covers it.
+  ingestWorkflow(date: string, override = false, approvedBy = ''): Promise<WorkflowPlan> {
     return fetchWithAuth(`${BASE}/workflow/plans`, {
       method: 'POST',
-      body: JSON.stringify({ date }),
+      body: JSON.stringify({ date, override, approved_by: approvedBy }),
     }).then((r) => jsonOrThrow(r));
   }
   latestWorkflow(date: string): Promise<WorkflowPlan> {

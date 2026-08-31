@@ -280,8 +280,13 @@ export class PlanWorkflow extends LitElement {
 
   // --- actions ---------------------------------------------------------------
 
+  // Ingest goes through the approval prompt too. Re-planning a date whose
+  // previous plan still has routes on the dealer's board answers 423 — the
+  // dispatcher is about to strand them — and settling that is the same
+  // conversation as every other 423 here: an approver authorizes it, and the
+  // server's own sentence says which trucks it will recall.
   private _ingest() {
-    this._run('ingest', () => aiLmService.ingestWorkflow(this._date), (p) => this._setPlan(p));
+    this._runReshuffle('ingest', (o, by) => aiLmService.ingestWorkflow(this._date, o, by));
   }
 
   // _runReshuffle runs an approval-gated action (assign / pack / resequence /
