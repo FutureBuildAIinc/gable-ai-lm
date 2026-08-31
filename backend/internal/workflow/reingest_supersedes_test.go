@@ -361,6 +361,10 @@ func (s lookupErrStore) GetLatestForDate(context.Context, string) (*Plan, error)
 	return nil, s.err
 }
 
+func (s lookupErrStore) ListForDate(context.Context, string) ([]*Plan, error) {
+	return nil, s.err
+}
+
 // TestAnUnreadableDateLookupRefusesRatherThanPlanBlind pins the fail-closed
 // direction. If this module cannot find out what is already holding the date,
 // it does not know whether the board is live — and creating a plan on top of an

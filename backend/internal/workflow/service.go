@@ -88,6 +88,11 @@ type planStore interface {
 	Update(ctx context.Context, p *Plan) error
 	Get(ctx context.Context, id string) (*Plan, error)
 	GetLatestForDate(ctx context.Context, date string) (*Plan, error)
+	// ListForDate returns every plan for a date, newest first. A date holds
+	// more than one plan whenever a re-ingest has superseded another, and
+	// nothing forces the one holding live routes to be the latest — so every
+	// gate that asks "is this date live?" must ask about all of them.
+	ListForDate(ctx context.Context, date string) ([]*Plan, error)
 }
 
 // gableSource is the GableLBM integration surface the workflow consumes
@@ -211,6 +216,20 @@ func (s *Service) GetLatestForDate(ctx context.Context, date string) (*Plan, err
 // to its own ledger, which starts empty, so the superseded plan's routes could
 // never be withdrawn by anything: exactly the orphan the rest of this work
 // removed, reached from the other side. See gateSupersede.
+//
+// The gate asks about EVERY plan holding the date, not the latest one. A date
+// legitimately holds several — that is what "supersede rather than replace"
+// means — and nothing makes the live one the newest: a dispatcher can push an
+// older plan BY ID after a newer one exists, and a latest-only read then
+// reports an empty ledger for a date whose board is live. Three plain HTTP
+// calls reached that: ingest, push the first plan, ingest again.
+//
+// And it asks TWICE. The first ask is the cheap one, before the ERP is touched,
+// so a refused re-plan does not pull a day of orders and a catalog to throw
+// them away. The second is immediately before the write, because the first read
+// happens before three ERP round-trips and a push landing in that window would
+// otherwise be planned straight over. The second ask is the authoritative one:
+// it is the snapshot that is recalled from and persisted.
 func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) {
 	if req.Date == "" {
 		return nil, fmt.Errorf("%w: date is required", ErrInvalidRequest)
@@ -223,7 +242,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	// needs an approver, not a reason to pull a day of orders and a catalog and
 	// throw them away. The lookup itself is one indexed read of a table this
 	// module owns; it costs the common case nothing upstream.
-	superseded, err := s.supersededPlan(ctx, req.Date)
+	superseded, err := s.supersededPlans(ctx, req.Date)
 	if err != nil {
 		return nil, err
 	}
@@ -296,8 +315,22 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		Loads:            []TruckLoad{},
 		UnassignedOrders: []Stop{},
 	}
+	// Re-ask, immediately before the write. The snapshot above was taken BEFORE
+	// three ERP round-trips (orders, catalog, branches); a push that landed in
+	// that window is invisible to it, and creating a plan on top of a board
+	// that gained routes since is the same orphan by a slower route. This
+	// second read is the authoritative one — it is what gets recalled from and
+	// what gets persisted — and it re-runs the gate, so an unapproved late
+	// arrival is refused with the same 423 rather than silently planned over.
+	superseded, err = s.supersededPlans(ctx, req.Date)
+	if err != nil {
+		return nil, err
+	}
+	if err := gateSupersede(superseded, req.Date, req.Override, req.ApprovedBy); err != nil {
+		return nil, err
+	}
 	// The approval given above is exercised HERE, as late as possible: the
-	// superseded plan's routes come off the dealer's board only once this
+	// superseded plans' routes come off the dealer's board only once this
 	// ingest is certain it has a replacement to put there. A recall failure
 	// aborts and creates NOTHING — a half-recalled board with a new plan on top
 	// is worse than refusing outright.
@@ -314,28 +347,46 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	return plan, nil
 }
 
-// supersededPlan returns the plan a re-ingest of this date would replace, or
-// nil when the date has never been planned. A date with no plan is the ordinary
-// first ingest and is not an error.
-func (s *Service) supersededPlan(ctx context.Context, date string) (*Plan, error) {
-	prev, err := s.repo.GetLatestForDate(ctx, date)
-	if errors.Is(err, ErrNotFound) {
-		return nil, nil
-	}
+// supersededPlans returns every plan a re-ingest of this date would strand:
+// the ones whose LEDGER still names routes on the dealer's dispatch board.
+//
+// All of them, not the latest. A date holds one plan per ingest and the live
+// one need not be the newest — a dispatcher can push an older plan by id after
+// a re-ingest has already minted a successor — so a latest-only read reports an
+// empty ledger for a date whose board is live and lets the next re-ingest orphan
+// it. That was reachable in three plain HTTP calls with no concurrency at all.
+//
+// It keys on the ledger, not the status, and that is deliberate: a plan that
+// reached PUSHED and has since had every route recalled has nothing on the
+// board, and re-planning that date must stay exactly as frictionless as it is
+// today. A date with nothing live anywhere returns an empty slice, and every
+// caller below then does nothing — no approval, no recall, no write.
+//
+// A date with no plans at all is the ordinary first ingest and is not an error.
+func (s *Service) supersededPlans(ctx context.Context, date string) ([]*Plan, error) {
+	all, err := s.repo.ListForDate(ctx, date)
 	if err != nil {
-		return nil, fmt.Errorf("look up the existing plan for %s: %w", date, err)
+		return nil, fmt.Errorf("look up the existing plans for %s: %w", date, err)
 	}
-	return prev, nil
+	live := make([]*Plan, 0, len(all))
+	for _, p := range all {
+		if len(liveRoutes(p)) > 0 {
+			live = append(live, p)
+		}
+	}
+	return live, nil
 }
 
-// supersede takes the previous plan's routes off the dealer's dispatch board
-// before next replaces it, and records on that plan both the approval and the
-// tombstones.
+// supersede takes the previous plans' routes off the dealer's dispatch board
+// before next replaces them, and records on each of those plans both the
+// approval and the tombstones.
 //
-// EVERY live route goes, not a subset: unlike a re-assignment, which keeps the
-// trucks it did not drop, a re-ingest keeps nothing. The new plan is built from
-// GableLBM's orders as they now stand and has no idea these routes exist, so a
-// route left behind here is left behind for good.
+// EVERY live plan for the date, and every live route on each: unlike a
+// re-assignment, which keeps the trucks it did not drop, a re-ingest keeps
+// nothing. The new plan is built from GableLBM's orders as they now stand and
+// has no idea these routes exist, so a route left behind here is left behind
+// for good — and a plan left behind here is a plan no future gate can even see,
+// because the next re-ingest reads the ledgers this one failed to tombstone.
 //
 // Ordering is deliberate. Recall first, then persist the tombstones, then let
 // the caller create the new plan. Each step can only fail into a state that
@@ -345,28 +396,30 @@ func (s *Service) supersededPlan(ctx context.Context, date string) (*Plan, error
 // GableLBM answers the idempotent "nothing there" success. Over-reporting what
 // is live costs a redundant call. Under-reporting costs a truck loading for a
 // run that no longer exists.
-func (s *Service) supersede(ctx context.Context, prev, next *Plan, approvedBy string) error {
-	if prev == nil {
-		return nil
+//
+// The Update is unconditional, even for a plan with nothing left to doom. It is
+// not bookkeeping — it is the optimistic-concurrency check. prev was read
+// before this ingest committed to anything, and a write that never happens is a
+// stale read that never gets caught: the caller would proceed on a snapshot
+// somebody else has already moved past. The fast path is exactly where that
+// hurts, so the fast path takes the check too. Requirement 5 is untouched
+// because a date with nothing live yields an EMPTY prev, and this loop then
+// runs zero times.
+func (s *Service) supersede(ctx context.Context, prev []*Plan, next *Plan, approvedBy string) error {
+	for _, p := range prev {
+		doomed := liveRoutes(p)
+		if err := s.recallRoutes(ctx, p, doomed, approvedBy,
+			fmt.Sprintf("superseded by a re-plan of %s", next.PlanDate),
+			"this date cannot be re-planned around it"); err != nil {
+			return err
+		}
+		if err := s.repo.Update(ctx, p); err != nil {
+			return fmt.Errorf("record the recall on superseded plan %s: %w", p.ID, err)
+		}
+		slog.Info("superseded a plan whose routes were live on the dispatch board",
+			"superseded_plan", p.ID, "date", p.PlanDate,
+			"recalled", len(doomed), "approved_by", approvedBy)
 	}
-	doomed := liveRoutes(prev)
-	if len(doomed) == 0 {
-		// Nothing on the board, so gateSupersede recorded no approval and
-		// there is nothing to write. The common re-ingest never reaches the
-		// ERP or the store on this path at all.
-		return nil
-	}
-	if err := s.recallRoutes(ctx, prev, doomed, approvedBy,
-		fmt.Sprintf("superseded by a re-plan of %s", next.PlanDate),
-		"this date cannot be re-planned around it"); err != nil {
-		return err
-	}
-	if err := s.repo.Update(ctx, prev); err != nil {
-		return fmt.Errorf("record the recall on superseded plan %s: %w", prev.ID, err)
-	}
-	slog.Info("superseded a plan whose routes were live on the dispatch board",
-		"superseded_plan", prev.ID, "date", prev.PlanDate,
-		"recalled", len(doomed), "approved_by", approvedBy)
 	return nil
 }
 
@@ -691,6 +744,12 @@ func (s *Service) recallRoutes(ctx context.Context, p *Plan, doomed []LiveRoute,
 	}
 	return nil
 }
+
+// systemRecaller attributes a ledger correction this module made on its own
+// initiative — no dispatcher asked for it and none approved it. It is
+// deliberately not an empty string: "who took this route off?" must never read
+// as "nobody knows".
+const systemRecaller = "gable-ai-lm"
 
 // nameOrID renders a live route for an operator, preferring the truck name.
 func nameOrID(r LiveRoute) string {
@@ -1133,6 +1192,7 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		pushErr     error
 		failedTruck string
 		wrote       []string
+		wroteIDs    []string
 		skipped     []string
 	)
 	for i := range p.Loads {
@@ -1144,7 +1204,15 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		// cheap, and the digest — not the timestamp — is what makes it safe:
 		// any change to stops, driver or manifest since the last push produces
 		// a different digest and re-sends.
-		if l.PushedAt != nil && l.PushedDigest == digest {
+		//
+		// The LEDGER has the last word, though. A digest records what this plan
+		// once sent; the ledger records what this plan still believes is up
+		// there, and clearDisplacedClaims tombstones the entry when another
+		// plan's push destroys the route (the ERP keeps at most one
+		// non-dispatched route per truck per day). Skipping on the digest alone
+		// would leave that truck with no route at all and a plan convinced it
+		// had sent one.
+		if l.PushedAt != nil && l.PushedDigest == digest && routeIsLive(p, l.VehicleID) {
 			skipped = append(skipped, l.VehicleName)
 			continue
 		}
@@ -1159,6 +1227,7 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		l.PushedDigest = digest
 		markRouteLive(p, l.VehicleID, l.VehicleName, now)
 		wrote = append(wrote, l.VehicleName)
+		wroteIDs = append(wroteIDs, l.VehicleID)
 		// Metered per route, inside the loop, because that is where the value
 		// actually occurs: a push that fails on the fourth truck still put
 		// three real routes on the dealer's dispatch board, and they do not
@@ -1190,11 +1259,144 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 			"skipped_already_live", strings.Join(skipped, ", "), "written", len(wrote))
 	}
 
+	// Keep the ledger truthful at the source. See clearDisplacedClaims: every
+	// truck this loop wrote has just destroyed whatever route another plan for
+	// this date had on that truck, and that plan's ledger is now lying.
+	//
+	// It runs before the status advance and its failure is returned, because a
+	// push is resumable and idempotent — the digest skips the trucks already
+	// written, so a retry costs nothing upstream and tries the correction
+	// again. A ledger allowed to lie is not a cosmetic defect: gateSupersede,
+	// the recall path and this skip all read it, so a lie there un-gates the
+	// very orphan this work removes.
+	if err := s.clearDisplacedClaims(ctx, p, wroteIDs, now); err != nil {
+		if uerr := s.repo.Update(ctx, p); uerr != nil {
+			slog.Error("could not record a push whose displaced-claim cleanup failed",
+				"plan", p.ID, "date", p.PlanDate, "error", uerr)
+		}
+		return nil, err
+	}
+
 	p.Status = planTransitions[actionPush].to
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// clearDisplacedClaims tombstones every OTHER plan's ledger entry for a truck
+// this push has just re-routed on this date.
+//
+// It exists because of a fact upstream: GableLBM's ReplaceDeliveryRoute DELETEs
+// any DRAFT/SCHEDULED delivery_route for the same (vehicle_id, scheduled_date)
+// before inserting. The ERP therefore holds AT MOST ONE non-dispatched route
+// per truck per day — two plans on one date both claiming a truck live is not
+// untidy, it is a state the ERP cannot represent. The second push has ALREADY
+// destroyed the first plan's route; the only question is whether this system
+// notices.
+//
+// Until it did, the older plan's ledger kept naming a route that no longer
+// existed, and everything keyed on that ledger inherited the lie: the recall
+// path would cancel a route belonging to somebody else (the wire key is
+// (vehicle, date), not "the route this plan pushed"), and gateSupersede would
+// refuse future re-ingests over ghosts. The ledger is a MIRROR of the dispatch
+// board; a mirror that can silently diverge makes every gate above unsound.
+//
+// This is NOT a second recall path. Nothing is withdrawn from GableLBM here —
+// there is nothing left to withdraw — so there is no wire call, no dispatched
+// 409 and no approval to weigh. It only stops a ledger claiming what upstream
+// no longer has.
+func (s *Service) clearDisplacedClaims(ctx context.Context, p *Plan, vehicleIDs []string, at time.Time) error {
+	if len(vehicleIDs) == 0 {
+		return nil
+	}
+	displaced := make(map[string]bool, len(vehicleIDs))
+	for _, id := range vehicleIDs {
+		displaced[id] = true
+	}
+	others, err := s.repo.ListForDate(ctx, p.PlanDate)
+	if err != nil {
+		return fmt.Errorf("look up the other plans for %s: %w", p.PlanDate, err)
+	}
+	for _, other := range others {
+		if other.ID == p.ID || !claimsAnyOf(other, vehicleIDs) {
+			continue
+		}
+		if err := s.tombstoneDisplaced(ctx, other.ID, p, displaced, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tombstoneDisplaced re-reads one plan and marks the displaced trucks recalled.
+//
+// It re-reads rather than writing the copy it was handed because the copy is
+// already a moment old and Update is version-checked: another actor saving that
+// plan in between must not turn a correctness fix into a 409 the dispatcher
+// cannot act on. A conflict therefore retries on fresh state; a conflict that
+// keeps happening is surfaced, because a ledger left lying is the defect.
+func (s *Service) tombstoneDisplaced(ctx context.Context, id string, by *Plan, displaced map[string]bool, at time.Time) error {
+	const attempts = 3
+	var err error
+	for i := 0; i < attempts; i++ {
+		var other *Plan
+		if other, err = s.repo.Get(ctx, id); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return fmt.Errorf("re-read plan %s to correct its ledger: %w", id, err)
+		}
+		n := 0
+		for j := range other.LiveRoutes {
+			r := &other.LiveRoutes[j]
+			if !r.Live() || !displaced[r.VehicleID] {
+				continue
+			}
+			t := at
+			r.RecalledAt = &t
+			r.RecalledBy = systemRecaller
+			r.RecallNote = fmt.Sprintf("replaced on the dispatch board by plan %s", by.ID)
+			n++
+		}
+		if n == 0 {
+			return nil
+		}
+		if err = s.repo.Update(ctx, other); err == nil {
+			slog.Info("corrected a plan whose routes this push replaced upstream",
+				"plan", other.ID, "date", other.PlanDate, "replaced_by", by.ID, "routes", n)
+			return nil
+		}
+		if !errors.Is(err, ErrVersionConflict) {
+			return fmt.Errorf("correct the ledger of plan %s: %w", id, err)
+		}
+	}
+	slog.Error("could not correct a plan whose routes this push replaced upstream",
+		"plan", id, "date", by.PlanDate, "replaced_by", by.ID, "error", err)
+	return err
+}
+
+// routeIsLive reports whether this plan's ledger still claims this truck's
+// route is on the dispatch board. It is the per-truck reading of liveRoutes,
+// which stays the one place that decides what "live" means.
+func routeIsLive(p *Plan, vehicleID string) bool {
+	for _, r := range liveRoutes(p) {
+		if r.VehicleID == vehicleID {
+			return true
+		}
+	}
+	return false
+}
+
+// claimsAnyOf is routeIsLive over a set, so the pre-check that saves a read
+// cannot drift from the check that does the work.
+func claimsAnyOf(p *Plan, vehicleIDs []string) bool {
+	for _, id := range vehicleIDs {
+		if routeIsLive(p, id) {
+			return true
+		}
+	}
+	return false
 }
 
 // deliveryRoute builds the GableLBM write-back payload for one truck.

@@ -179,6 +179,45 @@ func (r *Repository) Get(ctx context.Context, id string) (*Plan, error) {
 	return &p, nil
 }
 
+// ListForDate returns EVERY plan for a date, newest first.
+//
+// It exists because a date legitimately holds more than one plan — a re-ingest
+// supersedes rather than replaces — and nothing forces the plan holding live
+// routes to be the latest one. GetLatestForDate answers a display question
+// ("what is this date's current plan?"); it is not safe to gate on, because a
+// dispatcher can push an OLDER plan by id after a newer one exists and the
+// latest-only read then reports an empty ledger for a date whose board is live.
+//
+// A date with no plans is an empty slice, not ErrNotFound: "nothing here" is
+// the ordinary first ingest, not a failure.
+func (r *Repository) ListForDate(ctx context.Context, date string) ([]*Plan, error) {
+	rows, err := r.db.GetExecutor(ctx).Query(ctx, `
+		SELECT id, plan_date::text, status, version, payload, created_at, updated_at
+		FROM workflow_plans WHERE plan_date=$1
+		ORDER BY created_at DESC`, date)
+	if err != nil {
+		return nil, fmt.Errorf("query workflow_plans by date: %w", err)
+	}
+	defer rows.Close()
+
+	out := []*Plan{}
+	for rows.Next() {
+		var p Plan
+		var raw []byte
+		if err := rows.Scan(&p.ID, &p.PlanDate, &p.Status, &p.Version, &raw, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan workflow_plan: %w", err)
+		}
+		if err := r.unmarshalPayload(raw, &p); err != nil {
+			return nil, err
+		}
+		out = append(out, &p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("query workflow_plans by date: %w", err)
+	}
+	return out, nil
+}
+
 // GetLatestForDate returns the most recent plan for a date, or ErrNotFound.
 func (r *Repository) GetLatestForDate(ctx context.Context, date string) (*Plan, error) {
 	var p Plan

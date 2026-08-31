@@ -140,6 +140,21 @@ func (s *fakePlanStore) GetLatestForDate(_ context.Context, date string) (*Plan,
 	return nil, ErrNotFound
 }
 
+// ListForDate returns every plan for a date, newest first — the same order the
+// repository's `ORDER BY created_at DESC` gives, taken from insertion order
+// because two plans minted in the same test tick share a timestamp.
+func (s *fakePlanStore) ListForDate(_ context.Context, date string) ([]*Plan, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []*Plan{}
+	for i := len(s.created) - 1; i >= 0; i-- {
+		if p, ok := s.plans[s.created[i]]; ok && p.PlanDate == date {
+			out = append(out, clonePlan(p))
+		}
+	}
+	return out, nil
+}
+
 // count reports how many plans are stored (test-only accessor). "Did the
 // refused ingest create one anyway?" is not answerable without it.
 func (s *fakePlanStore) count() int {
@@ -169,6 +184,9 @@ func (s errPlanStore) Get(ctx context.Context, id string) (*Plan, error) {
 func (s errPlanStore) GetLatestForDate(ctx context.Context, d string) (*Plan, error) {
 	return s.inner.GetLatestForDate(ctx, d)
 }
+func (s errPlanStore) ListForDate(ctx context.Context, d string) ([]*Plan, error) {
+	return s.inner.ListForDate(ctx, d)
+}
 
 // fakeGable is the GableLBM integration double. pushed records every route
 // written back so a test can assert what actually reached the dispatch board.
@@ -187,12 +205,28 @@ type fakeGable struct {
 	// asserting, not just an implementation detail.
 	locationCalls int
 
+	// orderDates records every date an ingest actually pulled orders for, in
+	// call order. It exists because "the supersede gate sits BEFORE the ERP is
+	// touched" was unpinnable while this method recorded nothing: moving the
+	// gate below the order pull left the whole suite green, and a refused
+	// re-ingest would silently keep costing a day of orders and a catalog.
+	orderDates []string
+
+	// onListOrders fires once, inside the order pull. That call is exactly the
+	// window between the ingest's cheap pre-ERP gate and its authoritative
+	// pre-write one, so a test can land a competing push in it.
+	onListOrders func()
+
 	pushed  []gable.DeliveryRoute
 	pushErr error
 
 	// pushErrAfter, when > 0, lets the Nth push and every one before it
 	// succeed and fails the rest — the mid-loop failure a partial push is.
 	pushErrAfter int
+	// pushCalls counts attempts, which is what pushErrAfter counts down. It is
+	// not len(pushed): the board below REPLACES rather than accumulates, so the
+	// two stopped being the same number.
+	pushCalls int
 
 	// recalled records every route withdrawal, in order, so a test can assert
 	// that an override recalled EXACTLY the trucks the re-assignment dropped
@@ -208,7 +242,12 @@ type fakeGable struct {
 	recallMissing bool
 }
 
-func (f *fakeGable) ListOrdersForDate(context.Context, string) ([]gable.Order, error) {
+func (f *fakeGable) ListOrdersForDate(_ context.Context, date string) ([]gable.Order, error) {
+	f.orderDates = append(f.orderDates, date)
+	if hook := f.onListOrders; hook != nil {
+		f.onListOrders = nil
+		hook()
+	}
 	return f.orders, nil
 }
 func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) { return f.vehicles, nil }
@@ -220,14 +259,31 @@ func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
 	return f.locations, nil
 }
 func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { return f.drivers, nil }
+
+// PushDeliveryRoute models the upstream write as it actually behaves.
+//
+// GableLBM's ReplaceDeliveryRoute DELETEs any DRAFT/SCHEDULED delivery_route
+// for the same (vehicle_id, scheduled_date) before inserting, so the ERP holds
+// AT MOST ONE non-dispatched route per truck per day. A fake that APPENDED
+// could represent a board the real one cannot — two plans both holding a truck
+// — and every assertion of the form "the ledger mirrors the board" was
+// therefore being made against a board that does not exist.
 func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
-	if f.pushErrAfter > 0 && len(f.pushed) >= f.pushErrAfter {
+	f.pushCalls++
+	if f.pushErrAfter > 0 && f.pushCalls > f.pushErrAfter {
 		return fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
 	}
 	if f.pushErr != nil {
 		return f.pushErr
 	}
-	f.pushed = append(f.pushed, r)
+	kept := make([]gable.DeliveryRoute, 0, len(f.pushed)+1)
+	for _, existing := range f.pushed {
+		if existing.VehicleID == r.VehicleID && existing.ScheduledDate == r.ScheduledDate {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	f.pushed = append(kept, r)
 	return nil
 }
 

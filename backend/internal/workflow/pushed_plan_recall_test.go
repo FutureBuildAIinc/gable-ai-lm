@@ -404,13 +404,15 @@ func TestAPartialPushIsResumable(t *testing.T) {
 	// Resume: GableLBM comes back, and the re-push writes ONLY the truck that
 	// never landed. Re-POSTing the first two would be wasteful and would churn
 	// routes the yard may already be working from.
+	// Counted in CALLS, not in board size: the board replaces per (truck, date)
+	// exactly as GableLBM does, so a re-sent truck leaves its length unchanged.
 	g.pushErrAfter = 0
-	before := len(g.pushed)
+	before := g.pushCalls
 	got, err := svc.Push(context.Background(), "plan-1")
 	if err != nil {
 		t.Fatalf("the resumed push must complete the run: %v", err)
 	}
-	if wrote := len(g.pushed) - before; wrote != 1 {
+	if wrote := g.pushCalls - before; wrote != 1 {
 		t.Errorf("the resume wrote %d route(s), want 1 — the two already live must be skipped", wrote)
 	}
 	if got.Status != StatusPushed {
@@ -447,12 +449,15 @@ func TestAResumeRePushesATruckWhoseRouteChanged(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
+	// Counted in CALLS, not in board size: re-sending truck 1 REPLACES its row
+	// upstream (that is what ReplaceDeliveryRoute does), so the board grows by
+	// one while two routes are written.
 	g.pushErrAfter = 0
-	before := len(g.pushed)
+	before := g.pushCalls
 	if _, err := svc.Push(context.Background(), "plan-1"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
-	if wrote := len(g.pushed) - before; wrote != 2 {
+	if wrote := g.pushCalls - before; wrote != 2 {
 		t.Errorf("wrote %d route(s), want 2 — the acked truck changed and must be re-sent, not skipped", wrote)
 	}
 }

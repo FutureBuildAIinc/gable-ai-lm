@@ -239,6 +239,10 @@ func (s failingCreateStore) GetLatestForDate(ctx context.Context, d string) (*Pl
 	return s.inner.GetLatestForDate(ctx, d)
 }
 
+func (s failingCreateStore) ListForDate(ctx context.Context, d string) ([]*Plan, error) {
+	return s.inner.ListForDate(ctx, d)
+}
+
 // failAfterNPushes accepts n routes and then fails, modelling an ERP that goes
 // away mid-batch.
 type failAfterNPushes struct {

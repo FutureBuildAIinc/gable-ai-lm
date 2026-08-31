@@ -205,6 +205,27 @@ func liveRoutes(p *Plan) []LiveRoute {
 	return out
 }
 
+// liveRoutesAcross is liveRoutes over a set of plans, in plan order. It is what
+// makes one refusal sentence able to describe a whole date: a date can hold
+// several plans and any number of them may be holding trucks on the board.
+func liveRoutesAcross(plans []*Plan) []LiveRoute {
+	out := []LiveRoute{}
+	for _, p := range plans {
+		out = append(out, liveRoutes(p)...)
+	}
+	return out
+}
+
+// planIDs names the plans a refusal is about, so a dispatcher reading it can go
+// and look at them. "Some other plan has routes out" is not actionable.
+func planIDs(plans []*Plan) string {
+	ids := make([]string, 0, len(plans))
+	for _, p := range plans {
+		ids = append(ids, p.ID)
+	}
+	return strings.Join(ids, ", ")
+}
+
 // liveRouteNames lists the trucks whose routes are live, for a refusal message.
 func liveRouteNames(live []LiveRoute) string {
 	names := make([]string, 0, len(live))
@@ -253,7 +274,7 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 		return nil
 
 	case needsApproval:
-		return requireApproval(p, action, t.gerund,
+		return requireApproval([]*Plan{p}, action, t.gerund,
 			"will recall the route of any truck it drops", override, approvedBy)
 
 	default: // notListed
@@ -279,24 +300,33 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 // for a run that no longer exists" — reached by what is plausibly the more
 // common dispatcher action of the two.
 //
-// So the gate keys on the ledger of the plan being SUPERSEDED, and on nothing
-// else. Not on its status: a plan that reached PUSHED and has since had every
+// So the gate keys on the ledgers of the plans being SUPERSEDED, and on nothing
+// else. Not on their status: a plan that reached PUSHED and has since had every
 // route recalled has nothing on the board, and re-planning that date must stay
 // exactly as frictionless as it is today. "Are there live routes?" is the whole
 // question.
 //
+// And it keys on EVERY plan holding the date, not the newest. A date holds one
+// plan per ingest — that is what "supersede rather than replace" means — and
+// the live one need not be the latest: pushing an older plan by id after a
+// re-ingest has minted a successor leaves the newest plan's ledger empty and
+// the board full. A latest-only gate walks straight past that, which three
+// plain HTTP calls demonstrated. prev is the union (see Service.supersededPlans)
+// and is already filtered to plans with something live, so an empty slice is
+// the frictionless path and costs nothing.
+//
 // The refusal is ErrPushed with an approver — the same 423 idiom as the lock
 // and as every other live-route gate — and an exercised override is recorded on
-// the superseded plan, where the recall it authorizes will be tombstoned.
-func gateSupersede(prev *Plan, date string, override bool, approvedBy string) error {
-	// No previous plan for this date, or one that put nothing on the board (or
-	// has already taken it all off): the common case, and it must cost nothing.
-	if prev == nil || len(liveRoutes(prev)) == 0 {
+// every superseded plan, where the recalls it authorizes will be tombstoned.
+func gateSupersede(prev []*Plan, date string, override bool, approvedBy string) error {
+	// Nothing holding this date has anything on the board: the common case, and
+	// it must cost nothing.
+	if len(prev) == 0 {
 		return nil
 	}
 	return requireApproval(prev, actionSupersede,
 		fmt.Sprintf("re-planning %s", date),
-		fmt.Sprintf("will recall every route %s left on the dispatch board", prev.ID),
+		fmt.Sprintf("will recall every route %s left on the dispatch board", planIDs(prev)),
 		override, approvedBy)
 }
 
@@ -307,8 +337,15 @@ func gateSupersede(prev *Plan, date string, override bool, approvedBy string) er
 // reads the same way and every approval lands in the same audit field. The
 // callers supply only what differs: the gerund naming the operation, and the
 // consequence clause promising what an approval will do to the dealer's board.
-func requireApproval(p *Plan, action, gerund, consequence string, override bool, approvedBy string) error {
-	live := liveRoutes(p)
+//
+// It takes a SET of plans because a transition gate is about one plan and the
+// supersede gate is about a whole date, which may be held by several. One
+// sentence still comes out — the live trucks named across all of them — and the
+// approval is recorded on each plan it authorizes changing, because that is
+// where the recall it pays for will be tombstoned. A second sentence for the
+// multi-plan case would be a second override idiom for a dispatcher to learn.
+func requireApproval(plans []*Plan, action, gerund, consequence string, override bool, approvedBy string) error {
+	live := liveRoutesAcross(plans)
 	if !override {
 		return fmt.Errorf("%w (%s) — %s requires manual approval (override), and %s",
 			ErrPushed, liveRouteNames(live), gerund, consequence)
@@ -317,13 +354,15 @@ func requireApproval(p *Plan, action, gerund, consequence string, override bool,
 	if who == "" {
 		who = "an approver"
 	}
-	p.PushedOverrides = append(p.PushedOverrides, PushedOverride{
-		Action:     action,
-		ApprovedBy: who,
-		ApprovedAt: time.Now(),
-		Note: fmt.Sprintf("%s approved with %d route(s) live on the dispatch board (%s)",
-			gerund, len(live), liveRouteNames(live)),
-	})
+	for _, p := range plans {
+		p.PushedOverrides = append(p.PushedOverrides, PushedOverride{
+			Action:     action,
+			ApprovedBy: who,
+			ApprovedAt: time.Now(),
+			Note: fmt.Sprintf("%s approved with %d route(s) live on the dispatch board (%s)",
+				gerund, len(live), liveRouteNames(live)),
+		})
+	}
 	return nil
 }
 

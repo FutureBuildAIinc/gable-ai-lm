@@ -140,7 +140,19 @@ The workflow push writes one route per truck and **acknowledges each one on the 
 lands** (`TruckLoad.pushed_at` plus a digest of the payload, and a `Plan.live_routes`
 entry). A push that fails part-way therefore persists what it managed to write and leaves
 the plan at `REVIEWED` — never `PUSHED` — so re-running it resumes, skipping the trucks
-already on the board whose route is unchanged.
+already on the board whose route is unchanged *and whose ledger entry is still live*.
+
+**"Overwrites rather than duplicates" is a constraint on AI_LM, not just a convenience.**
+`ReplaceDeliveryRoute` DELETEs any `DRAFT`/`SCHEDULED` `delivery_route` for the same
+`(vehicle_id, scheduled_date)` before inserting, so GableLBM holds **at most one
+non-dispatched route per truck per day**. A date can hold several AI_LM plans (a re-ingest
+supersedes rather than replaces), so two of them claiming the same truck live is not untidy
+— it is a state the dealer's system cannot represent, and the second push has already
+destroyed the first plan's route. `workflow.Push` therefore tombstones any *other* plan's
+`live_routes` entry for a truck it just re-routed. That is a ledger correction, not a
+recall: there is nothing left upstream to withdraw, so no `recall` call is made. Skipping it
+would leave every gate keyed on `live_routes` — including the re-ingest gate — reading a
+ledger that no longer mirrors the board.
 
 ### `POST /api/integration/delivery-routes/recall` — withdraw
 
@@ -157,11 +169,14 @@ Request `{ vehicle_id, scheduled_date, reason?, recalled_by? }`; response
 
 - `workflow.Assign` dooms exactly the trucks a re-assignment **drops**. The survivors are
   stale, not orphaned, and the next push replaces them; recalling one would cancel a good run.
-- `workflow.Ingest` dooms **every** live route of the plan it supersedes. A re-ingest keeps
-  nothing — the new plan is rebuilt from GableLBM's orders as they now stand and has no idea
-  the old routes exist, so a route left behind here is left behind for good. This is the
+- `workflow.Ingest` dooms **every** live route of **every** plan holding the date. A re-ingest
+  keeps nothing — the new plan is rebuilt from GableLBM's orders as they now stand and has no
+  idea the old routes exist, so a route left behind here is left behind for good. This is the
   `"the day changed, re-run it"` path, and until it was gated it produced exactly the orphan
-  this endpoint exists to prevent, because the new plan's ledger starts empty.
+  this endpoint exists to prevent, because the new plan's ledger starts empty. It reads the
+  whole date (`ListForDate`) rather than its latest plan, because nothing forces the plan
+  holding live routes to be the newest: pushing an older plan by id after a re-ingest has
+  already minted a successor leaves the newest ledger empty and the board full.
 
 Three contract points that shape the AI_LM side:
 
