@@ -338,7 +338,7 @@ a way that looks like an empty catalog rather than a version mismatch.
 
 ### What the fix involves
 
-- Publish an OpenAPI 3 document (or JSON Schema set) for the six routes, and
+- Publish an OpenAPI 3 document (or JSON Schema set) for the seven routes, and
   generate the wire structs from it rather than hand-maintaining both.
 - Extract the wire schema into a shared, semver-versioned package that both sides
   depend on, so the commit dependency becomes a version constraint.
