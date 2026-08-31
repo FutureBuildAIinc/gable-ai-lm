@@ -165,7 +165,17 @@ func Mint(c Claims, priv ed25519.PrivateKey) (string, error) {
 // checks the detached signature. Every failure path returns an error: this
 // function never downgrades a bad token into a lesser licence.
 func verify(token string, trusted map[string]ed25519.PublicKey) (*Claims, string, error) {
-	parts := strings.Split(strings.TrimSpace(token), ".")
+	token = strings.TrimSpace(token)
+	// Go's base64 decoder silently skips \r and \n, so a hard-wrapped token
+	// would decode to the same claim bytes and verify. That is not a forgery
+	// today — the signed bytes are unchanged — but it means one licence has
+	// many valid string forms, which stops being harmless the moment a token
+	// string is hashed for revocation, de-duplication or caching. Require one
+	// canonical form now, while nothing depends on it.
+	if strings.ContainsAny(token, " \t\r\n") {
+		return nil, "", fmt.Errorf("%w: token contains whitespace; it must be a single unwrapped line", ErrMalformedToken)
+	}
+	parts := strings.Split(token, ".")
 	if len(parts) != 4 || parts[0] != tokenPrefix {
 		return nil, "", fmt.Errorf("%w: expected %s.<key-id>.<claims>.<signature>", ErrMalformedToken, tokenPrefix)
 	}
@@ -201,6 +211,15 @@ func verify(token string, trusted map[string]ed25519.PublicKey) (*Claims, string
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
 		return nil, kid, fmt.Errorf("%w: claim set is not a license claim set this build understands: %v", ErrMalformedToken, err)
+	}
+	// Decode reads ONE JSON value and ignores whatever follows it, so a payload
+	// of `{...claims...}{"edition":"commercial"}` would parse the first object
+	// and silently drop the second. That is the precise fail-open
+	// DisallowUnknownFields exists to prevent: a newer issuer appending a
+	// document this build cannot represent would be ignored rather than
+	// refused. Require that the payload is exactly one value.
+	if dec.More() {
+		return nil, kid, fmt.Errorf("%w: claim set carries trailing data after the first JSON object", ErrMalformedToken)
 	}
 	return &c, kid, nil
 }

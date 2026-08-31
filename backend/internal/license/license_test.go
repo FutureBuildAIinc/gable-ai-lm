@@ -6,6 +6,7 @@ package license
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -856,5 +857,81 @@ func TestKeyIDIsDerivedNotAssigned(t *testing.T) {
 	}
 	if KeyID(s.pub) == KeyID(newSigner(t).pub) {
 		t.Error("two different keys share a key id")
+	}
+}
+
+// A licence must have exactly one valid string form.
+//
+// Go's base64 decoder skips \r and \n, so a hard-wrapped token decodes to the
+// same claim bytes and verifies. That is not a forgery — the signed bytes are
+// unchanged — but it means one licence has many accepted spellings, which stops
+// being harmless the moment a token string is hashed for revocation, dedup or
+// caching. Found by adversarial review; pinned here so canonicality cannot be
+// lost by a later refactor of the parser.
+func TestWrappedTokenIsRefusedEvenThoughItWouldVerify(t *testing.T) {
+	s := newSigner(t)
+	tok := s.mint(t, communityClaims())
+
+	// Sanity: the unwrapped token is genuinely good, so the refusals below are
+	// about the whitespace and not a broken fixture.
+	if _, err := Load(Config{Token: tok, PublicKeys: s.trust()}); err != nil {
+		t.Fatalf("baseline token should load: %v", err)
+	}
+
+	parts := strings.Split(tok, ".")
+	for _, tc := range []struct {
+		name    string
+		wrapped string
+	}{
+		{"newline inside the claim set", parts[0] + "." + parts[1] + "." + parts[2][:8] + "\n" + parts[2][8:] + "." + parts[3]},
+		{"carriage return inside the signature", parts[0] + "." + parts[1] + "." + parts[2] + "." + parts[3][:8] + "\r" + parts[3][8:]},
+		{"tab inside the claim set", parts[0] + "." + parts[1] + "." + parts[2][:8] + "\t" + parts[2][8:] + "." + parts[3]},
+		{"space inside the claim set", parts[0] + "." + parts[1] + "." + parts[2][:8] + " " + parts[2][8:] + "." + parts[3]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lic, err := Load(Config{Token: tc.wrapped, PublicKeys: s.trust()})
+			if err == nil {
+				t.Fatalf("wrapped token was accepted; edition=%s", lic.Edition())
+			}
+			if !errors.Is(err, ErrMalformedToken) {
+				t.Errorf("err = %v, want ErrMalformedToken", err)
+			}
+		})
+	}
+}
+
+// A payload carrying a second JSON document must be refused, not truncated.
+//
+// json.Decoder.Decode reads one value and ignores what follows, so
+// `{...claims...}{"edition":"commercial"}` parsed the first object and silently
+// dropped the second. DisallowUnknownFields exists precisely so that a token
+// minted by a newer issuer — carrying a determination this build cannot
+// represent — fails at boot rather than being partly understood. Trailing data
+// was the hole in that guarantee. Requires the private key to exploit, so this
+// is about keeping a stated invariant true, not about an external attacker.
+func TestTrailingJSONInTheClaimSetIsRefused(t *testing.T) {
+	s := newSigner(t)
+
+	body, err := json.Marshal(communityClaims())
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	// One signature over both documents, so the signature itself is valid and
+	// the only thing that can reject this is the trailing-data check.
+	payload := append(append([]byte{}, body...), []byte(`{"edition":"commercial"}`)...)
+	sig := ed25519.Sign(s.priv, payload)
+	tok := strings.Join([]string{
+		"ailm1",
+		KeyID(s.pub),
+		base64.RawURLEncoding.EncodeToString(payload),
+		base64.RawURLEncoding.EncodeToString(sig),
+	}, ".")
+
+	lic, err := Load(Config{Token: tok, PublicKeys: s.trust()})
+	if err == nil {
+		t.Fatalf("token with a trailing JSON document was accepted; edition=%s", lic.Edition())
+	}
+	if !errors.Is(err, ErrMalformedToken) {
+		t.Errorf("err = %v, want ErrMalformedToken", err)
 	}
 }

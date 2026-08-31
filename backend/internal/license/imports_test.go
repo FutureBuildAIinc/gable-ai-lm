@@ -23,6 +23,14 @@ import (
 // packages that cannot themselves reach a network makes an outbound call
 // unreachable rather than merely unwritten.
 //
+// That guarantee holds only while every entry is stdlib. This file parses THIS
+// package's imports, not their transitive ones, so admitting an internal or
+// third-party package would silence the check for everything beneath it —
+// exactly the "phones home three levels down" case above. TestAllowlistIsStdlibOnly
+// makes that structural: the allowlist cannot admit a non-stdlib package
+// without failing, so the reviewer's only remaining job is the one the comment
+// asks for — confirming the stdlib package cannot open a connection.
+//
 // Adding an entry here is a deliberate act. If you are adding one, satisfy
 // yourself first that the package cannot open a connection, and second that the
 // seam genuinely needs it.
@@ -138,4 +146,31 @@ func keys(m map[string][]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// TestAllowlistIsStdlibOnly keeps the allowlist's promise honest.
+//
+// packageImports scans one package. Its conclusion — that no outbound call is
+// reachable — is sound only because every allowed import is a stdlib package
+// with no network of its own. Admit "github.com/…/internal/foo" and the
+// conclusion silently stops following: foo's own imports are never examined.
+//
+// Stdlib import paths have no dot in their first segment (dots appear in domain
+// names). That is the whole test, and it is enough: it forces anyone widening
+// the allowlist to a module path to confront this comment first.
+func TestAllowlistIsStdlibOnly(t *testing.T) {
+	for path := range allowedImports {
+		first := path
+		if i := strings.Index(path, "/"); i >= 0 {
+			first = path[:i]
+		}
+		if strings.Contains(first, ".") {
+			t.Errorf(
+				"allowlist admits %q, which is not stdlib — this test only scans "+
+					"this package's own imports, so a module path here would leave its "+
+					"transitive imports unchecked and the no-network claim unproven",
+				path,
+			)
+		}
+	}
 }
