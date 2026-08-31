@@ -6,7 +6,9 @@ package routing
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
+	"github.com/FutureBuildAIinc/gable-ai-lm/internal/depot"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
 )
 
@@ -27,22 +29,51 @@ type driverSource interface {
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
 }
 
+// locationSource fetches the dealer's yards, so a plan can be rooted at the
+// branch it was asked for rather than at the middle of its own stops
+// (satisfied by *gable.Client).
+type locationSource interface {
+	ListLocations(ctx context.Context) ([]gable.Location, error)
+}
+
 // routeSink writes an approved route back to GableLBM (satisfied by *gable.Client).
 type routeSink interface {
 	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
 }
 
-// Service orchestrates route planning and write-back.
-type Service struct {
-	repo     *Repository
-	orders   orderSource
-	vehicles vehicleSource
-	drivers  driverSource
-	sink     routeSink
+// planStore is the persistence seam for route plans (satisfied by
+// *Repository). It is declared consumer-side like every other seam in this
+// module so planning can be exercised against an in-memory store with no
+// Postgres.
+type planStore interface {
+	Save(ctx context.Context, p *Plan) error
+	Get(ctx context.Context, id string) (*Plan, error)
+	UpdateStatus(ctx context.Context, id, status string) error
 }
 
-func NewService(repo *Repository, orders orderSource, vehicles vehicleSource, drivers driverSource, sink routeSink) *Service {
-	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, sink: sink}
+// Config carries this module's deployment configuration: the install-wide
+// fallback yard (DEPOT_LAT/DEPOT_LNG). It is the same pair the workflow module
+// is given, because both root their runs through the same ladder and an
+// endpoint that disagreed with its neighbour about where the yard is would be
+// the bug this file was changed to fix.
+type Config struct {
+	DepotLat *float64
+	DepotLng *float64
+}
+
+// Service orchestrates route planning and write-back.
+type Service struct {
+	repo      planStore
+	orders    orderSource
+	vehicles  vehicleSource
+	drivers   driverSource
+	locations locationSource
+	sink      routeSink
+	cfg       Config
+}
+
+func NewService(repo planStore, orders orderSource, vehicles vehicleSource, drivers driverSource, locations locationSource, sink routeSink, cfg Config) *Service {
+	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, locations: locations, sink: sink, cfg: cfg}
 }
 
 // Plan pulls confirmed orders for the date, optimizes the stop sequence, and
@@ -59,7 +90,7 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 
 	// Build stops from orders that carry geolocation.
 	var stops []Stop
-	var sumLat, sumLng float64
+	var points []depot.Point
 	for _, o := range orders {
 		if o.Latitude == nil || o.Longitude == nil {
 			continue
@@ -75,18 +106,13 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 			Address:   o.Address,
 			WeightLbs: weight,
 		})
-		sumLat += *o.Latitude
-		sumLng += *o.Longitude
+		points = append(points, depot.Point{Lat: *o.Latitude, Lng: *o.Longitude})
 	}
 
-	// Depot defaults to the centroid of all stops when not supplied.
-	depotLat, depotLng := 0.0, 0.0
-	if req.DepotLat != nil && req.DepotLng != nil {
-		depotLat, depotLng = *req.DepotLat, *req.DepotLng
-	} else if len(stops) > 0 {
-		depotLat = sumLat / float64(len(stops))
-		depotLng = sumLng / float64(len(stops))
-	}
+	depotLat, depotLng, depotSource, depotNote := s.resolveDepot(ctx, req, points)
+	slog.Info("routing plan depot resolved",
+		"date", req.Date, "depot_source", depotSource, "depot_lat", depotLat, "depot_lng", depotLng,
+		"note", depotNote)
 
 	// Pull the live fleet and bin-pack stops across trucks by capacity (CVRP).
 	vehicles, err := s.vehicles.ListVehicles(ctx)
@@ -137,6 +163,55 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		return nil, err
 	}
 	return plan, nil
+}
+
+// resolveDepot roots this plan through the shared ladder in internal/depot:
+// REQUEST -> BRANCH -> CONFIG -> CENTROID -> NONE. It is the same ladder the
+// workflow ingest uses, deliberately: this endpoint used to run its own shorter
+// one (request depot, else the centroid of the stops) and so ignored the
+// branch id its caller had explicitly handed it — it stored that branch on the
+// plan and then rooted the route somewhere else.
+//
+// The branch list is only fetched when it can actually change the answer: an
+// explicit request depot outranks it, and a request naming no branch has
+// nothing to look up. The fetch is best effort — a GableLBM that predates
+// /api/integration/locations answers 404, and that must cost this plan its
+// branch origin, not the plan itself.
+//
+// The result is not persisted: route_plans is a column-backed table and adding
+// a depot_source column is a migration. The caller logs it instead, once per
+// plan, so support can still answer "why does this route start there?".
+func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, stops []depot.Point) (lat, lng float64, source, note string) {
+	var wanted []string
+	if req.BranchID != nil && *req.BranchID != "" {
+		wanted = []string{*req.BranchID}
+	}
+
+	var branches []gable.Location
+	var branchesErr error
+	if len(wanted) > 0 && (req.DepotLat == nil || req.DepotLng == nil) {
+		if branches, branchesErr = s.locations.ListLocations(ctx); branchesErr != nil {
+			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
+				"date", req.Date, "branch_id", *req.BranchID, "err", branchesErr)
+			branches = nil
+		}
+	}
+
+	lat, lng, source, note = depot.Resolve(depot.Input{
+		RequestLat: req.DepotLat,
+		RequestLng: req.DepotLng,
+		BranchIDs:  wanted,
+		Branches:   branches,
+		ConfigLat:  s.cfg.DepotLat,
+		ConfigLng:  s.cfg.DepotLng,
+		Stops:      stops,
+	})
+	if branchesErr != nil {
+		// The request DID name a yard; we simply could not look it up. Say
+		// that, rather than letting the note claim the branch was unknown.
+		note = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(source))
+	}
+	return lat, lng, source, note
 }
 
 // Get returns a stored plan by id.
