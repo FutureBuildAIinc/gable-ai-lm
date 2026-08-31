@@ -25,6 +25,14 @@ func (s *Service) GetProfile(ctx context.Context, gableVehicleID string) (*Profi
 }
 
 // UpsertProfile creates or replaces a vehicle profile.
+//
+// Validation lives here rather than in the handler so every caller is covered:
+// the endpoint is a whole-profile replace, and an unrated axle or a zero GVWR
+// stored through any path degrades the solver's verdict on a truck the operator
+// believes is configured.
 func (s *Service) UpsertProfile(ctx context.Context, gableVehicleID string, in ProfileInput) (*Profile, error) {
+	if err := in.Validate(); err != nil {
+		return nil, err
+	}
 	return s.repo.Upsert(ctx, gableVehicleID, in)
 }

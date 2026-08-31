@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LicenseRef-OpenLBM-Docs-1.0
 # SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
 name: check-my-contribution
-description: Run the pre-flight before opening a pull request against Gable AI_LM — whatever gates the repo defines, plus SPDX headers, reuse lint, no committed secrets or binaries, and that the PR targets staging. Use when the user says "check my work", "am I ready to open a PR", "run the pre-flight", "will CI pass", "did I break anything", "review my changes before I push", "/preflight", or is about to commit or push.
+description: Run the pre-flight before opening a pull request against Gable AI_LM — whatever gates the repo defines, plus SPDX headers, reuse lint, no committed secrets or binaries, and that the PR targets main. Use when the user says "check my work", "am I ready to open a PR", "run the pre-flight", "will CI pass", "did I break anything", "review my changes before I push", "/preflight", or is about to commit or push.
 ---
 
 # check-my-contribution — the pre-flight, run for real
@@ -32,7 +32,7 @@ runs — that's the only way "will CI pass?" gets an honest answer.
 ```bash
 git rev-parse --abbrev-ref HEAD
 git status --short
-git diff --stat origin/staging...HEAD 2>/dev/null || git diff --stat
+git diff --stat origin/main...HEAD 2>/dev/null || git diff --stat
 ```
 
 ## 2 · Run the gates
@@ -83,7 +83,7 @@ Check every file you added:
 <!-- REUSE-IgnoreStart -->
 
 ```bash
-for f in $(git diff --name-only --diff-filter=A origin/staging...HEAD 2>/dev/null || git diff --name-only --diff-filter=A); do
+for f in $(git diff --name-only --diff-filter=A origin/main...HEAD 2>/dev/null || git diff --name-only --diff-filter=A); do
   case "$f" in *.license) continue ;; esac
   printf '%-56s %s\n' "$f" "$(grep -m1 -o 'SPDX-License-Identifier: .*' "$f" 2>/dev/null || echo 'MISSING')"
 done
@@ -104,15 +104,15 @@ Unsure which identifier applies? Use the **`licensing-check`** skill.
 git diff --cached --name-only | while read -r f; do
   [ -f "$f" ] && file "$f" | grep -q "executable\|ELF\|Mach-O" && echo "BINARY: $f"
 done
-git diff --name-only origin/staging...HEAD 2>/dev/null | while read -r f; do
+git diff --name-only origin/main...HEAD 2>/dev/null | while read -r f; do
   [ -f "$f" ] && du -h "$f"; done | sort -rh | head
 
 # Key-shaped strings
-git diff origin/staging...HEAD 2>/dev/null | \
+git diff origin/main...HEAD 2>/dev/null | \
   grep -nE 'sk-or-v1-|dop_v1_|ghp_|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 
 # .env files
-git diff --name-only origin/staging...HEAD 2>/dev/null | grep -E '(^|/)\.env(\.|$)'
+git diff --name-only origin/main...HEAD 2>/dev/null | grep -E '(^|/)\.env(\.|$)'
 ```
 
 If a secret shows up, **do not just delete the line and commit again** — it stays in history.
@@ -138,9 +138,9 @@ the `gable` repo's `CLAUDE.md`:
 
 ## 6 · The PR
 
-- **Targets `staging`**, not `master`. Maintainers fast-forward `staging → master` after review.
+- **Targets `main`.** `main` is the only branch (see CONTRIBUTING.md).
   ```bash
-  gh pr create --base staging --fill
+  gh pr create --base main --fill
   ```
 - **Fill in the PR template honestly** if one exists (`ls .github/PULL_REQUEST_TEMPLATE.md`).
   Only tick a box you actually ran.
@@ -160,7 +160,7 @@ go test -race ./...     FAIL — see below
 reuse lint              SKIPPED — reuse not installed
 SPDX headers            PASS
 secrets / binaries      clean
-PR target               staging
+PR target               main
 ```
 
 Then, for each failure: the exact command, the exact error, and the smallest fix.

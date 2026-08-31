@@ -5,11 +5,12 @@ SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
 
 # Contributing to Gable AI_LM with Claude Code
 
-> ## Read this first: there is no code here yet
+> ## Read this first
 >
-> This repository is an **empty scaffold**. Apart from the `.claude/` kit and `LICENSES/`, it
-> contains nothing. The AI_LM project still lives in the older `futurebuildai` organisation and
-> is **awaiting migration** here. **That is where the behaviour actually is today.**
+> This repository holds the AI_LM service: a Go backend under `backend/`, a Lit 3 frontend
+> under `app/`, and its own Postgres schema. The migration out of the older `futurebuildai`
+> organisation is **complete** — this is where the behaviour is. A stale copy may still exist
+> elsewhere on a contributor's disk; it is not authoritative.
 >
 > The Claude Code kit is installed *ahead* of the migration on purpose, so the conventions
 > arrive with the first commit rather than being retrofitted afterwards. Nothing below is
@@ -159,9 +160,9 @@ file where the behaviour actually lives rather than opening an issue nobody can 
 These apply whether or not you used AI — and they apply from the first commit, which is the point
 of installing the kit early.
 
-**1 · Pull requests target `staging`, never `master`.**
-Maintainers fast-forward `staging → master` after review. If your clone doesn't have `staging`
-yet, branch from the default branch and still open the PR **against `staging`**.
+**1 · Pull requests target `main`.**
+`main` is the only branch today — see `CONTRIBUTING.md`. Branch as `<line>/<slug>` and open the
+PR against `main`.
 
 **2 · Never commit a secret.**
 This one is sharper here than elsewhere, because this product line is the one with API keys in

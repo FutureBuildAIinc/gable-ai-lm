@@ -16,6 +16,31 @@ interface ErrorEnvelope {
   meta?: { request_id: string };
 }
 
+/**
+ * An HTTP failure that kept its status code.
+ *
+ * Callers used to recover by matching the message text (see PlanWorkflow's
+ * lock prompt, which greps for /lock|manual approval/i). That works until
+ * someone rewords a server message. The status is the contract, so carry it:
+ * `err.status === 409` is a fact, `/modified concurrently/` is a guess.
+ *
+ * It extends Error and keeps `message` identical, so every existing `catch`
+ * and message check behaves exactly as before.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+/** True when a write lost an optimistic-lock race and the plan must be reloaded. */
+export function isConflict(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409;
+}
+
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -25,7 +50,7 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
     } catch {
       /* non-JSON body */
     }
-    throw new Error(msg);
+    throw new ApiError(res.status, msg);
   }
   return (await res.json()) as T;
 }

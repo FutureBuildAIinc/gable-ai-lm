@@ -33,6 +33,7 @@ import {
 import {
   aiLmService,
   isBlockingUnplaced,
+  isConflict,
   unplacedLabel,
   type AxleLoad,
   type WorkflowPlan,
@@ -189,6 +190,10 @@ export class PlanWorkflow extends LitElement {
 
   // T2-3 — pending override prompt when a reshuffle hits a locked run.
   @state() private _override: { message: string; run: () => Promise<void> } | null = null;
+  // Set when a write lost the optimistic-lock race (HTTP 409). The plan on
+  // screen is stale, so the only safe recovery is reload — never a blind retry,
+  // which would re-apply this dispatcher's intent on top of someone else's.
+  @state() private _conflict: string | null = null;
 
   // T2-2 — inline dimension-override editor target + form.
   @state() private _dimEdit: { orderId: string; productId: string; sku: string } | null = null;
@@ -236,11 +241,16 @@ export class PlanWorkflow extends LitElement {
     this._busy = label;
     this._error = '';
     this._notice = '';
+    this._conflict = null;
     try {
       const v = await fn();
       after?.(v);
     } catch (err) {
-      this._error = err instanceof Error ? err.message : String(err);
+      if (isConflict(err)) {
+        this._conflict = err instanceof Error ? err.message : String(err);
+      } else {
+        this._error = err instanceof Error ? err.message : String(err);
+      }
     } finally {
       this._busy = '';
     }
@@ -262,6 +272,7 @@ export class PlanWorkflow extends LitElement {
     this._stepSlider = -1;
     this._stopPlayback();
     this._override = null;
+    this._conflict = null;
     // The plan changed — the prior briefing is stale; let the user regenerate.
     this._briefing = null;
   }
@@ -283,11 +294,16 @@ export class PlanWorkflow extends LitElement {
     this._error = '';
     this._notice = '';
     this._override = null;
+    this._conflict = null;
     try {
       this._setPlan(await fn(false, ''), this._step);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/lock|manual approval/i.test(msg)) {
+      if (isConflict(err)) {
+        // Stale plan — offer reload, not the override prompt. Overriding here
+        // would authorize a reshuffle against a plan that no longer exists.
+        this._conflict = msg;
+      } else if (/lock|manual approval/i.test(msg)) {
         this._override = {
           message: msg,
           run: async () => {
@@ -541,6 +557,25 @@ export class PlanWorkflow extends LitElement {
         ${this._plan ? this._renderLockBar() : nothing}
 
         ${this._plan && this._plan.loads.length > 0 ? this._renderBriefing() : nothing}
+
+        ${this._conflict
+          ? html`<div class="px-4 py-3 rounded-lg border border-amber-warn/40 bg-amber-warn/10 text-amber-warn text-sm flex flex-wrap items-center gap-3">
+              ${icon(AlertTriangle, 16)}
+              <span class="flex-1 min-w-[12rem]">
+                Someone else changed this plan while you were working. Your change was not applied.
+                Reload to see theirs, then redo yours.
+              </span>
+              <button
+                @click=${async () => { this._conflict = null; await this._loadLatest(); }}
+                ?disabled=${this._busy !== ''}
+                class="flex items-center gap-1.5 bg-amber-warn text-deep-space font-semibold px-3 py-1.5 rounded-lg disabled:opacity-50"
+              >${icon(RefreshCw, 14)} Reload plan</button>
+              <button
+                @click=${() => { this._conflict = null; }}
+                class="text-zinc-400 hover:text-white"
+              >${icon(X, 16)}</button>
+            </div>`
+          : nothing}
 
         ${this._override
           ? html`<div class="px-4 py-3 rounded-lg border border-amber-warn/40 bg-amber-warn/10 text-amber-warn text-sm flex flex-wrap items-center gap-3">

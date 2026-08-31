@@ -189,7 +189,8 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
 - Weights/dimensions: `BIGINT` lb and integer inches where exact; lat/lng `DOUBLE PRECISION`.
 - Migrations in `backend/migrations/` as numbered SQL with a sibling `_NNN_*_down.sql`
   rollback. The migrator (`cmd/migrate`) skips `*_down.sql`. Current set:
-  `001_ai_lm_core`, `002_route_plan_loads`, `003_workflow_plans`.
+  `001_ai_lm_core`, `002_route_plan_loads`, `003_workflow_plans`,
+  `004_workflow_plans_version` (optimistic-lock `version` column).
 
 ### Backend Code
 - Config: env vars with `godotenv` fallback (`internal/config/config.go`). Default DB URL
@@ -236,7 +237,7 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
 go run ./cmd/server                # run API (port 8090, needs DB on :5434)
 go run ./cmd/migrate               # apply SQL migrations
 go run ./cmd/seed                  # seed demo fleet profiles + restricted points
-go build ./... && go vet ./... && go test ./...
+go build ./... && go vet ./... && go test -race ./...   # CI uses -race; make test does not
 make run | migrate | seed | build | vet | test | tidy
 ```
 
@@ -286,7 +287,8 @@ A different ERP can satisfy this contract to reuse AI_LM unchanged.
 
 ## Pre-Flight Checks (before declaring work done)
 - `cd app && npx tsc --noEmit` (or `npm run build`)
-- `cd backend && go build ./... && go vet ./... && go test ./...`
+- `cd backend && go build ./... && go vet ./... && go test -race ./...`
+  (CI runs `-race`; `make test` omits it, so a race lands in CI, not locally)
 - New DB columns: UUID PKs, `DECIMAL(19,4)` for quantities, money-as-cents.
 - UI uses design-system tokens (no hardcoded colors), JetBrains Mono for numbers.
 - New endpoints under `/api/v1` and wired into a `RegisterRoutes` call in
@@ -295,6 +297,17 @@ A different ERP can satisfy this contract to reuse AI_LM unchanged.
 ## Roadmap & Recommended Next Work
 
 ### Recently completed (do not re-recommend)
+- **Stackability enforced in the placement solver** — a non-stackable article is capped
+  at a single layer (`load/sequenced.go`, `if !it.Stackable { maxLayers = 1 }`) and the
+  load-level seal emits a typed `ReasonNotStackable` unplaced entry rather than piling a
+  tier on top of it. `TieredSolver` is now the single placement engine, so
+  `/api/v1/load/optimize` and the workflow share one core.
+- **Concurrency control on plan writes** — migration `004` adds a `version` column and
+  `workflow.Repository` does a compare-and-set update; a lost race returns
+  `ErrVersionConflict` → HTTP 409. Regression tests run under `-race`.
+- **Configurable depot** — `workflow.resolveDepot` resolves request → `DEPOT_LAT/LNG`
+  config → stop centroid, records the source on the plan, and a regression test names
+  the retired hardcoded coordinates so they can never come back.
 - **PIM-canonical geometry resolver** — `EffectiveProduct` + `resolveGeometry`
   (OVERRIDE → PIM → FALLBACK), `GET /api/v1/catalog/products`, `gable.Client` carrying PIM
   dims, and the Load Builder loading real products as scaled digital twins (commit
@@ -322,9 +335,8 @@ A different ERP can satisfy this contract to reuse AI_LM unchanged.
    delivery, not a manual basket.
 4. **Real distance-matrix routing provider.** Swap the nearest-neighbor + 2-opt heuristic
    behind `routing` for a Maps/OSRM matrix; the interface seam already exists.
-5. **Stackability + orientation in the solver.** `stackable` is carried end-to-end but the
-   placement solver does not yet forbid stacking on non-stackable items (e.g. the 6×6 PT
-   post) or constrain long-piece orientation.
+5. **Orientation constraints in the solver.** Stackability is enforced (see completed
+   above); constraining long-piece orientation is still open.
 
 ### Out of Scope (future phases)
 - Mesh/GLTF product assets (parametric boxes only; `geometry_source` reserves the seam).
