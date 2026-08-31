@@ -170,6 +170,23 @@ type fakeGable struct {
 
 	pushed  []gable.DeliveryRoute
 	pushErr error
+
+	// pushErrAfter, when > 0, lets the Nth push and every one before it
+	// succeed and fails the rest — the mid-loop failure a partial push is.
+	pushErrAfter int
+
+	// recalled records every route withdrawal, in order, so a test can assert
+	// that an override recalled EXACTLY the trucks the re-assignment dropped
+	// and no others. Recalling a surviving truck would cancel a good route,
+	// which is the regression this record exists to catch.
+	recalled []gable.RouteRecall
+	// recallErr fails every recall (a GableLBM that cannot be reached);
+	// recallDispatched fails them with the terminal 409 instead.
+	recallErr        error
+	recallDispatched bool
+	// recallMissing marks the recall as having found nothing on the board —
+	// the idempotent no-op, which is a success.
+	recallMissing bool
 }
 
 func (f *fakeGable) ListOrdersForDate(context.Context, string) ([]gable.Order, error) {
@@ -185,11 +202,59 @@ func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
 }
 func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { return f.drivers, nil }
 func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
+	if f.pushErrAfter > 0 && len(f.pushed) >= f.pushErrAfter {
+		return fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
+	}
 	if f.pushErr != nil {
 		return f.pushErr
 	}
 	f.pushed = append(f.pushed, r)
 	return nil
+}
+
+func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall) (*gable.RouteRecallResult, error) {
+	if f.recallDispatched {
+		return nil, fmt.Errorf("%w (truck %s on %s)", gable.ErrRouteDispatched, rc.VehicleID, rc.ScheduledDate)
+	}
+	if f.recallErr != nil {
+		return nil, f.recallErr
+	}
+	f.recalled = append(f.recalled, rc)
+	if f.recallMissing {
+		return &gable.RouteRecallResult{Recalled: false}, nil
+	}
+	// Drop the recalled route from the board the fake is standing in for, so
+	// "what is live upstream" stays honest across a push/recall/push cycle.
+	kept := f.pushed[:0]
+	for _, r := range f.pushed {
+		if r.VehicleID != rc.VehicleID || r.ScheduledDate != rc.ScheduledDate {
+			kept = append(kept, r)
+		}
+	}
+	stops := 0
+	if n := len(f.pushed) - len(kept); n > 0 {
+		stops = 1
+	}
+	f.pushed = kept
+	return &gable.RouteRecallResult{Recalled: stops > 0, RouteID: "route-" + rc.VehicleID, StopCount: stops}, nil
+}
+
+// recalledIDs lists the vehicles recalled, in call order.
+func (f *fakeGable) recalledIDs() []string {
+	out := make([]string, 0, len(f.recalled))
+	for _, r := range f.recalled {
+		out = append(out, r.VehicleID)
+	}
+	return out
+}
+
+// pushedIDs lists the vehicles currently live on the fake dispatch board.
+func (f *fakeGable) pushedIDs() []string {
+	out := make([]string, 0, len(f.pushed))
+	for _, r := range f.pushed {
+		out = append(out, r.VehicleID)
+	}
+	return out
 }
 
 // fakeCatalog resolves products to effective geometry.

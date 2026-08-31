@@ -5,6 +5,9 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -95,6 +98,10 @@ type gableSource interface {
 	ListLocations(ctx context.Context) ([]gable.Location, error)
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
 	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
+	// RecallDeliveryRoute withdraws a route this plan previously pushed. It is
+	// the inverse the dispatch board lacked, and without it a re-assignment
+	// could only ever orphan the trucks it dropped.
+	RecallDeliveryRoute(ctx context.Context, recall gable.RouteRecall) (*gable.RouteRecallResult, error)
 }
 
 // catalogSource resolves products to effective geometry (satisfied by *catalog.Service).
@@ -422,9 +429,15 @@ func (s *Service) Assign(ctx context.Context, id string, override bool, approved
 	if err != nil {
 		return nil, err
 	}
-	if err := gateReshuffle(p, override, approvedBy, "re-assigning trucks"); err != nil {
+	if err := gateReshuffle(p, override, approvedBy, planTransitions[actionAssign].gerund); err != nil {
 		return nil, err
 	}
+	// Re-assignment on a plan whose routes are live needs an approver, because
+	// it is about to decide which trucks stop existing.
+	if err := gateTransition(p, actionAssign, override, approvedBy); err != nil {
+		return nil, err
+	}
+	priorLive := liveRoutes(p)
 
 	byOrder := orderIndex(p)
 	var rstops []routing.Stop
@@ -488,20 +501,120 @@ func (s *Service) Assign(ctx context.Context, id string, override bool, approved
 		p.UnassignedOrders = append(p.UnassignedOrders, toWorkflowStop(st, byOrder))
 	}
 
-	p.Status = StatusAssigned
+	// The new assignment is now known, so the trucks it DROPPED can be named —
+	// and only now. Recall their routes before the plan is rewritten: after
+	// this function returns, nothing in the system would remember they were
+	// ever live.
+	//
+	// A recall failure aborts the whole re-assignment and persists nothing. The
+	// stored plan still lists every route as live, so the next attempt recalls
+	// them all again — which is safe because recall is idempotent upstream, and
+	// is the direction to fail in. Over-reporting what is live costs a
+	// redundant call; under-reporting leaves a truck loading for a run that no
+	// longer exists.
+	if err := s.recallDroppedRoutes(ctx, p, priorLive, approvedBy, planTransitions[actionAssign].gerund); err != nil {
+		return nil, err
+	}
+
+	p.Status = planTransitions[actionAssign].to
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
+// recallDroppedRoutes withdraws, from GableLBM's dispatch board, every route in
+// priorLive whose truck is no longer in p.Loads, and tombstones it on the plan.
+//
+// It is called AFTER the new assignment is built (the drops cannot be named
+// before) and BEFORE the plan is persisted (so a failure leaves the stored plan
+// exactly as it was). It returns on the first failure without writing: a
+// half-recalled board that the plan has half-forgotten is worse than a stale
+// one it still remembers in full.
+//
+// Trucks that SURVIVE the re-assignment are deliberately not recalled. Their
+// routes are stale, not orphaned, and the push upstream is create-or-replace,
+// so the next push corrects them. Recalling one would cancel a good route.
+func (s *Service) recallDroppedRoutes(ctx context.Context, p *Plan, priorLive []LiveRoute, approvedBy, action string) error {
+	if len(priorLive) == 0 {
+		return nil
+	}
+	kept := make(map[string]bool, len(p.Loads))
+	for _, l := range p.Loads {
+		kept[l.VehicleID] = true
+	}
+
+	now := time.Now()
+	note := fmt.Sprintf("dropped by %s", action)
+	for _, r := range priorLive {
+		if kept[r.VehicleID] {
+			continue
+		}
+		res, err := s.gable.RecallDeliveryRoute(ctx, gable.RouteRecall{
+			VehicleID:     r.VehicleID,
+			ScheduledDate: p.PlanDate,
+			Reason:        note,
+			RecalledBy:    approvedBy,
+		})
+		if err != nil {
+			slog.Error("could not recall an orphaned route from GableLBM",
+				"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName, "vehicle_id", r.VehicleID, "error", err)
+			if errors.Is(err, gable.ErrRouteDispatched) {
+				return refusedf("truck %s has already left the yard on this run — its route cannot be recalled, so this plan cannot be re-assigned without it; call the driver first", nameOrID(r))
+			}
+			return fmt.Errorf("recall route from GableLBM (truck %s): %w", nameOrID(r), err)
+		}
+		slog.Info("recalled an orphaned route from the dispatch board",
+			"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName,
+			"was_live", res.Recalled, "stops", res.StopCount, "approved_by", approvedBy)
+
+		for i := range p.LiveRoutes {
+			if p.LiveRoutes[i].VehicleID != r.VehicleID || !p.LiveRoutes[i].Live() {
+				continue
+			}
+			t := now
+			p.LiveRoutes[i].RecalledAt = &t
+			p.LiveRoutes[i].RecalledBy = approvedBy
+			p.LiveRoutes[i].RecallNote = note
+		}
+	}
+	return nil
+}
+
+// nameOrID renders a live route for an operator, preferring the truck name.
+func nameOrID(r LiveRoute) string {
+	if r.VehicleName != "" {
+		return r.VehicleName
+	}
+	return r.VehicleID
+}
+
 // --- Step 4: pack every truck (LIFO bundles) ---------------------------------
 
 // Pack 3D-packs every assigned truck: stops load in reverse route order so the
 // first delivery is the last material on (rear of bed, first off).
-func (s *Service) Pack(ctx context.Context, id string) (*Plan, error) {
+//
+// On a locked run, or on one whose routes are already live on the dispatch
+// board, it refuses unless override (manual approval) is supplied. It recalls
+// nothing: re-packing changes what is ON each truck, never which trucks exist,
+// so no route is orphaned. The routes upstream simply become stale manifests,
+// and the next push replaces them — the per-load digest guarantees it, because
+// a re-pack changes the manifest and therefore the digest.
+func (s *Service) Pack(ctx context.Context, id string, override bool, approvedBy string) (*Plan, error) {
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	// NOTE the asymmetry with Assign and Resequence: Pack does NOT consult
+	// gateReshuffle. The T2-3 lock freezes a run against re-OPTIMIZATION, and
+	// packing is not that — it is the next step of the run the lock froze.
+	// A morning run locks at its 06:00 cutoff and the yard still has to pack
+	// it; requiring an approver for that would gate the normal path.
+	//
+	// The live-routes gate below is a different question and does apply: a
+	// re-pack of a plan already on the dispatch board supersedes the manifests
+	// the yard is working from.
+	if err := gateTransition(p, actionPack, override, approvedBy); err != nil {
 		return nil, err
 	}
 	if len(p.Loads) == 0 {
@@ -523,7 +636,7 @@ func (s *Service) Pack(ctx context.Context, id string) (*Plan, error) {
 		}
 	}
 
-	p.Status = StatusPacked
+	p.Status = planTransitions[actionPack].to
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
@@ -638,7 +751,10 @@ func (s *Service) Resequence(ctx context.Context, id, vehicleID string, orderIDs
 	if err != nil {
 		return nil, err
 	}
-	if err := gateReshuffle(p, override, approvedBy, "re-sequencing a route"); err != nil {
+	if err := gateReshuffle(p, override, approvedBy, planTransitions[actionResequence].gerund); err != nil {
+		return nil, err
+	}
+	if err := gateTransition(p, actionResequence, override, approvedBy); err != nil {
 		return nil, err
 	}
 
@@ -686,9 +802,7 @@ func (s *Service) Resequence(ctx context.Context, id, vehicleID string, orderIDs
 	}
 
 	// A manual resequence invalidates any later-stage artifacts.
-	if p.Status == StatusReviewed || p.Status == StatusPushed {
-		p.Status = StatusPacked
-	}
+	walkBackAfterReshuffle(p)
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
@@ -842,6 +956,13 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Legal from REVIEWED only. Note that this is NOT what stops a resume: a
+	// push that died part-way deliberately left the status at REVIEWED, so
+	// re-running it lands here as an ordinary push and skips the trucks that
+	// already landed.
+	if err := gateTransition(p, actionPush, false, ""); err != nil {
+		return nil, err
+	}
 	if len(p.Loads) == 0 {
 		return nil, refusedf("nothing to push — no truck loads")
 	}
@@ -889,24 +1010,44 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		return nil, refusedf("yard proof + sign-off required before depart on: %s", strings.Join(unsigned, ", "))
 	}
 
-	for _, l := range p.Loads {
-		route := gable.DeliveryRoute{
-			VehicleID:     l.VehicleID,
-			DriverID:      l.DriverID,
-			ScheduledDate: p.PlanDate,
-			LoadManifest:  buildManifest(p, l),
+	// The write loop is per-truck and every truck is acknowledged on the plan
+	// as it lands. That acknowledgement is the whole difference between a push
+	// that can be resumed and one that cannot: this loop used to return on the
+	// first failure with the status untouched, so a push that died on truck 3
+	// of 5 left trucks 1 and 2 live on the dealer's board, the plan reading
+	// REVIEWED, and NO record anywhere of which routes had actually been
+	// written. Nothing was resumable and nothing was recallable.
+	now := time.Now()
+	var (
+		pushErr     error
+		failedTruck string
+		wrote       []string
+		skipped     []string
+	)
+	for i := range p.Loads {
+		l := &p.Loads[i]
+		route := deliveryRoute(p, *l)
+		digest := routeDigest(route)
+
+		// Already on the board, byte for byte. Skipping is what makes a resume
+		// cheap, and the digest — not the timestamp — is what makes it safe:
+		// any change to stops, driver or manifest since the last push produces
+		// a different digest and re-sends.
+		if l.PushedAt != nil && l.PushedDigest == digest {
+			skipped = append(skipped, l.VehicleName)
+			continue
 		}
-		for _, st := range l.Stops {
-			route.Stops = append(route.Stops, gable.RouteStop{
-				OrderID:  st.OrderID,
-				Sequence: st.Sequence,
-				Lat:      st.Lat,
-				Lng:      st.Lng,
-			})
-		}
+
 		if err := s.gable.PushDeliveryRoute(ctx, route); err != nil {
-			return nil, fmt.Errorf("write back to GableLBM (truck %s): %w", l.VehicleName, err)
+			pushErr, failedTruck = err, l.VehicleName
+			break
 		}
+
+		t := now
+		l.PushedAt = &t
+		l.PushedDigest = digest
+		markRouteLive(p, l.VehicleID, l.VehicleName, now)
+		wrote = append(wrote, l.VehicleName)
 		// Metered per route, inside the loop, because that is where the value
 		// actually occurs: a push that fails on the fourth truck still put
 		// three real routes on the dealer's dispatch board, and they do not
@@ -914,11 +1055,89 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		s.meter.RoutesPushed(1)
 	}
 
-	p.Status = StatusPushed
+	if pushErr != nil {
+		// Persist what actually landed, and do NOT advance the status: the
+		// plan's status must describe the dispatch board, and the board is
+		// only partly written. Leaving it at REVIEWED is also what makes the
+		// retry a legal, ordinary push.
+		slog.Error("push to GableLBM failed part-way through the run",
+			"plan", p.ID, "date", p.PlanDate, "failed_truck", failedTruck,
+			"written", len(wrote), "of", len(p.Loads), "error", pushErr)
+		if err := s.repo.Update(ctx, p); err != nil {
+			// Never mask the push failure with the bookkeeping failure, but do
+			// say so: this is the one path where the board and the plan really
+			// have diverged, and support needs to know it happened.
+			slog.Error("could not record a partial push — the dispatch board is ahead of the plan",
+				"plan", p.ID, "date", p.PlanDate, "written", len(wrote), "error", err)
+		}
+		return nil, refusedf("push stopped at truck %s: %d of %d truck(s) are now live on the dispatch board (%s). GableLBM was not reachable for the rest — run push again to finish the run; the trucks already written are skipped",
+			failedTruck, len(liveRoutes(p)), len(p.Loads), strings.Join(wrote, ", "))
+	}
+
+	if len(skipped) > 0 {
+		slog.Info("resumed a partial push", "plan", p.ID, "date", p.PlanDate,
+			"skipped_already_live", strings.Join(skipped, ", "), "written", len(wrote))
+	}
+
+	p.Status = planTransitions[actionPush].to
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// deliveryRoute builds the GableLBM write-back payload for one truck.
+func deliveryRoute(p *Plan, l TruckLoad) gable.DeliveryRoute {
+	route := gable.DeliveryRoute{
+		VehicleID:     l.VehicleID,
+		DriverID:      l.DriverID,
+		ScheduledDate: p.PlanDate,
+		LoadManifest:  buildManifest(p, l),
+	}
+	for _, st := range l.Stops {
+		route.Stops = append(route.Stops, gable.RouteStop{
+			OrderID:  st.OrderID,
+			Sequence: st.Sequence,
+			Lat:      st.Lat,
+			Lng:      st.Lng,
+		})
+	}
+	return route
+}
+
+// routeDigest fingerprints exactly what would be written upstream for one
+// truck, so a resumed push can tell "already sent, unchanged" from "sent, but
+// the plan has moved on since".
+//
+// It hashes the marshalled payload rather than a hand-picked set of fields
+// because the risk it guards is precisely the field somebody forgets to add:
+// encoding/json sorts map keys, so the manifest hashes stably too.
+func routeDigest(route gable.DeliveryRoute) string {
+	raw, err := json.Marshal(route)
+	if err != nil {
+		// Unreachable for this payload, and a digest that cannot be computed
+		// must never read as "matches" — an empty digest never equals a stored
+		// one, so the route is re-pushed.
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// markRouteLive records that a truck's route is now on the dispatch board,
+// reviving a previously recalled entry for the same truck rather than
+// accumulating duplicates.
+func markRouteLive(p *Plan, vehicleID, vehicleName string, at time.Time) {
+	for i := range p.LiveRoutes {
+		if p.LiveRoutes[i].VehicleID == vehicleID && p.LiveRoutes[i].Live() {
+			p.LiveRoutes[i].PushedAt = at
+			p.LiveRoutes[i].VehicleName = vehicleName
+			return
+		}
+	}
+	p.LiveRoutes = append(p.LiveRoutes, LiveRoute{
+		VehicleID: vehicleID, VehicleName: vehicleName, PushedAt: at,
+	})
 }
 
 // buildManifest assembles the yard-facing packing manifest for one truck. It is
@@ -1087,7 +1306,10 @@ func (s *Service) SetPriority(ctx context.Context, id, orderID string, priority 
 	if err != nil {
 		return nil, err
 	}
-	if err := gateReshuffle(p, override, approvedBy, "changing delivery priority"); err != nil {
+	if err := gateReshuffle(p, override, approvedBy, planTransitions[actionPriority].gerund); err != nil {
+		return nil, err
+	}
+	if err := gateTransition(p, actionPriority, override, approvedBy); err != nil {
 		return nil, err
 	}
 
@@ -1148,9 +1370,7 @@ func (s *Service) SetPriority(ctx context.Context, id, orderID string, priority 
 				return nil, err
 			}
 		}
-		if p.Status == StatusReviewed || p.Status == StatusPushed {
-			p.Status = StatusPacked
-		}
+		walkBackAfterReshuffle(p)
 	}
 
 	if err := s.repo.Update(ctx, p); err != nil {
@@ -1173,6 +1393,16 @@ func (s *Service) SetLineDimensions(ctx context.Context, id, orderID string, req
 
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	// A dimension override re-packs the truck carrying the order, so it is a
+	// reshuffle like any other and answers to both gates. It previously had
+	// neither: it was the one mutation that could silently re-pack a locked,
+	// pushed run.
+	if err := gateReshuffle(p, req.Override, req.ApprovedBy, planTransitions[actionDimensions].gerund); err != nil {
+		return nil, err
+	}
+	if err := gateTransition(p, actionDimensions, req.Override, req.ApprovedBy); err != nil {
 		return nil, err
 	}
 
@@ -1262,9 +1492,7 @@ func (s *Service) repackOrderTruck(ctx context.Context, p *Plan, orderID string)
 	if err := s.packLoad(ctx, p, target, vehiclesByID, 0); err != nil {
 		return err
 	}
-	if p.Status == StatusReviewed || p.Status == StatusPushed {
-		p.Status = StatusPacked
-	}
+	walkBackAfterReshuffle(p)
 	return nil
 }
 

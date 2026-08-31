@@ -6,6 +6,7 @@ package gable
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -374,5 +375,137 @@ func TestContextCancellationIsReportedAsAFailure(t *testing.T) {
 	cancel()
 	if _, err := NewClient(srv.URL, "k").ListVehicles(ctx); err == nil {
 		t.Fatal("a cancelled context must surface as an error, not an empty fleet")
+	}
+}
+
+// TestRecallDeliveryRouteSendsTheContractedShape pins the request AI_LM makes
+// against GableLBM's recall endpoint: the path, the integration key, and the
+// (vehicle_id, scheduled_date) key plus its optional provenance. The pair is
+// the key on purpose — see RouteRecall on why a stored route id is not.
+func TestRecallDeliveryRouteSendsTheContractedShape(t *testing.T) {
+	var gotPath, gotMethod, gotKey string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod, gotKey = r.URL.Path, r.Method, r.Header.Get("X-Integration-Key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = io.WriteString(w, `{"recalled":true,"route_id":"r-9","stop_count":3,"reason":"dropped by re-assignment"}`)
+	}))
+	defer srv.Close()
+
+	res, err := NewClient(srv.URL, "k").RecallDeliveryRoute(context.Background(), RouteRecall{
+		VehicleID:     "v1",
+		ScheduledDate: "2026-06-26",
+		Reason:        "dropped by re-assignment",
+		RecalledBy:    "dispatcher@dealer.com",
+	})
+	if err != nil {
+		t.Fatalf("RecallDeliveryRoute: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/integration/delivery-routes/recall" {
+		t.Errorf("called %s %s, want POST /api/integration/delivery-routes/recall", gotMethod, gotPath)
+	}
+	if gotKey != "k" {
+		t.Errorf("integration key = %q, want %q", gotKey, "k")
+	}
+	for field, want := range map[string]any{
+		"vehicle_id":     "v1",
+		"scheduled_date": "2026-06-26",
+		"reason":         "dropped by re-assignment",
+		"recalled_by":    "dispatcher@dealer.com",
+	} {
+		if gotBody[field] != want {
+			t.Errorf("body[%q] = %v, want %v", field, gotBody[field], want)
+		}
+	}
+	if !res.Recalled || res.RouteID != "r-9" || res.StopCount != 3 {
+		t.Errorf("result = %+v, want the upstream acknowledgement decoded", res)
+	}
+}
+
+// TestRecallingNothingIsSuccess pins the convergence contract. Recall exists to
+// clean up after a partial push, so it is retried; if "there was nothing on the
+// board" read as a failure, the caller could never tell converged from broken
+// and would refuse to advance a plan that was already correct.
+func TestRecallingNothingIsSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"recalled":false}`)
+	}))
+	defer srv.Close()
+
+	res, err := NewClient(srv.URL, "k").RecallDeliveryRoute(context.Background(),
+		RouteRecall{VehicleID: "v1", ScheduledDate: "2026-06-26"})
+	if err != nil {
+		t.Fatalf("an empty board must not read as a failed recall: %v", err)
+	}
+	if res.Recalled {
+		t.Error("recalled = true, want false when there was nothing to withdraw")
+	}
+}
+
+// TestRecallOfADispatchedRouteIsTerminal pins that a truck already on the road
+// is reported as its own sentinel. Retrying it forever would be wrong: the
+// answer is a phone call, not a loop.
+func TestRecallOfADispatchedRouteIsTerminal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"route already dispatched; cannot recall"}`)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, "k").RecallDeliveryRoute(context.Background(),
+		RouteRecall{VehicleID: "v1", ScheduledDate: "2026-06-26"})
+	if !errors.Is(err, ErrRouteDispatched) {
+		t.Fatalf("a 409 must surface as ErrRouteDispatched, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "v1") {
+		t.Errorf("error %q should name the truck that cannot be recalled", err)
+	}
+}
+
+// TestRecallFailureIsNotSilentlySuccessful pins the fail-closed direction: a
+// 500 upstream must not read as "the board is clear". The workflow refuses to
+// rewrite a plan when a recall fails, so this error is what stops a truck's
+// route being abandoned live on the dealer's board.
+func TestRecallFailureIsNotSilentlySuccessful(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"failed to recall delivery route"}`)
+	}))
+	defer srv.Close()
+
+	res, err := NewClient(srv.URL, "k").RecallDeliveryRoute(context.Background(),
+		RouteRecall{VehicleID: "v1", ScheduledDate: "2026-06-26"})
+	if err == nil {
+		t.Fatal("a 500 must not read as a successful recall")
+	}
+	if res != nil {
+		t.Error("a failed recall must not return a result a caller could act on")
+	}
+	if errors.Is(err, ErrRouteDispatched) {
+		t.Error("a 500 is retryable and must not be reported as the terminal 409 case")
+	}
+}
+
+// TestAPIErrorCarriesTheStatusCodeMachinesNeed pins that the upstream status is
+// reachable programmatically, not only inside the message. RecallDeliveryRoute's
+// 409 branch depends on it, and before APIError existed there was no way to
+// write that branch except by matching English.
+func TestAPIErrorCarriesTheStatusCodeMachinesNeed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"nope"}`)
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
+	var target *APIError
+	if !errors.As(err, &target) {
+		t.Fatalf("upstream failure %v should be an *APIError", err)
+	}
+	if target.Status != http.StatusNotFound {
+		t.Errorf("Status = %d, want 404", target.Status)
+	}
+	if target.Method != http.MethodPost || target.Path != "/api/integration/delivery-routes" {
+		t.Errorf("APIError should name the call: %+v", target)
 	}
 }

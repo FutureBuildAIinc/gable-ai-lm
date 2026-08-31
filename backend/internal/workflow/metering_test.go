@@ -104,7 +104,7 @@ func TestPackMetersTrucksThatWerePacked(t *testing.T) {
 		svc := newTestService(newFakePlanStore(planWithPackedLoad()),
 			&fakeGable{vehicles: testVehicles()}, Config{}).WithMeter(probe.m)
 
-		if _, err := svc.Pack(context.Background(), "plan-1"); err != nil {
+		if _, err := svc.Pack(context.Background(), "plan-1", false, ""); err != nil {
 			t.Fatalf("pack: %v", err)
 		}
 		if got := probe.trucks(t); got != 1 {
@@ -117,7 +117,7 @@ func TestPackMetersTrucksThatWerePacked(t *testing.T) {
 		store := errPlanStore{inner: newFakePlanStore(planWithPackedLoad()), err: errors.New("update failed")}
 		svc := newTestService(store, &fakeGable{vehicles: testVehicles()}, Config{}).WithMeter(probe.m)
 
-		if _, err := svc.Pack(context.Background(), "plan-1"); err == nil {
+		if _, err := svc.Pack(context.Background(), "plan-1", false, ""); err == nil {
 			t.Fatal("expected the pack to fail")
 		}
 		if got := probe.trucks(t); got != 0 {
@@ -131,7 +131,7 @@ func TestPackMetersTrucksThatWerePacked(t *testing.T) {
 		unassigned.Loads = nil
 		svc := newTestService(newFakePlanStore(unassigned), &fakeGable{vehicles: testVehicles()}, Config{}).WithMeter(probe.m)
 
-		if _, err := svc.Pack(context.Background(), "plan-1"); err == nil {
+		if _, err := svc.Pack(context.Background(), "plan-1", false, ""); err == nil {
 			t.Fatal("expected the pack to be refused — nothing is assigned")
 		}
 		if got := probe.trucks(t); got != 0 {

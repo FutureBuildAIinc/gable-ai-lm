@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -152,6 +153,45 @@ type DeliveryRoute struct {
 	LoadManifest  any         `json:"load_manifest,omitempty"`
 }
 
+// RouteRecall withdraws a route AI_LM previously pushed from GableLBM's
+// dispatch board. It is the inverse of DeliveryRoute and the reason a dispatch
+// board can no longer outlive the plan that created it.
+//
+// It is keyed on (VehicleID, ScheduledDate) and NEVER on a stored route id.
+// The push upstream is create-or-replace: every re-push mints a fresh
+// delivery_routes row, so an id captured at push time either names nothing by
+// the time a recall matters or — worse — names a route that now belongs to a
+// different plan.
+//
+// Reason and RecalledBy carry the provenance of the manual approval that
+// authorized the withdrawal (the workflow's 423 override). Both are optional on
+// the wire so a recall is never blocked on missing attribution.
+//
+// The field order and tags here are pinned by GableLBM's contract suite
+// (internal/integrations/testdata/ailm_client_contract.json, type "RouteRecall").
+// Changing them breaks the integration in a way only that suite will catch.
+type RouteRecall struct {
+	VehicleID     string `json:"vehicle_id"`
+	ScheduledDate string `json:"scheduled_date"` // YYYY-MM-DD
+	Reason        string `json:"reason,omitempty"`
+	RecalledBy    string `json:"recalled_by,omitempty"`
+}
+
+// RouteRecallResult acknowledges a withdrawal.
+//
+// Recalled is false when there was nothing on the board for that (vehicle,
+// date) pair. That is a SUCCESS: a recall names a desired end state — "no live
+// route for this truck on this day" — and the state already holds. It matters
+// because this call exists to clean up after a partial push, so it WILL be
+// retried; a retry of an already-successful recall that read as a failure would
+// leave the caller unable to tell "converged" from "broken".
+type RouteRecallResult struct {
+	Recalled  bool   `json:"recalled"`
+	RouteID   string `json:"route_id,omitempty"` // the route withdrawn; empty when Recalled is false
+	StopCount int    `json:"stop_count"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // StaffValidation is the GableLBM /api/integration/validate-staff response. It
 // reports whether a staff member's email is entitled to use AI_LM and carries
 // the role/module grants that authorize the AI_LM session.
@@ -163,6 +203,33 @@ type StaffValidation struct {
 	Roles    []string `json:"roles"`
 	Modules  []string `json:"modules"`
 }
+
+// APIError is a non-2xx answer from GableLBM, carrying the status code the
+// caller needs in order to act on it. Before it existed, do() collapsed every
+// upstream refusal into a formatted string, so a caller could not tell a 404
+// from a 500 without parsing English — and the one caller that must (route
+// recall, which treats "already gone" as success) could not be written at all.
+//
+// Error() reproduces that original string byte for byte. The message is the
+// operator-facing contract pinned by TestErrorCarriesUpstreamStatusAndSnippet;
+// this type adds a machine-facing one beside it without changing it.
+type APIError struct {
+	Status int
+	Method string
+	Path   string
+	Body   string // up to 512 bytes of the upstream response
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("gable %s %s: status %d: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+// ErrRouteDispatched reports that a route could not be recalled because the
+// truck has already left the yard (GableLBM answers 409 for an IN_TRANSIT or
+// COMPLETED route). It is a distinct sentinel because the correct response is
+// different in kind from every other failure here: not "retry", but "this
+// cannot be undone from a screen — call the driver".
+var ErrRouteDispatched = errors.New("route already dispatched; cannot recall")
 
 // --- Methods ---
 
@@ -223,6 +290,35 @@ func (c *Client) PushDeliveryRoute(ctx context.Context, route DeliveryRoute) err
 	return c.do(ctx, http.MethodPost, "/api/integration/delivery-routes", route, nil)
 }
 
+// RecallDeliveryRoute withdraws a previously pushed route from GableLBM's
+// dispatch board and its yard Pack-Trucks surface.
+//
+//	POST /api/integration/delivery-routes/recall
+//
+// Upstream supersedes the route (CANCELLED plus recall audit columns) rather
+// than deleting it, so the audit trail and any proof-of-delivery attached to
+// that day survive.
+//
+// Two response codes need naming because callers must branch on them:
+//
+//   - 200 with {"recalled": false} means there was nothing on the board. That
+//     is success. Recall is idempotent by design so that a retry after a failed
+//     multi-truck recall converges instead of reporting a phantom failure.
+//   - 409 means the truck is already IN_TRANSIT or COMPLETED. That is
+//     terminal, not retryable, and is returned as ErrRouteDispatched so a
+//     caller can escalate it to a human instead of looping.
+func (c *Client) RecallDeliveryRoute(ctx context.Context, recall RouteRecall) (*RouteRecallResult, error) {
+	var out RouteRecallResult
+	if err := c.do(ctx, http.MethodPost, "/api/integration/delivery-routes/recall", recall, &out); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict {
+			return nil, fmt.Errorf("%w (truck %s on %s)", ErrRouteDispatched, recall.VehicleID, recall.ScheduledDate)
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ValidateStaff asks GableLBM whether the given staff email is entitled to use
 // AI_LM, returning the staff identity plus role/module grants. Sent with the
 // X-Integration-Key header like every other integration call.
@@ -265,7 +361,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("gable %s %s: status %d: %s", method, path, resp.StatusCode, string(snippet))
+		return &APIError{Status: resp.StatusCode, Method: method, Path: path, Body: string(snippet)}
 	}
 
 	if out != nil {

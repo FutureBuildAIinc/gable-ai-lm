@@ -41,6 +41,19 @@ export function isConflict(err: unknown): boolean {
   return err instanceof ApiError && err.status === 409;
 }
 
+/**
+ * A change the backend refused pending manual approval — either the run is
+ * locked (T2-3) or its routes are already live on the dealer's dispatch board.
+ * Both answer 423 and both are resolved the same way: an approver authorizes it.
+ *
+ * Key off the status, not the message. This used to be a `/lock|manual
+ * approval/i` regex over the server's prose, which meant the override prompt
+ * silently stopped appearing the moment anyone reworded a refusal.
+ */
+export function isLocked(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 423;
+}
+
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -477,6 +490,35 @@ export interface TruckLoad {
   load_plan?: LoadPlan;
   compliance?: ComplianceReview;
   proof?: LoadProof;
+  /**
+   * When this truck's route last reached the dispatch board, and a fingerprint
+   * of exactly what was written. A load with no `pushed_at` on a plan whose
+   * others have one is a truck a partial push never reached.
+   */
+  pushed_at?: string;
+  pushed_digest?: string;
+}
+
+/**
+ * One route this plan has placed on GableLBM's dispatch board. `recalled_at`
+ * set means it has since been withdrawn — the entries are tombstoned rather
+ * than removed, so the board's history stays answerable.
+ */
+export interface LiveRoute {
+  vehicle_id: string;
+  vehicle_name?: string;
+  pushed_at: string;
+  recalled_at?: string;
+  recalled_by?: string;
+  recall_note?: string;
+}
+
+/** A manual approval to change a plan whose routes were already live. */
+export interface PushedOverride {
+  action: string;
+  approved_by?: string;
+  approved_at: string;
+  note?: string;
 }
 
 export type WorkflowStatus = 'ANALYZED' | 'ASSIGNED' | 'PACKED' | 'REVIEWED' | 'PUSHED';
@@ -512,6 +554,8 @@ export interface WorkflowPlan {
   unassigned_orders: WorkflowStop[];
   lock?: PlanLock;
   late_adds?: LateAdd[];
+  live_routes?: LiveRoute[];
+  pushed_overrides?: PushedOverride[];
   created_at: string;
   updated_at: string;
 }
@@ -613,10 +657,11 @@ class AiLmService {
       body: JSON.stringify({ override, approved_by: approvedBy }),
     }).then((r) => jsonOrThrow(r));
   }
-  packWorkflow(id: string): Promise<WorkflowPlan> {
-    return fetchWithAuth(`${BASE}/workflow/plans/${id}/pack`, { method: 'POST' }).then((r) =>
-      jsonOrThrow(r),
-    );
+  packWorkflow(id: string, override = false, approvedBy = ''): Promise<WorkflowPlan> {
+    return fetchWithAuth(`${BASE}/workflow/plans/${id}/pack`, {
+      method: 'POST',
+      body: JSON.stringify({ override, approved_by: approvedBy }),
+    }).then((r) => jsonOrThrow(r));
   }
   resequenceWorkflow(
     id: string,
@@ -647,10 +692,12 @@ class AiLmService {
     id: string,
     orderId: string,
     body: { product_id?: string; sku?: string } & DimOverride,
+    override = false,
+    approvedBy = '',
   ): Promise<WorkflowPlan> {
     return fetchWithAuth(`${BASE}/workflow/plans/${id}/orders/${orderId}/dimensions`, {
       method: 'PUT',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, override, approved_by: approvedBy }),
     }).then((r) => jsonOrThrow(r));
   }
   // T1-6: yard proof-of-load + sign-off.

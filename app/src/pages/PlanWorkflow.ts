@@ -34,6 +34,7 @@ import {
   aiLmService,
   isBlockingUnplaced,
   isConflict,
+  isLocked,
   unplacedLabel,
   type AxleLoad,
   type WorkflowPlan,
@@ -283,9 +284,12 @@ export class PlanWorkflow extends LitElement {
     this._run('ingest', () => aiLmService.ingestWorkflow(this._date), (p) => this._setPlan(p));
   }
 
-  // _runReshuffle runs a lock-gated action (assign / resequence / priority).
-  // When the run is locked the backend returns 423; we surface an override
-  // prompt so an approver can authorize the change (T2-3).
+  // _runReshuffle runs an approval-gated action (assign / pack / resequence /
+  // priority). The backend answers 423 for two different reasons — the run is
+  // locked (T2-3), or its routes are already live on the dealer's dispatch
+  // board — and both are settled the same way: an approver authorizes it. So
+  // there is one prompt, and it carries the server's own sentence, which is
+  // what says which of the two happened and what it will cost.
   private async _runReshuffle(
     label: string,
     fn: (override: boolean, approvedBy: string) => Promise<WorkflowPlan>,
@@ -303,7 +307,11 @@ export class PlanWorkflow extends LitElement {
         // Stale plan — offer reload, not the override prompt. Overriding here
         // would authorize a reshuffle against a plan that no longer exists.
         this._conflict = msg;
-      } else if (/lock|manual approval/i.test(msg)) {
+        // 423 is the contract. The regex is a one-release fallback for a
+        // backend that has not shipped the status yet, and should come out
+        // after that: matching on prose is how this prompt silently stops
+        // appearing when somebody rewords a refusal.
+      } else if (isLocked(err) || /lock|manual approval/i.test(msg)) {
         this._override = {
           message: msg,
           run: async () => {
@@ -334,7 +342,7 @@ export class PlanWorkflow extends LitElement {
 
   private _pack() {
     if (!this._plan) return;
-    this._run('pack', () => aiLmService.packWorkflow(this._plan!.id), (p) => this._setPlan(p));
+    this._runReshuffle('pack', (o, by) => aiLmService.packWorkflow(this._plan!.id, o, by));
   }
 
   private _review() {
@@ -425,10 +433,15 @@ export class PlanWorkflow extends LitElement {
   private _saveDim() {
     if (!this._plan || !this._dimEdit) return;
     const { orderId, productId, sku } = this._dimEdit;
-    this._run(
-      'dim',
-      () =>
-        aiLmService.setLineDimensions(this._plan!.id, orderId, {
+    // Through _runReshuffle, not _run: a dimension override re-packs the truck
+    // carrying the order, so it is gated like any other reshuffle — on a locked
+    // run and on one whose routes are live. Without the override prompt the
+    // dispatcher would just see a 423 they had no way to answer.
+    this._runReshuffle('dim', async (override, approvedBy) => {
+      const p = await aiLmService.setLineDimensions(
+        this._plan!.id,
+        orderId,
+        {
           product_id: productId,
           sku,
           length_in: Number(this._dim.l),
@@ -436,12 +449,14 @@ export class PlanWorkflow extends LitElement {
           height_in: Number(this._dim.h),
           tolerance_pct: Number(this._dim.tol),
           source: this._dim.src,
-        }),
-      (p) => {
-        this._dimEdit = null;
-        this._setPlan(p, this._step);
-      },
-    );
+        },
+        override,
+        approvedBy,
+      );
+      // Close the editor only once the change actually landed.
+      this._dimEdit = null;
+      return p;
+    });
   }
 
   // --- T1-6: yard proof + sign-off -------------------------------------------

@@ -33,16 +33,30 @@ func NewRepository(db *database.DB) *Repository {
 }
 
 // payload is everything outside the dedicated columns, stored as one JSONB doc.
+//
+// NOTE, because this has already cost one silent data loss in review: a field
+// added to Plan is NOT persisted by being added to Plan. This struct enumerates
+// the plan-level fields by hand and marshalPayload/unmarshalPayload copy them
+// one by one, so a new Plan field missing from all three vanishes on every
+// write. Nothing in the in-memory test suite catches it either — fakePlanStore
+// round-trips the whole Plan through encoding/json, so an unregistered field
+// survives in every test and is lost only in production. That is what
+// TestPayloadRoundTripsTheLiveRouteLedger exists for.
+//
+// Fields inside Loads/Orders/Stops need no entry here: they ride inside those
+// slices and are marshalled wholesale.
 type payload struct {
-	DepotLat         float64         `json:"depot_lat"`
-	DepotLng         float64         `json:"depot_lng"`
-	DepotSource      string          `json:"depot_source,omitempty"`
-	DepotNote        string          `json:"depot_note,omitempty"`
-	Orders           []OrderAnalysis `json:"orders"`
-	Loads            []TruckLoad     `json:"loads"`
-	UnassignedOrders []Stop          `json:"unassigned_orders"`
-	Lock             *PlanLock       `json:"lock,omitempty"`
-	LateAdds         []LateAdd       `json:"late_adds,omitempty"`
+	DepotLat         float64          `json:"depot_lat"`
+	DepotLng         float64          `json:"depot_lng"`
+	DepotSource      string           `json:"depot_source,omitempty"`
+	DepotNote        string           `json:"depot_note,omitempty"`
+	Orders           []OrderAnalysis  `json:"orders"`
+	Loads            []TruckLoad      `json:"loads"`
+	UnassignedOrders []Stop           `json:"unassigned_orders"`
+	Lock             *PlanLock        `json:"lock,omitempty"`
+	LateAdds         []LateAdd        `json:"late_adds,omitempty"`
+	LiveRoutes       []LiveRoute      `json:"live_routes,omitempty"`
+	PushedOverrides  []PushedOverride `json:"pushed_overrides,omitempty"`
 }
 
 func (r *Repository) marshalPayload(p *Plan) ([]byte, error) {
@@ -56,6 +70,8 @@ func (r *Repository) marshalPayload(p *Plan) ([]byte, error) {
 		UnassignedOrders: p.UnassignedOrders,
 		Lock:             p.Lock,
 		LateAdds:         p.LateAdds,
+		LiveRoutes:       p.LiveRoutes,
+		PushedOverrides:  p.PushedOverrides,
 	})
 }
 
@@ -73,6 +89,8 @@ func (r *Repository) unmarshalPayload(raw []byte, p *Plan) error {
 	p.UnassignedOrders = pl.UnassignedOrders
 	p.Lock = pl.Lock
 	p.LateAdds = pl.LateAdds
+	p.LiveRoutes = pl.LiveRoutes
+	p.PushedOverrides = pl.PushedOverrides
 	if p.Orders == nil {
 		p.Orders = []OrderAnalysis{}
 	}

@@ -429,6 +429,8 @@ describe('PlanWorkflow — dimension overrides for variable-size SKUs (T2-2)', (
         height_in: 2,
         tolerance_pct: 15,
         source: 'MEASURED',
+        override: false,
+        approved_by: '',
       },
     });
   });

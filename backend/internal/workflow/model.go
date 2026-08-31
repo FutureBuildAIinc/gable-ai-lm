@@ -165,6 +165,19 @@ type TruckLoad struct {
 	// pushed (leave the yard) until Proof has at least one attachment and a
 	// sign-off.
 	Proof *LoadProof `json:"proof,omitempty"`
+	// PushedAt is when THIS truck's route last reached GableLBM's dispatch
+	// board, and PushedDigest fingerprints exactly what was written. Together
+	// they are the per-truck acknowledgement that makes a push resumable: a
+	// push that dies on truck 3 of 5 leaves 1 and 2 acked, and re-running it
+	// skips them instead of re-POSTing routes that already landed.
+	//
+	// The digest, not the timestamp, is what authorizes the skip. A timestamp
+	// alone would let a truck whose stops changed AFTER it was pushed — a
+	// review that rebalanced weight onto it, say — be skipped on the next push
+	// and left holding a stale manifest upstream. The digest covers the whole
+	// route payload, so any change to stops, driver or manifest re-pushes.
+	PushedAt     *time.Time `json:"pushed_at,omitempty"`
+	PushedDigest string     `json:"pushed_digest,omitempty"`
 }
 
 // ProofAttachment is one yard photo/video reference for a packed load (T1-6).
@@ -191,6 +204,46 @@ type LoadProof struct {
 // attachment and a sign-off.
 func (p *LoadProof) Ready() bool {
 	return p != nil && len(p.Attachments) > 0 && p.SignedOff
+}
+
+// LiveRoute is one (vehicle, date) route this plan has actually placed on
+// GableLBM's dispatch board.
+//
+// It is plan-level rather than per-load, and that is the whole point. Assign
+// rebuilds Plan.Loads from scratch, so the record of what is live upstream must
+// outlive the loads that created it — otherwise the one truck a re-assignment
+// DROPS takes the only evidence of its own live route with it, and its route
+// stays on the dealer's board forever with nothing left in this system that
+// knows to recall it.
+//
+// Recalls are tombstoned (RecalledAt set), never removed, so support can always
+// answer "what did we put on their board, and when did we take it off".
+type LiveRoute struct {
+	VehicleID   string     `json:"vehicle_id"`
+	VehicleName string     `json:"vehicle_name,omitempty"`
+	PushedAt    time.Time  `json:"pushed_at"`
+	RecalledAt  *time.Time `json:"recalled_at,omitempty"`
+	RecalledBy  string     `json:"recalled_by,omitempty"`
+	RecallNote  string     `json:"recall_note,omitempty"`
+}
+
+// Live reports whether this route is still believed to be on the dispatch board.
+func (r LiveRoute) Live() bool { return r.RecalledAt == nil }
+
+// PushedOverride records one manual approval to change a plan whose routes were
+// already live on the dispatch board — the 423 override, in the same shape the
+// T2-3 lock override uses.
+//
+// It exists because not every such change recalls anything. Re-packing a pushed
+// plan changes no truck's membership, so it leaves no tombstone on any
+// LiveRoute; without this the approval that authorized it would be nowhere on
+// the plan, and "who said this run could be rebuilt after it went out?" would
+// have no answer.
+type PushedOverride struct {
+	Action     string    `json:"action"`
+	ApprovedBy string    `json:"approved_by,omitempty"`
+	ApprovedAt time.Time `json:"approved_at"`
+	Note       string    `json:"note,omitempty"`
 }
 
 // Lock window codes (T2-3).
@@ -260,8 +313,16 @@ type Plan struct {
 	UnassignedOrders []Stop          `json:"unassigned_orders"`
 	Lock             *PlanLock       `json:"lock,omitempty"`
 	LateAdds         []LateAdd       `json:"late_adds,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	// LiveRoutes is the ledger of routes this plan has placed on GableLBM's
+	// dispatch board, including the ones it has since recalled. It is the only
+	// durable record of what is live upstream, and it survives an Assign that
+	// throws Loads away. Repository.payload must carry it — see the note there.
+	LiveRoutes []LiveRoute `json:"live_routes,omitempty"`
+	// PushedOverrides is the audit trail of manual approvals to change this
+	// plan after its routes went live.
+	PushedOverrides []PushedOverride `json:"pushed_overrides,omitempty"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
 }
 
 // IngestRequest starts a workflow run for a date.
@@ -291,6 +352,15 @@ type PriorityRequest struct {
 // AssignRequest runs (or re-runs) truck assignment. Override authorizes a
 // re-assignment on a locked run (T2-3); the body may be empty.
 type AssignRequest struct {
+	Override   bool   `json:"override,omitempty"`
+	ApprovedBy string `json:"approved_by,omitempty"`
+}
+
+// PackRequest runs (or re-runs) 3D packing. Override authorizes a re-pack of a
+// plan whose routes are already live on the dispatch board; the body may be
+// empty. It deliberately mirrors AssignRequest rather than inventing a second
+// approval shape.
+type PackRequest struct {
 	Override   bool   `json:"override,omitempty"`
 	ApprovedBy string `json:"approved_by,omitempty"`
 }
@@ -347,6 +417,12 @@ type DimensionOverrideRequest struct {
 	TolerancePct float64 `json:"tolerance_pct,omitempty"`
 	Source       string  `json:"source,omitempty"` // MEASURED / AVERAGE
 	Note         string  `json:"note,omitempty"`
+	// Override authorizes the change on a locked run (T2-3) or on a plan whose
+	// routes are live on the dispatch board. Until this existed a dimension
+	// override was the one mutation that re-packed a locked, pushed run with no
+	// gate of any kind.
+	Override   bool   `json:"override,omitempty"`
+	ApprovedBy string `json:"approved_by,omitempty"`
 }
 
 // Briefing is the LLM-generated dispatch briefing for a plan. When AI is not

@@ -124,8 +124,14 @@ func (h *Handler) HandleAssign(w http.ResponseWriter, r *http.Request) {
 	h.respondStep(w, r, plan, err)
 }
 
+// HandlePack runs (or re-runs) 3D packing. Like HandleAssign it tolerates an
+// empty body; when present it carries the override (manual approval) for a
+// locked run or for one whose routes are already live on the dispatch board.
 func (h *Handler) HandlePack(w http.ResponseWriter, r *http.Request) {
-	h.step(w, r, h.svc.Pack)
+	var req PackRequest
+	_ = json.NewDecoder(r.Body).Decode(&req) // body optional
+	plan, err := h.svc.Pack(r.Context(), r.PathValue("id"), req.Override, req.ApprovedBy)
+	h.respondStep(w, r, plan, err)
 }
 
 func (h *Handler) HandleReview(w http.ResponseWriter, r *http.Request) {
@@ -157,7 +163,11 @@ func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan
 		httputil.RespondError(w, r, "plan not found", http.StatusNotFound, err)
 		return
 	}
-	if errors.Is(err, ErrLocked) {
+	// A locked run (T2-3) and a plan whose routes are already live on the
+	// dispatch board are the same conversation with the dispatcher: "this needs
+	// an approver". Both carry their own sentence and both answer 423, so the
+	// UI has exactly one override prompt to implement.
+	if errors.Is(err, ErrLocked) || errors.Is(err, ErrPushed) {
 		httputil.RespondError(w, r, err.Error(), http.StatusLocked, err)
 		return
 	}

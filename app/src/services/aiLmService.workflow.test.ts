@@ -231,12 +231,20 @@ describe('aiLmService — guided workflow lifecycle', () => {
     expect(lastCall()).toMatchObject({ url: '/api/v1/workflow/plans/plan-1', method: 'GET' });
   });
 
-  it('walks pack, review and push as bodyless POSTs', async () => {
+  it('sends pack with an approval body, and review and push bodyless', async () => {
+    // Pack carries override/approved_by like assign does: re-packing a plan
+    // whose routes are already on the dispatch board needs an approver, and it
+    // uses the same shape rather than a second override idiom.
     await aiLmService.packWorkflow('plan-1');
     expect(lastCall()).toMatchObject({
       url: '/api/v1/workflow/plans/plan-1/pack',
       method: 'POST',
-      body: undefined,
+      body: { override: false, approved_by: '' },
+    });
+
+    await aiLmService.packWorkflow('plan-1', true, 'dispatcher@dealer.com');
+    expect(lastCall()).toMatchObject({
+      body: { override: true, approved_by: 'dispatcher@dealer.com' },
     });
 
     await aiLmService.reviewWorkflow('plan-1');
@@ -296,6 +304,8 @@ describe('aiLmService — stop priority and dimension overrides', () => {
         height_in: 2,
         tolerance_pct: 15,
         source: 'AVERAGE',
+        override: false,
+        approved_by: '',
       },
     });
   });

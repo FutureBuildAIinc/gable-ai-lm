@@ -51,6 +51,14 @@ func (s *Service) Review(ctx context.Context, id string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Review is legal from PACKED and REVIEWED only. On a plan already on the
+	// dispatch board it is refused outright rather than offered an override:
+	// review never changes which trucks exist, so there is no orphaned route to
+	// recall and nothing for an approver to weigh. Changing the plan walks it
+	// back to PACKED and review is legal again.
+	if err := gateTransition(p, actionReview, false, ""); err != nil {
+		return nil, err
+	}
 	if len(p.Loads) == 0 {
 		return nil, refusedf("no truck loads to review — run assign + pack first")
 	}
@@ -80,7 +88,7 @@ func (s *Service) Review(ctx context.Context, id string) (*Plan, error) {
 		return nil, err
 	}
 
-	p.Status = StatusReviewed
+	p.Status = planTransitions[actionReview].to
 	if err := s.repo.Update(ctx, p); err != nil {
 		return nil, err
 	}

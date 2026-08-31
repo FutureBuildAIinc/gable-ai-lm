@@ -18,6 +18,7 @@ sync with `backend/internal/gable/client.go` and the catalog resolver in
 |---|---|---|---|---|
 | **Outbound** (read) | `GET {GABLE_API_URL}/api/integration/*` | `X-Integration-Key` header | **GableLBM** | ecosystem |
 | **Outbound** (write-back) | `POST {GABLE_API_URL}/api/integration/delivery-routes` | `X-Integration-Key` header | **GableLBM** | ecosystem |
+| **Outbound** (recall) | `POST {GABLE_API_URL}/api/integration/delivery-routes/recall` | `X-Integration-Key` header | **GableLBM** | ecosystem |
 | **Inbound** (served) | `/api/v1/*` (fleet, catalog, load, routing, compliance, workflow, auth) | AI_LM HMAC session JWT via `SESSION_SECRET`; optionally also JWKS. `AUTH_MODE=dev` bypasses everything | AI_LM's own Lit UI | first-party |
 
 AI_LM has **no true third-party integrations of its own** — no EDI, no ERP adaptors, no
@@ -43,7 +44,8 @@ client is `internal/gable.Client`; config resolution is in `internal/config/conf
 | `GET` | `/api/integration/drivers` | `internal/routing` | Driver assignment for route write-back |
 | `GET` | `/api/integration/orders` | `internal/catalog` / routing | Orders + line items + delivery geo + `branch_id` |
 | `GET` | `/api/integration/locations` | `internal/workflow` (depot) | Dealer branches (yards) + nullable coordinates |
-| `POST` | `/api/integration/delivery-routes` | `internal/routing` (approve) | Write-back of an approved route plan |
+| `POST` | `/api/integration/delivery-routes` | `internal/routing` (approve), `internal/workflow` (push) | Write-back of an approved route plan |
+| `POST` | `/api/integration/delivery-routes/recall` | `internal/workflow` (re-assign) | Withdraw a pushed route the plan no longer contains |
 | `POST` | `/api/integration/validate-staff` | `gable.Client.ValidateStaff` | Staff login entitlement check (pillar 4) |
 
 > GableLBM also exposes quote endpoints (`bulk-price`, `quotes`, `accept-and-convert`) on
@@ -134,6 +136,39 @@ AI_LM posts an approved plan back:
 Idempotent on `(vehicle_id, scheduled_date)` — re-approving a plan overwrites rather than
 duplicates.
 
+The workflow push writes one route per truck and **acknowledges each one on the plan as it
+lands** (`TruckLoad.pushed_at` plus a digest of the payload, and a `Plan.live_routes`
+entry). A push that fails part-way therefore persists what it managed to write and leaves
+the plan at `REVIEWED` — never `PUSHED` — so re-running it resumes, skipping the trucks
+already on the board whose route is unchanged.
+
+### `POST /api/integration/delivery-routes/recall` — withdraw
+
+The inverse of the write-back, and the reason a dispatch board can no longer outlive the
+plan that created it. Because the write-back is create-or-replace, a truck that *survives* a
+re-plan is corrected by the next push — but a truck the re-plan **drops** was, until this
+endpoint existed, abandoned live on the dealer's board with its old stops and old manifest.
+The yard would load a truck for a run that no longer existed.
+
+Request `{ vehicle_id, scheduled_date, reason?, recalled_by? }`; response
+`{ recalled, route_id?, stop_count, reason? }`. Consumed by
+`gable.Client.RecallDeliveryRoute`, called from `workflow.Assign` for exactly the trucks a
+re-assignment drops.
+
+Three contract points that shape the AI_LM side:
+
+- **Keyed on `(vehicle_id, scheduled_date)`, never a stored `route_id`.** Every push mints a
+  new route row upstream, so an id captured at push time recalls nothing — or names a route
+  that now belongs to a different plan.
+- **`recalled: false` is success, not "not found".** A recall states a desired end state
+  ("no live route for this truck that day"), and it is retried after a failed multi-truck
+  recall, so it must converge rather than report a phantom failure. AI_LM relies on this:
+  when a recall fails it persists nothing, leaving the plan naming every route as live, so
+  the retry redundantly recalls the ones that already went — which is the safe direction.
+- **`409` is terminal, not retryable.** The truck is IN_TRANSIT or COMPLETED and has left the
+  yard. Surfaced as `gable.ErrRouteDispatched` and turned into a refusal naming the truck,
+  because the answer is a phone call, not a loop.
+
 ### `POST /api/integration/validate-staff` — staff login
 
 Called by `gable.Client.ValidateStaff` from AI_LM's `POST /api/v1/auth/login`. Request
@@ -160,11 +195,12 @@ is documented here only to complete the picture. Full route table is in `CLAUDE.
 
 ## Replacing the backend
 
-The **seven** consumed routes above — five reads, the `validate-staff` check, and the
-delivery-routes write-back — are the entire dependency AI_LM has on GableLBM. Any ERP that
+The **eight** consumed routes above — five reads, the `validate-staff` check, the
+delivery-routes write-back and its recall — are the entire dependency AI_LM has on
+GableLBM. Any ERP that
 satisfies this contract (same paths, same `X-Integration-Key` auth, same
-product/vehicle/driver/order/location shapes, accepting the route write-back, and answering
-`validate-staff`) is *intended* to host AI_LM unchanged. That is the deliberate licensing
+product/vehicle/driver/order/location shapes, accepting the route write-back **and its
+recall**, and answering `validate-staff`) is *intended* to host AI_LM unchanged. That is the deliberate licensing
 seam.
 
 > **Honest status: the seam is not closed yet.** The design says ERP-specific knowledge is

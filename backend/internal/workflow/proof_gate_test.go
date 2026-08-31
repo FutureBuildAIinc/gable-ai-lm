@@ -73,7 +73,7 @@ func TestRepackWithdrawsTheYardSignOff(t *testing.T) {
 			name: "the dispatcher re-runs Pack",
 			run: func(t *testing.T, svc *Service) *Plan {
 				t.Helper()
-				got, err := svc.Pack(context.Background(), "plan-1")
+				got, err := svc.Pack(context.Background(), "plan-1", false, "")
 				if err != nil {
 					t.Fatalf("pack: %v", err)
 				}
@@ -134,13 +134,17 @@ func TestPushRefusesAfterARepackedLoadLosesItsSignOff(t *testing.T) {
 	if _, err := svc.Resequence(context.Background(), "plan-1", "v1", []string{"o2", "o1"}, false, ""); err != nil {
 		t.Fatalf("resequence: %v", err)
 	}
-	// Resequence also invalidates the review, so restore it — this test is about
-	// the sign-off and nothing else.
+	// Resequence also invalidates the review — it walks the plan back to PACKED
+	// and clears the compliance artifact — so restore both. This test is about
+	// the sign-off and nothing else, and without the status restored the plan
+	// would be refused by the transition table (push is legal from REVIEWED)
+	// one gate before the one under test.
 	p, err := store.Get(context.Background(), "plan-1")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	p.Loads[0].Compliance = &ComplianceReview{Status: "PASS"}
+	p.Status = StatusReviewed
 	if err := store.Update(context.Background(), p); err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -164,7 +168,7 @@ func TestComplianceHeightCapRepackWithdrawsTheSignOff(t *testing.T) {
 
 	// Pack for real first, so the reviewer's re-pack has a solved plan to
 	// differ from and the sign-off is re-applied to THAT plan.
-	if _, err := svc.Pack(context.Background(), "plan-1"); err != nil {
+	if _, err := svc.Pack(context.Background(), "plan-1", false, ""); err != nil {
 		t.Fatalf("pack: %v", err)
 	}
 	p, err := store.Get(context.Background(), "plan-1")
@@ -230,7 +234,7 @@ func TestIdenticalRepackKeepsTheSignOff(t *testing.T) {
 	svc := newTestService(store, &fakeGable{vehicles: testVehicles()}, Config{})
 
 	// First Pack replaces the hand-built fixture plan with a real solve.
-	if _, err := svc.Pack(context.Background(), "plan-1"); err != nil {
+	if _, err := svc.Pack(context.Background(), "plan-1", false, ""); err != nil {
 		t.Fatalf("first pack: %v", err)
 	}
 	p, err := store.Get(context.Background(), "plan-1")
@@ -246,7 +250,7 @@ func TestIdenticalRepackKeepsTheSignOff(t *testing.T) {
 	}
 
 	// Second Pack: same orders, same fleet, deterministic solver ⇒ same load.
-	got, err := svc.Pack(context.Background(), "plan-1")
+	got, err := svc.Pack(context.Background(), "plan-1", false, "")
 	if err != nil {
 		t.Fatalf("second pack: %v", err)
 	}
