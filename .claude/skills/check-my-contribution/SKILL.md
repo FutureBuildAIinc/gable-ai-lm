@@ -138,9 +138,9 @@ the `gable` repo's `CLAUDE.md`:
 
 ## 6 · The PR
 
-- **Targets `staging`**, not `master`. Maintainers fast-forward `staging → master` after review.
+- **Targets `main`.** `main` is the only branch (see CONTRIBUTING.md).
   ```bash
-  gh pr create --base staging --fill
+  gh pr create --base main --fill
   ```
 - **Fill in the PR template honestly** if one exists (`ls .github/PULL_REQUEST_TEMPLATE.md`).
   Only tick a box you actually ran.
@@ -160,7 +160,7 @@ go test -race ./...     FAIL — see below
 reuse lint              SKIPPED — reuse not installed
 SPDX headers            PASS
 secrets / binaries      clean
-PR target               staging
+PR target               main
 ```
 
 Then, for each failure: the exact command, the exact error, and the smallest fix.
