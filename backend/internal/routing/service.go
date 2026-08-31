@@ -6,7 +6,9 @@ package routing
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
+	"github.com/FutureBuildAIinc/gable-ai-lm/internal/depot"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
 )
 
@@ -27,22 +29,51 @@ type driverSource interface {
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
 }
 
+// locationSource fetches the dealer's yards, so a plan can be rooted at the
+// branch it was asked for rather than at the middle of its own stops
+// (satisfied by *gable.Client).
+type locationSource interface {
+	ListLocations(ctx context.Context) ([]gable.Location, error)
+}
+
 // routeSink writes an approved route back to GableLBM (satisfied by *gable.Client).
 type routeSink interface {
 	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
 }
 
-// Service orchestrates route planning and write-back.
-type Service struct {
-	repo     *Repository
-	orders   orderSource
-	vehicles vehicleSource
-	drivers  driverSource
-	sink     routeSink
+// planStore is the persistence seam for route plans (satisfied by
+// *Repository). It is declared consumer-side like every other seam in this
+// module so planning can be exercised against an in-memory store with no
+// Postgres.
+type planStore interface {
+	Save(ctx context.Context, p *Plan) error
+	Get(ctx context.Context, id string) (*Plan, error)
+	UpdateStatus(ctx context.Context, id, status string) error
 }
 
-func NewService(repo *Repository, orders orderSource, vehicles vehicleSource, drivers driverSource, sink routeSink) *Service {
-	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, sink: sink}
+// Config carries this module's deployment configuration: the install-wide
+// fallback yard (DEPOT_LAT/DEPOT_LNG). It is the same pair the workflow module
+// is given, because both root their runs through the same ladder and an
+// endpoint that disagreed with its neighbour about where the yard is would be
+// the bug this file was changed to fix.
+type Config struct {
+	DepotLat *float64
+	DepotLng *float64
+}
+
+// Service orchestrates route planning and write-back.
+type Service struct {
+	repo      planStore
+	orders    orderSource
+	vehicles  vehicleSource
+	drivers   driverSource
+	locations locationSource
+	sink      routeSink
+	cfg       Config
+}
+
+func NewService(repo planStore, orders orderSource, vehicles vehicleSource, drivers driverSource, locations locationSource, sink routeSink, cfg Config) *Service {
+	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, locations: locations, sink: sink, cfg: cfg}
 }
 
 // Plan pulls confirmed orders for the date, optimizes the stop sequence, and
@@ -59,7 +90,7 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 
 	// Build stops from orders that carry geolocation.
 	var stops []Stop
-	var sumLat, sumLng float64
+	var points []depot.Point
 	for _, o := range orders {
 		if o.Latitude == nil || o.Longitude == nil {
 			continue
@@ -75,18 +106,13 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 			Address:   o.Address,
 			WeightLbs: weight,
 		})
-		sumLat += *o.Latitude
-		sumLng += *o.Longitude
+		points = append(points, depot.Point{Lat: *o.Latitude, Lng: *o.Longitude})
 	}
 
-	// Depot defaults to the centroid of all stops when not supplied.
-	depotLat, depotLng := 0.0, 0.0
-	if req.DepotLat != nil && req.DepotLng != nil {
-		depotLat, depotLng = *req.DepotLat, *req.DepotLng
-	} else if len(stops) > 0 {
-		depotLat = sumLat / float64(len(stops))
-		depotLng = sumLng / float64(len(stops))
-	}
+	depotLat, depotLng, depotSource, depotNote := s.resolveDepot(ctx, req, orders, points)
+	slog.Info("routing plan depot resolved",
+		"date", req.Date, "depot_source", depotSource, "depot_lat", depotLat, "depot_lng", depotLng,
+		"note", depotNote)
 
 	// Pull the live fleet and bin-pack stops across trucks by capacity (CVRP).
 	vehicles, err := s.vehicles.ListVehicles(ctx)
@@ -137,6 +163,158 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		return nil, err
 	}
 	return plan, nil
+}
+
+// resolveDepot roots this plan through the shared ladder in internal/depot:
+// REQUEST -> BRANCH -> CONFIG -> CENTROID -> NONE. It is the same ladder the
+// workflow ingest uses, deliberately: this endpoint used to run its own shorter
+// one (request depot, else the centroid of the stops) and so ignored the
+// branch id its caller had explicitly handed it — it stored that branch on the
+// plan and then rooted the route somewhere else.
+//
+// Sharing the ladder was not enough, though, because the two callers were still
+// feeding it different questions. Workflow asked "which yards do these ORDERS
+// ship from?"; routing asked only "which yard did the request name?" — so the
+// same orders, planned through the two endpoints with no explicit branch, came
+// out rooted at a yard in one and at the middle of the stops in the other, and
+// the ladder's multi-yard guard could never fire here at all. The set handed in
+// below is therefore derived from the orders, exactly as workflow derives it,
+// through the same helper.
+//
+// req.BranchID keeps its meaning on top of that: it is the caller's own
+// statement of which yard this plan is FOR, so it decides where the route is
+// rooted. Two things it does NOT do:
+//
+// It does not settle whether the dispatcher hears that the orders name a
+// different yard. Asking for Dallas does not move the Fort Worth stops, and a
+// plan that quietly routes a day from the wrong yard is the failure this whole
+// ladder exists to prevent. The warning therefore fires on WRONGNESS, not on
+// span: whenever the requested yard is not the only one the orders name —
+// including when they unanimously name a different one, which is the 100%-wrong
+// case and used to be the silent one.
+//
+// And it does not outrank the orders when it cannot be used at all. An unknown,
+// inactive or never-geocoded branch id is not an answer, and the package
+// doctrine is BRANCH before CONFIG — so a requested yard that will not resolve
+// falls through to the yard the ORDERS ship from before it falls to this
+// install's configured depot. Skipping a live branch answer because a different
+// branch failed is how a Dallas day ends up rooted in Austin.
+//
+// The branch list is only fetched when it can actually change the answer: an
+// explicit request depot outranks it, and a run naming no branch anywhere —
+// neither on the request nor on any order — has nothing to look up. The fetch
+// is best effort — a GableLBM that predates /api/integration/locations answers
+// 404, and that must cost this plan its branch origin, not the plan itself.
+//
+// The result is not persisted: route_plans is a column-backed table and adding
+// a depot_source column is a migration. The caller logs it instead, once per
+// plan, so support can still answer "why does this route start there?".
+func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, orders []gable.Order, stops []depot.Point) (lat, lng float64, source, note string) {
+	// The yards this day's orders actually ship from — the same question, asked
+	// through the same helper, as internal/workflow asks of its analyses.
+	orderBranches := depot.DistinctBranchIDs(orderBranchIDs(orders))
+
+	explicit := ""
+	if req.BranchID != nil {
+		explicit = *req.BranchID
+	}
+
+	// A request depot outranks every branch, so with one there is nothing a
+	// branch lookup could change — including the mismatch sentence below, which
+	// is held to the same rule the workflow ingest applies: an operator who gave
+	// this run its own coordinate has already answered the question.
+	branchRungInPlay := req.DepotLat == nil || req.DepotLng == nil
+
+	var branches []gable.Location
+	var branchesErr error
+	if branchRungInPlay && (explicit != "" || len(orderBranches) > 0) {
+		if branches, branchesErr = s.locations.ListLocations(ctx); branchesErr != nil {
+			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
+				"date", req.Date, "requested_branch", explicit, "order_branches", orderBranches, "err", branchesErr)
+			branches = nil
+		}
+	}
+
+	// An explicit branch is the caller's answer and outranks what the orders
+	// imply — while it is usable. When it is not (unknown, inactive, never
+	// geocoded, out of range) it is not an answer at all, and the run falls to
+	// the yard its orders actually ship from BEFORE it falls to the configured
+	// depot: BRANCH outranks CONFIG, and the branch that failed is not the
+	// branch being asked about. With no explicit branch, the orders speak for
+	// themselves.
+	wanted := orderBranches
+	requestedWhy := ""
+	if explicit != "" && branchRungInPlay {
+		if _, _, ok, why := depot.ResolveBranch([]string{explicit}, branches); ok {
+			wanted = []string{explicit}
+		} else {
+			requestedWhy = why
+		}
+	}
+
+	lat, lng, source, note = depot.Resolve(depot.Input{
+		RequestLat: req.DepotLat,
+		RequestLng: req.DepotLng,
+		BranchIDs:  wanted,
+		Branches:   branches,
+		ConfigLat:  s.cfg.DepotLat,
+		ConfigLng:  s.cfg.DepotLng,
+		Stops:      stops,
+	})
+
+	if requestedWhy != "" {
+		// The yard the caller asked for could not be used. The note owes the
+		// dispatcher both halves: why that yard was unusable, and where the run
+		// went instead — the orders' own yard when they name a usable one, and
+		// otherwise whatever rung below it answered.
+		switch {
+		case source == depot.SourceBranch:
+			note = requestedWhy + "; " + depot.OrdersOwnBranchPhrase(wanted, branches)
+		case note != "":
+			// The orders' own yards were tried and declined too; the ladder has
+			// already written that half of the sentence.
+			note = requestedWhy + "; " + note
+		default:
+			note = requestedWhy + "; " + depot.FallbackPhrase(source)
+		}
+	}
+	if branchesErr != nil {
+		// A yard WAS named; we simply could not look it up. Say that, rather
+		// than letting the note claim the branch was unknown.
+		note = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(source))
+	}
+	if explicit != "" && branchRungInPlay && requestedWhy == "" {
+		// The ladder only sees the one yard the request named, so it cannot
+		// notice that the orders name another. When they do, that fact has to
+		// reach the note whether it is half the day or all of it: the plan is
+		// rooted where it was asked to be, and the dispatcher is told which
+		// stops that leaves in a yard they do not ship from.
+		if mismatch := depot.RequestedBranchMismatchPhrase(explicit, orderBranches, branches); mismatch != "" {
+			note = joinNotes(note, mismatch)
+		}
+	}
+	return lat, lng, source, note
+}
+
+// orderBranchIDs projects the yard off each order. It is the routing module's
+// half of the shared question — the semantics (first appearance, empties
+// skipped, duplicates collapsed) belong to depot.DistinctBranchIDs, so this
+// module cannot drift from workflow's answer again.
+func orderBranchIDs(orders []gable.Order) []string {
+	ids := make([]string, 0, len(orders))
+	for _, o := range orders {
+		ids = append(ids, o.BranchID)
+	}
+	return ids
+}
+
+// joinNotes appends a second sentence to a depot note without inventing a
+// leading separator when the first one is empty.
+func joinNotes(first, second string) string {
+	if first == "" {
+		return second
+	}
+	return first + "; " + second
 }
 
 // Get returns a stored plan by id.

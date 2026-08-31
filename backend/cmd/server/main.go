@@ -155,8 +155,12 @@ func main() {
 		cfg.SecurementJurisdiction, cfg.SecurementAnchorSpacingIn)
 	load.NewHandler(loadSvc).RegisterRoutes(mux, writeGuard)
 
-	// Routing (pillar 2).
-	routingSvc := routing.NewService(routing.NewRepository(db), gableClient, gableClient, gableClient, gableClient)
+	// Routing (pillar 2). It is handed the branch list and this install's
+	// configured depot for the same reason the workflow is: both root their
+	// runs through the one ladder in internal/depot, and an unwired dependency
+	// there is a nil panic on the first plan that names a branch.
+	routingSvc := routing.NewService(routing.NewRepository(db), gableClient, gableClient, gableClient, gableClient, gableClient,
+		routing.Config{DepotLat: cfg.DepotLat, DepotLng: cfg.DepotLng})
 	routing.NewHandler(routingSvc).RegisterRoutes(mux, writeGuard)
 
 	// Compliance (pillar 2).
@@ -174,10 +178,14 @@ func main() {
 			DepotLng:                  cfg.DepotLng,
 		})
 	workflow.NewHandler(workflowSvc).RegisterRoutes(mux, writeGuard)
+	// DEPOT_LAT/DEPOT_LNG are the install-wide fallback, shared by the workflow
+	// and routing modules because both resolve their origin through the one
+	// ladder in internal/depot. A plan prefers the GableLBM branch it actually
+	// ships from, so this is what it lands on when no branch is usable.
 	if cfg.DepotLat != nil && cfg.DepotLng != nil {
-		logger.Info("Workflow depot configured", "lat", *cfg.DepotLat, "lng", *cfg.DepotLng)
+		logger.Info("Fallback depot configured", "lat", *cfg.DepotLat, "lng", *cfg.DepotLng)
 	} else {
-		logger.Warn("DEPOT_LAT/DEPOT_LNG not set — workflow plans root at the centroid of each day's stops (set them to this yard's coordinates)")
+		logger.Warn("DEPOT_LAT/DEPOT_LNG not set — a plan that cannot root at its GableLBM branch falls back to the centroid of that day's stops (set them to this yard's coordinates)")
 	}
 
 	// Health — liveness.

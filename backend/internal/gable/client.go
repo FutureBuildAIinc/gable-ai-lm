@@ -3,8 +3,8 @@
 
 // Package gable is the HTTP client for GableLBM's /api/integration/* surface.
 // AI_LM is a standalone service: it pulls its source-of-truth data (vehicles,
-// orders, products+weight) from GableLBM and writes approved routes back, all
-// authenticated with the X-Integration-Key header.
+// orders, products+weight, branch locations) from GableLBM and writes approved
+// routes back, all authenticated with the X-Integration-Key header.
 package gable
 
 import (
@@ -96,14 +96,41 @@ type OrderLine struct {
 }
 
 // Order is a confirmed order with optional delivery geolocation.
+//
+// BranchID is the yard the load ships from (orders.branch_id, NOT NULL in
+// GableLBM since migration 062). It is a plain string, deliberately not a
+// pointer and not omitempty: an empty value on the wire is an upstream defect
+// AI_LM should be able to observe, not a legitimate "this order has no branch".
 type Order struct {
 	ID           string      `json:"id"`
 	Status       string      `json:"status"`
+	BranchID     string      `json:"branch_id"`
 	CustomerName string      `json:"customer_name,omitempty"`
 	Address      string      `json:"address,omitempty"`
 	Latitude     *float64    `json:"latitude,omitempty"`
 	Longitude    *float64    `json:"longitude,omitempty"`
 	Lines        []OrderLine `json:"lines"`
+}
+
+// Location is one of the dealer's branches (yards) in GableLBM, matched against
+// Order.BranchID so a run roots at the yard its load actually leaves from
+// rather than at one globally configured depot.
+//
+// Latitude/Longitude are pointers for the same reason Product's geometry is:
+// locations.latitude/longitude are backfilled lazily by geocoding the branch
+// address, so nil means "this yard has never been geocoded" and must not
+// collapse into a real 0,0 off the coast of Africa. A nil coordinate is a
+// reason to fall back down the depot chain, never a place to root a route.
+//
+// Only active top-level BRANCH locations are returned, so an order whose
+// branch_id has no match here is "branch unknown" — also a fallback, not a
+// crash.
+type Location struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Address   string   `json:"address,omitempty"`
+	Latitude  *float64 `json:"latitude,omitempty"`
+	Longitude *float64 `json:"longitude,omitempty"`
 }
 
 // RouteStop is a single stop in an approved delivery route written back to LBM.
@@ -144,6 +171,16 @@ type StaffValidation struct {
 func (c *Client) ListVehicles(ctx context.Context) ([]Vehicle, error) {
 	var out []Vehicle
 	if err := c.do(ctx, http.MethodGet, "/api/integration/vehicles", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListLocations returns the dealer's active branches (yards). GableLBM's
+// integration endpoints return bare JSON arrays (not an enveloped object).
+func (c *Client) ListLocations(ctx context.Context) ([]Location, error) {
+	var out []Location
+	if err := c.do(ctx, http.MethodGet, "/api/integration/locations", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil

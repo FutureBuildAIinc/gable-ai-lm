@@ -16,6 +16,7 @@ import (
 
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/catalog"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/compliance"
+	"github.com/FutureBuildAIinc/gable-ai-lm/internal/depot"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/fleet"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/load"
@@ -24,11 +25,17 @@ import (
 
 // Depot origin sources, recorded on the plan so the UI (and support) can see
 // where a run's routing origin came from.
+//
+// The values live in internal/depot, which owns the one ladder this module and
+// internal/routing both resolve through. They are re-exported here because they
+// are part of this module's published plan payload (Plan.DepotSource) and are
+// referenced by name across the codebase.
 const (
-	DepotSourceRequest  = "REQUEST"  // supplied on the ingest request
-	DepotSourceConfig   = "CONFIG"   // this install's DEPOT_LAT/DEPOT_LNG
-	DepotSourceCentroid = "CENTROID" // centroid of the day's routable stops
-	DepotSourceNone     = "NONE"     // nothing to root on (no geocoded orders)
+	DepotSourceRequest  = depot.SourceRequest  // supplied on the ingest request
+	DepotSourceBranch   = depot.SourceBranch   // the GableLBM yard every order on this run ships from
+	DepotSourceConfig   = depot.SourceConfig   // this install's DEPOT_LAT/DEPOT_LNG
+	DepotSourceCentroid = depot.SourceCentroid // centroid of the day's routable stops
+	DepotSourceNone     = depot.SourceNone     // nothing to root on (no geocoded orders)
 )
 
 // defaultDeckHeightIn approximates deck height above road for clearance checks:
@@ -84,6 +91,7 @@ type planStore interface {
 type gableSource interface {
 	ListOrdersForDate(ctx context.Context, date string) ([]gable.Order, error)
 	ListVehicles(ctx context.Context) ([]gable.Vehicle, error)
+	ListLocations(ctx context.Context) ([]gable.Location, error)
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
 	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
 }
@@ -123,10 +131,12 @@ type Config struct {
 	LockMorningAt             string
 	LockAfternoonAt           string
 
-	// DepotLat/DepotLng are this dealer's yard (DEPOT_LAT/DEPOT_LNG). They are
-	// deployment configuration, not a code constant: nil means "not configured",
-	// and a plan then roots at the centroid of its own stops rather than at
-	// somebody else's yard.
+	// DepotLat/DepotLng are this dealer's fallback yard (DEPOT_LAT/DEPOT_LNG).
+	// They are deployment configuration, not a code constant: nil means "not
+	// configured", and a plan then roots at the centroid of its own stops
+	// rather than at somebody else's yard. They are the whole-install answer
+	// and are outranked by the branch the day's orders actually ship from,
+	// which GableLBM knows per order.
 	DepotLat *float64
 	DepotLng *float64
 }
@@ -197,10 +207,39 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		analyses = append(analyses, analyzeOrder(o, byProduct))
 	}
 
-	depotLat, depotLng, depotSource := resolveDepot(req, s.cfg, analyses)
+	// Branch lookup is best effort and deliberately skipped whenever it cannot
+	// change the answer: a request that already named a depot outranks every
+	// yard, and a day whose orders name no yard at all has nothing to look up —
+	// the branch list would be fetched, handed to the ladder and ignored. That
+	// is a round-trip to the ERP per ingest, on exactly the deployments (a
+	// GableLBM predating orders.branch_id) least able to answer it. A GableLBM
+	// that predates /api/integration/locations answers 404 here; that must
+	// degrade to the previous behaviour, not fail every plan for the day.
+	orderBranches := branchIDs(analyses)
+	var branches []gable.Location
+	var branchesErr error
+	if (req.DepotLat == nil || req.DepotLng == nil) && len(orderBranches) > 0 {
+		if branches, branchesErr = s.gable.ListLocations(ctx); branchesErr != nil {
+			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
+				"date", req.Date, "branch_ids", orderBranches, "err", branchesErr)
+			branches = nil
+		}
+	}
+
+	depotLat, depotLng, depotSource, depotNote := resolveDepot(req, s.cfg, analyses, branches)
+	if branchesErr != nil {
+		// The orders DID name a yard — the lookup is not even attempted
+		// otherwise; we simply could not read it. Say that, rather than letting
+		// the note claim the branch was unknown.
+		depotNote = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(depotSource))
+	}
 	if depotSource == DepotSourceNone {
 		slog.Warn("no depot for workflow plan: DEPOT_LAT/DEPOT_LNG are unset and no order on this date has a geolocation to take a centroid from",
 			"date", req.Date, "orders", len(analyses))
+	}
+	if depotNote != "" {
+		slog.Info("workflow plan did not root at an order's branch",
+			"date", req.Date, "depot_source", depotSource, "reason", depotNote)
 	}
 
 	plan := &Plan{
@@ -209,6 +248,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		DepotLat:         depotLat,
 		DepotLng:         depotLng,
 		DepotSource:      depotSource,
+		DepotNote:        depotNote,
 		Orders:           analyses,
 		Loads:            []TruckLoad{},
 		UnassignedOrders: []Stop{},
@@ -219,39 +259,49 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	return plan, nil
 }
 
-// resolveDepot picks a run's routing origin, in strict precedence:
-//
-//  1. the ingest request (this run's explicit override);
-//  2. this install's configured depot (DEPOT_LAT/DEPOT_LNG) — the dealer's yard;
-//  3. the centroid of the day's routable stops.
-//
-// There is deliberately no built-in coordinate: a hardcoded default would root
-// every other dealer's routes at one customer's yard, which silently corrupts
-// sequences, distances, durations and the shift-feasibility check. When nothing
-// at all is available (no depot configured and no geocoded order) it reports
-// DepotSourceNone and (0,0); there are no routable stops in that case, so the
-// origin is unused, but the caller can see and warn about it.
-func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis) (lat, lng float64, source string) {
-	if req.DepotLat != nil && req.DepotLng != nil {
-		return *req.DepotLat, *req.DepotLng, DepotSourceRequest
+// resolveDepot picks a run's routing origin. The ladder itself —
+// REQUEST -> BRANCH -> CONFIG -> CENTROID -> NONE, and every sentence it writes
+// when the branch step declines — lives in internal/depot and is shared with
+// internal/routing. This function's only job is to translate the workflow's
+// vocabulary into the ladder's: which yards the day's orders ship from, and
+// which of those orders can actually be driven to.
+func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis, branches []gable.Location) (lat, lng float64, source, note string) {
+	return depot.Resolve(depot.Input{
+		RequestLat: req.DepotLat,
+		RequestLng: req.DepotLng,
+		BranchIDs:  branchIDs(analyses),
+		Branches:   branches,
+		ConfigLat:  cfg.DepotLat,
+		ConfigLng:  cfg.DepotLng,
+		Stops:      routableStops(analyses),
+	})
+}
+
+// branchIDs lists the yards this run's orders ship from. It only projects the
+// field out of the workflow's own vocabulary; the semantics — first-appearance
+// order, empty ids skipped, duplicates collapsed — live in depot.DistinctBranchIDs
+// and are shared with internal/routing, which asks the same question of raw
+// gable.Orders. Two implementations of this is how the two modules came to
+// disagree about where a run leaves from.
+func branchIDs(analyses []OrderAnalysis) []string {
+	ids := make([]string, 0, len(analyses))
+	for _, a := range analyses {
+		ids = append(ids, a.BranchID)
 	}
-	if cfg.DepotLat != nil && cfg.DepotLng != nil {
-		return *cfg.DepotLat, *cfg.DepotLng, DepotSourceConfig
-	}
-	var sumLat, sumLng float64
-	geoCount := 0
+	return depot.DistinctBranchIDs(ids)
+}
+
+// routableStops is the centroid's input: only orders that can actually be
+// driven to. An ungeocoded order must not drag the origin.
+func routableStops(analyses []OrderAnalysis) []depot.Point {
+	pts := make([]depot.Point, 0, len(analyses))
 	for _, a := range analyses {
 		if !a.Routable {
 			continue
 		}
-		sumLat += *a.Lat
-		sumLng += *a.Lng
-		geoCount++
+		pts = append(pts, depot.Point{Lat: *a.Lat, Lng: *a.Lng})
 	}
-	if geoCount > 0 {
-		return round6(sumLat / float64(geoCount)), round6(sumLng / float64(geoCount)), DepotSourceCentroid
-	}
-	return 0, 0, DepotSourceNone
+	return pts
 }
 
 // analyzeOrder resolves one order's lines against the effective catalog and
@@ -259,6 +309,7 @@ func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis) (lat,
 func analyzeOrder(o gable.Order, byProduct map[string]catalog.EffectiveProduct) OrderAnalysis {
 	a := OrderAnalysis{
 		OrderID:      o.ID,
+		BranchID:     o.BranchID,
 		CustomerName: o.CustomerName,
 		Address:      o.Address,
 		Lat:          o.Latitude,
@@ -1299,6 +1350,3 @@ func toSolverVehicle(p *fleet.Profile) load.Vehicle {
 }
 
 func round2(f float64) float64 { return math.Round(f*100) / 100 }
-
-// round6 keeps a derived coordinate at ~11 cm precision (6 decimal places).
-func round6(f float64) float64 { return math.Round(f*1e6) / 1e6 }

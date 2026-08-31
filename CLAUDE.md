@@ -271,8 +271,15 @@ AI_LM consumes these GableLBM endpoints (all `X-Integration-Key` gated; base URL
 - `GET  /api/integration/vehicles`               → fleet (id, name, type, capacity, make/model/year).
 - `GET  /api/integration/drivers`                → drivers for route write-back.
 - `GET  /api/integration/orders?date=&status=CONFIRMED` → orders + line items
-  (`product_id, sku, quantity, weight_lbs`) and delivery `latitude/longitude` where present.
+  (`product_id, sku, quantity, weight_lbs`), delivery `latitude/longitude` where present,
+  and `branch_id` — the yard the order ships from (`NOT NULL` upstream).
   `date` filters on the order's `scheduled_delivery_date`.
+- `GET  /api/integration/locations`              → the dealer's active branches (yards):
+  `{id, name, address, latitude?, longitude?}`. Coordinates are **nullable** — a branch that
+  has never been geocoded omits them, and must not be read as 0,0. `workflow.Ingest` matches
+  them against the orders' `branch_id` to root a plan at the yard the load leaves from
+  (`depot_source = BRANCH`) ahead of the install-wide `DEPOT_LAT`/`DEPOT_LNG`; a run spanning
+  several branches falls back and records why in `depot_note` rather than picking one.
 - `POST /api/integration/delivery-routes`        → write-back of an approved plan
   (`vehicle_id, driver_id, scheduled_date, stops[]{order_id, sequence, lat, lng}`,
   optional `load_manifest` JSON — the 3D packing manifest that powers GableLBM's

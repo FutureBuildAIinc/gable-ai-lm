@@ -156,7 +156,7 @@ Do not put two dealers' data in one instance.
 
 **ERP portability is a design goal, not a delivered fact.** The intent is that
 any ERP satisfying the integration contract can host AI_LM unchanged, and the
-contract itself is genuinely narrow — six routes. But the seam is not closed
+contract itself is genuinely narrow — seven routes. But the seam is not closed
 yet: GableLBM wire types from `internal/gable` still cross into downstream
 domain code, appearing in roughly ten non-test files across `routing`,
 `workflow`, `catalog`, and `auth`. Swapping the ERP today means editing those
