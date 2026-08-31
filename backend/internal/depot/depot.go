@@ -149,20 +149,8 @@ func resolveFallback(in Input) (lat, lng float64, source string) {
 // or a caller that simply did not supply one) is not an error and gets no note:
 // ok=false, why="".
 func resolveBranch(ids []string, branches []gable.Location) (lat, lng float64, ok bool, why string) {
-	byID := make(map[string]gable.Location, len(branches))
-	for _, b := range branches {
-		byID[b.ID] = b
-	}
-
-	distinct := make([]string, 0, 2)
-	seen := make(map[string]bool, 2)
-	for _, id := range ids {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		distinct = append(distinct, id)
-	}
+	byID := indexBranches(branches)
+	distinct := DistinctBranchIDs(ids)
 
 	switch len(distinct) {
 	case 0:
@@ -170,14 +158,8 @@ func resolveBranch(ids []string, branches []gable.Location) (lat, lng float64, o
 	case 1:
 		// The only case that can succeed; fall through to the checks below.
 	default:
-		labels := make([]string, 0, len(distinct))
-		for _, id := range distinct {
-			labels = append(labels, describeBranch(byID, id))
-		}
-		sort.Strings(labels)
-		return 0, 0, false, fmt.Sprintf(
-			"this run's orders ship from %d different branches (%s), so no single yard is its origin — per-branch plan splitting is not supported yet",
-			len(labels), strings.Join(labels, ", "))
+		return 0, 0, false, SpanningBranchesPhrase(distinct, branches) +
+			", so no single yard is its origin — per-branch plan splitting is not supported yet"
 	}
 
 	id := distinct[0]
@@ -194,6 +176,65 @@ func resolveBranch(ids []string, branches []gable.Location) (lat, lng float64, o
 			describeBranch(byID, id), *b.Latitude, *b.Longitude)
 	}
 	return *b.Latitude, *b.Longitude, true, ""
+}
+
+// DistinctBranchIDs lists the yards a run ships from, in the order they first
+// appear: empty ids contribute nothing, and a repeated id collapses to one.
+//
+// It is exported and lives here because BOTH callers of the ladder have to
+// answer the same question from their own vocabulary — the workflow ingest
+// from its order analyses, the routing endpoint from the raw orders — and two
+// implementations of "which yards is this run leaving from?" is exactly the
+// kind of near-duplicate that let the two modules disagree in the first place.
+// An order with no branch id is not an error: a GableLBM that predates
+// orders.branch_id simply keeps its old, silent behaviour.
+func DistinctBranchIDs(ids []string) []string {
+	distinct := make([]string, 0, 2)
+	seen := make(map[string]bool, 2)
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		distinct = append(distinct, id)
+	}
+	return distinct
+}
+
+// SpanningBranchesPhrase reports, in an operator's words, that a run's orders
+// ship from more than one yard — naming every one of them. It returns "" when
+// they do not: one yard, or none, is not a fact worth a sentence.
+//
+// It is exported because the multi-yard CONDITION outlives the rung that
+// detects it. The ladder itself declines to root a run that spans yards, and
+// completes this phrase with "so no single yard is its origin". But a caller
+// may legitimately root such a run anyway — internal/routing does, when its
+// own caller named the yard explicitly — and rooting it does not make the
+// stops in the other yards go away. That caller completes the sentence
+// differently; this half, the count and the names, must read identically
+// wherever the condition surfaces.
+func SpanningBranchesPhrase(ids []string, branches []gable.Location) string {
+	distinct := DistinctBranchIDs(ids)
+	if len(distinct) < 2 {
+		return ""
+	}
+	byID := indexBranches(branches)
+	labels := make([]string, 0, len(distinct))
+	for _, id := range distinct {
+		labels = append(labels, describeBranch(byID, id))
+	}
+	sort.Strings(labels)
+	return fmt.Sprintf("this run's orders ship from %d different branches (%s)",
+		len(labels), strings.Join(labels, ", "))
+}
+
+// indexBranches keys GableLBM's branch list by id for lookup and labelling.
+func indexBranches(branches []gable.Location) map[string]gable.Location {
+	byID := make(map[string]gable.Location, len(branches))
+	for _, b := range branches {
+		byID[b.ID] = b
+	}
+	return byID
 }
 
 // describeBranch renders a branch for an operator: its name when GableLBM knows

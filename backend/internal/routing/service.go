@@ -109,7 +109,7 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		points = append(points, depot.Point{Lat: *o.Latitude, Lng: *o.Longitude})
 	}
 
-	depotLat, depotLng, depotSource, depotNote := s.resolveDepot(ctx, req, points)
+	depotLat, depotLng, depotSource, depotNote := s.resolveDepot(ctx, req, orders, points)
 	slog.Info("routing plan depot resolved",
 		"date", req.Date, "depot_source", depotSource, "depot_lat", depotLat, "depot_lng", depotLng,
 		"note", depotNote)
@@ -172,8 +172,25 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 // branch id its caller had explicitly handed it — it stored that branch on the
 // plan and then rooted the route somewhere else.
 //
+// Sharing the ladder was not enough, though, because the two callers were still
+// feeding it different questions. Workflow asked "which yards do these ORDERS
+// ship from?"; routing asked only "which yard did the request name?" — so the
+// same orders, planned through the two endpoints with no explicit branch, came
+// out rooted at a yard in one and at the middle of the stops in the other, and
+// the ladder's multi-yard guard could never fire here at all. The set handed in
+// below is therefore derived from the orders, exactly as workflow derives it,
+// through the same helper.
+//
+// req.BranchID keeps its meaning on top of that: it is the caller's own
+// statement of which yard this plan is FOR, so it decides where the route is
+// rooted. What it does not do is settle whether the dispatcher hears about a
+// run whose stops are spread across yards — asking for Dallas does not move the
+// Plano stops, and a plan that quietly routes half a day from the wrong yard is
+// the failure this whole ladder exists to prevent. So an explicit branch
+// overrides the origin and the span is still reported.
+//
 // The branch list is only fetched when it can actually change the answer: an
-// explicit request depot outranks it, and a request naming no branch has
+// explicit request depot outranks it, and a run naming no branch anywhere has
 // nothing to look up. The fetch is best effort — a GableLBM that predates
 // /api/integration/locations answers 404, and that must cost this plan its
 // branch origin, not the plan itself.
@@ -181,18 +198,35 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 // The result is not persisted: route_plans is a column-backed table and adding
 // a depot_source column is a migration. The caller logs it instead, once per
 // plan, so support can still answer "why does this route start there?".
-func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, stops []depot.Point) (lat, lng float64, source, note string) {
-	var wanted []string
-	if req.BranchID != nil && *req.BranchID != "" {
-		wanted = []string{*req.BranchID}
+func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, orders []gable.Order, stops []depot.Point) (lat, lng float64, source, note string) {
+	// The yards this day's orders actually ship from — the same question, asked
+	// through the same helper, as internal/workflow asks of its analyses.
+	orderBranches := depot.DistinctBranchIDs(orderBranchIDs(orders))
+
+	explicit := ""
+	if req.BranchID != nil {
+		explicit = *req.BranchID
 	}
+
+	// An explicit branch is the caller's answer and outranks what the orders
+	// imply; with none, the orders speak for themselves.
+	wanted := orderBranches
+	if explicit != "" {
+		wanted = []string{explicit}
+	}
+
+	// A request depot outranks every branch, so with one there is nothing a
+	// branch lookup could change — including the span sentence below, which is
+	// held to the same rule the workflow ingest applies: an operator who gave
+	// this run its own coordinate has already answered the question.
+	branchRungInPlay := req.DepotLat == nil || req.DepotLng == nil
 
 	var branches []gable.Location
 	var branchesErr error
-	if len(wanted) > 0 && (req.DepotLat == nil || req.DepotLng == nil) {
+	if len(wanted) > 0 && branchRungInPlay {
 		if branches, branchesErr = s.locations.ListLocations(ctx); branchesErr != nil {
 			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
-				"date", req.Date, "branch_id", *req.BranchID, "err", branchesErr)
+				"date", req.Date, "branch_ids", wanted, "err", branchesErr)
 			branches = nil
 		}
 	}
@@ -207,11 +241,42 @@ func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, stops []dep
 		Stops:      stops,
 	})
 	if branchesErr != nil {
-		// The request DID name a yard; we simply could not look it up. Say
-		// that, rather than letting the note claim the branch was unknown.
+		// A yard WAS named; we simply could not look it up. Say that, rather
+		// than letting the note claim the branch was unknown.
 		note = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(source))
 	}
+	if explicit != "" && branchRungInPlay {
+		// The ladder only sees the one yard the request named, so it cannot
+		// notice that the orders disagree. When they do, that fact still has to
+		// reach the note: the plan is rooted where it was asked to be, and the
+		// dispatcher is told which stops that leaves in another yard.
+		if span := depot.SpanningBranchesPhrase(orderBranches, branches); span != "" {
+			note = joinNotes(note, span+", and this plan is rooted at the branch named on the request ("+
+				explicit+"), so the stops belonging to the other yards are routed from there too")
+		}
+	}
 	return lat, lng, source, note
+}
+
+// orderBranchIDs projects the yard off each order. It is the routing module's
+// half of the shared question — the semantics (first appearance, empties
+// skipped, duplicates collapsed) belong to depot.DistinctBranchIDs, so this
+// module cannot drift from workflow's answer again.
+func orderBranchIDs(orders []gable.Order) []string {
+	ids := make([]string, 0, len(orders))
+	for _, o := range orders {
+		ids = append(ids, o.BranchID)
+	}
+	return ids
+}
+
+// joinNotes appends a second sentence to a depot note without inventing a
+// leading separator when the first one is empty.
+func joinNotes(first, second string) string {
+	if first == "" {
+		return second
+	}
+	return first + "; " + second
 }
 
 // Get returns a stored plan by id.

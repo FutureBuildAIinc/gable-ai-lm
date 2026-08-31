@@ -222,7 +222,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	}
 
 	depotLat, depotLng, depotSource, depotNote := resolveDepot(req, s.cfg, analyses, branches)
-	if branchesErr != nil && anyBranchID(analyses) {
+	if branchesErr != nil && len(branchIDs(analyses)) > 0 {
 		// The orders DID name a yard; we simply could not look it up. Say that,
 		// rather than letting the note claim the branch was unknown.
 		depotNote = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depot.FallbackPhrase(depotSource))
@@ -271,17 +271,18 @@ func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis, branc
 	})
 }
 
-// branchIDs lists the yards this run's orders ship from, in the order they
-// first appear. Orders with no branch id contribute nothing, which is how a
-// GableLBM that predates orders.branch_id keeps its old, silent behaviour.
+// branchIDs lists the yards this run's orders ship from. It only projects the
+// field out of the workflow's own vocabulary; the semantics — first-appearance
+// order, empty ids skipped, duplicates collapsed — live in depot.DistinctBranchIDs
+// and are shared with internal/routing, which asks the same question of raw
+// gable.Orders. Two implementations of this is how the two modules came to
+// disagree about where a run leaves from.
 func branchIDs(analyses []OrderAnalysis) []string {
 	ids := make([]string, 0, len(analyses))
 	for _, a := range analyses {
-		if a.BranchID != "" {
-			ids = append(ids, a.BranchID)
-		}
+		ids = append(ids, a.BranchID)
 	}
-	return ids
+	return depot.DistinctBranchIDs(ids)
 }
 
 // routableStops is the centroid's input: only orders that can actually be
@@ -295,17 +296,6 @@ func routableStops(analyses []OrderAnalysis) []depot.Point {
 		pts = append(pts, depot.Point{Lat: *a.Lat, Lng: *a.Lng})
 	}
 	return pts
-}
-
-// anyBranchID reports whether at least one ingested order named a yard, which
-// is what makes a failed branch lookup worth telling the operator about.
-func anyBranchID(analyses []OrderAnalysis) bool {
-	for _, a := range analyses {
-		if a.BranchID != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // analyzeOrder resolves one order's lines against the effective catalog and
