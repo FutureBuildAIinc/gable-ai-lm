@@ -70,6 +70,13 @@ func (h *Handler) HandleUpsertProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile, err := h.svc.UpsertProfile(r.Context(), vehicleID, in)
+	// A rejected profile is the operator's problem to fix, so the field list is
+	// the client's sentence — RespondError sends msg verbatim and keeps the
+	// diagnostic in err.
+	if errors.Is(err, ErrInvalidProfile) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadRequest, err)
+		return
+	}
 	if err != nil {
 		httputil.RespondError(w, r, "failed to save vehicle profile", http.StatusInternalServerError, err)
 		return
