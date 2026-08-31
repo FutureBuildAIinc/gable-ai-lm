@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
+	"github.com/FutureBuildAIinc/gable-ai-lm/pkg/metrics"
 )
 
 // productSource fetches the PIM-canonical catalog (with geometry + weight) from
@@ -17,16 +18,37 @@ type productSource interface {
 	GetProductsWithWeight(ctx context.Context) ([]gable.Product, error)
 }
 
+// dimensionStore is the persistence seam for AI_LM's dimension overrides
+// (satisfied by *Repository). It is declared consumer-side, the same way
+// internal/workflow declares planStore, so this module's own logic — which
+// geometry wins, and which round-trip counts as a catalog pull — can be
+// exercised without a Postgres.
+type dimensionStore interface {
+	List(ctx context.Context) ([]Dimension, error)
+	GetByProductID(ctx context.Context, gableProductID string) (*Dimension, error)
+	Upsert(ctx context.Context, gableProductID string, in DimensionInput) (*Dimension, error)
+}
+
 // Service holds product-dimension business logic.
 type Service struct {
-	repo     *Repository
+	repo     dimensionStore
 	products productSource
+	meter    *metrics.Meter
 }
 
 // NewService wires the dimension repository and the GableLBM product source.
 // products may be nil (overrides-only mode for tests / offline use).
-func NewService(repo *Repository, products productSource) *Service {
+func NewService(repo dimensionStore, products productSource) *Service {
 	return &Service{repo: repo, products: products}
+}
+
+// WithMeter attaches the business-metering counters (pkg/metrics) so a catalog
+// pull lands on /metrics under this deployment's licence labels. cmd/server
+// calls it once at boot; the meter is nil-safe, so a Service built without one
+// meters nothing and behaves exactly as it did before.
+func (s *Service) WithMeter(m *metrics.Meter) *Service {
+	s.meter = m
+	return s
 }
 
 // ListDimensions returns all product dimension records.
@@ -76,6 +98,10 @@ func (s *Service) ListEffectiveProducts(ctx context.Context) ([]EffectiveProduct
 	if err != nil {
 		return nil, fmt.Errorf("fetch PIM products: %w", err)
 	}
+	// Metered here and only here: a pull is an answered round-trip to the ERP's
+	// PIM. The overrides-only path above never reached it, and a failed fetch
+	// returned no catalog — neither is a pull.
+	s.meter.CatalogPulled()
 
 	out := make([]EffectiveProduct, 0, len(products))
 	for _, p := range products {

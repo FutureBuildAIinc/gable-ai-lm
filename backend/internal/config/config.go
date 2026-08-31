@@ -70,6 +70,18 @@ type Config struct {
 	LockMorningAt   string // LOCK_MORNING_AT (default 06:00)
 	LockAfternoonAt string // LOCK_AFTERNOON_AT (default 11:00)
 
+	// Licensing / entitlement seam (internal/license). All three are optional:
+	// with none of them set the deployment reports edition "evaluation", which
+	// is what §1 of the OpenLBM Community Source License grants to everyone for
+	// non-production use. It is NOT a lockout waiting to be switched on.
+	//
+	// A PRESENT token is verified offline and fails closed — see license.Load.
+	// LicensePublicKeys holds the base64 Ed25519 VERIFICATION keys (plural
+	// during a rotation); the signing private key never touches this service.
+	LicenseToken      string // LICENSE_TOKEN — the token itself
+	LicenseFile       string // LICENSE_FILE — path to a mounted token, used when LICENSE_TOKEN is unset
+	LicensePublicKeys string // LICENSE_PUBLIC_KEY — comma/whitespace-separated base64 public keys
+
 	// Logging
 	LogLevel string // DEBUG, INFO, WARN, ERROR (default: INFO)
 
@@ -115,6 +127,10 @@ func Load() (*Config, error) {
 
 		LockMorningAt:   getEnv("LOCK_MORNING_AT", "06:00"),
 		LockAfternoonAt: getEnv("LOCK_AFTERNOON_AT", "11:00"),
+
+		LicenseToken:      getEnv("LICENSE_TOKEN", ""),
+		LicenseFile:       getEnv("LICENSE_FILE", ""),
+		LicensePublicKeys: getEnv("LICENSE_PUBLIC_KEY", ""),
 
 		LogLevel: getEnv("LOG_LEVEL", "INFO"),
 

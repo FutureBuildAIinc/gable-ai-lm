@@ -65,6 +65,7 @@ GableLBM (source of truth)                AI_LM (this service)
 | `workflow` | The guided 5-step dispatch run (Ingest & Analyze → Assign → Pack → Route Review → Manifest & Push). One `Plan` row carries a whole run; each step persists its artifacts so the UI can resume or replay any stage. Also owns run locking, late-adds, priority overrides, and proof/sign-off. |
 | `auth` | Staff login. Delegates the entitlement decision to GableLBM's `validate-staff`, then mints AI_LM's own HMAC session JWT signed with `SESSION_SECRET`. AI_LM never stores credentials. |
 | `ai` | Optional OpenRouter client (OpenAI-compatible) behind the dispatch briefing. Degrades to "unavailable" with no key; never blocks the workflow. |
+| `license` | Entitlement seam. Verifies an offline Ed25519 licence token (`LICENSE_TOKEN`/`LICENSE_FILE`, no network on any path) and reports the edition the OpenLBM Community Source License puts this deployment in. No token ⇒ `evaluation` (§1 Grant), which is the normal, correct default; a present-but-invalid token refuses to boot. **Gates nothing** — `Allow()` is true for every feature — and feeds the `ailm_*` business counters their `edition`/`subject` labels. |
 
 ## 4. The Digital-Twin Pipeline
 
