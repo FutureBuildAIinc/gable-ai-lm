@@ -81,8 +81,14 @@ type Plan struct {
 	// thing — the warning surviving a page reload or a later fetch. Until then
 	// the slog line Service.Plan emits is the durable copy, and it carries the
 	// same two values word for word.
+	// Byte-identical to workflow.Plan's values for the same INPUT (both come
+	// from internal/depot) — not for the same "run": routing accepts a request
+	// branch that workflow has no field for.
 	DepotSource string `json:"depot_source,omitempty"`
 	DepotNote   string `json:"depot_note,omitempty"`
+	// Populated on POST /routing/plan only. Absent on GET /routing/plan/{id} AND
+	// on POST /routing/plan/{id}/approve — both read the plan back from Postgres,
+	// where these columns do not exist.
 
 	Loads            []Load    `json:"loads"`
 	UnassignedStops  []Stop    `json:"unassigned_stops"`

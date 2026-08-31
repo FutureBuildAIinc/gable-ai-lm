@@ -117,11 +117,11 @@ func TestPlanResponseCarriesTheDepotNote(t *testing.T) {
 	}
 }
 
-// TestPlanResponseNoteMatchesTheLoggedNote pins the property that makes the log
+// TestPlanResponseNoteMatchesTheResolverOutput pins the property that makes the log
 // a usable durable copy of a response-only field: support reading the log line
 // and the dispatcher reading the response must be looking at the same sentence,
 // not two paraphrases of one event.
-func TestPlanResponseNoteMatchesTheLoggedNote(t *testing.T) {
+func TestPlanResponseNoteMatchesTheResolverOutput(t *testing.T) {
 	cfg := Config{DepotLat: fptr(austinConfigLat), DepotLng: fptr(austinConfigLng)}
 	req := PlanRequest{Date: "2026-06-26", BranchID: sptr(planoYardID)}
 	orders := shippingFrom(routingOrders(), dallasYardID)
