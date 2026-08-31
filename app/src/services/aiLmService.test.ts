@@ -12,7 +12,7 @@
  * transport's header injection is exercised too.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { aiLmService, type ProfileInput } from './aiLmService.ts';
+import { aiLmService, ApiError, isConflict, type ProfileInput } from './aiLmService.ts';
 import { jsonResponse } from '../test/dom.ts';
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -160,5 +160,42 @@ describe('aiLmService — response handling', () => {
     fetchMock.mockResolvedValue(jsonResponse({ meta: { request_id: 'req-9' } }, 423));
 
     await expect(aiLmService.assignWorkflow('plan-1')).rejects.toThrow('HTTP 423');
+  });
+
+  // The optimistic lock in workflow.Repository returns 409 when a write loses
+  // the race. The page has to tell that apart from every other failure — it is
+  // the one case where the recovery is "reload", not "retry" or "override" —
+  // so the status travels with the error instead of being guessed from wording.
+  it('carries the HTTP status on the thrown error', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        { error: { code: 'conflict', message: 'workflow plan was modified concurrently' } },
+        409,
+      ),
+    );
+
+    await expect(aiLmService.packWorkflow('plan-1')).rejects.toBeInstanceOf(ApiError);
+    await expect(aiLmService.packWorkflow('plan-1')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('identifies a lost optimistic-lock race as a conflict', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: 'conflict', message: 'modified concurrently' } }, 409),
+    );
+
+    const err = await aiLmService.packWorkflow('plan-1').catch((e: unknown) => e);
+    expect(isConflict(err)).toBe(true);
+  });
+
+  it('does not mistake a lock or a server error for a conflict', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: 'locked', message: 'run is locked' } }, 423),
+    );
+    const locked = await aiLmService.packWorkflow('plan-1').catch((e: unknown) => e);
+    expect(isConflict(locked)).toBe(false);
+
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: 'internal', message: 'boom' } }, 500));
+    const boom = await aiLmService.packWorkflow('plan-1').catch((e: unknown) => e);
+    expect(isConflict(boom)).toBe(false);
   });
 });
