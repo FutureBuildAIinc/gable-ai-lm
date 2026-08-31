@@ -41,10 +41,49 @@ type Load struct {
 // back-compat with the 3D/summary code). UnassignedStops are stops that did not
 // fit any available vehicle.
 type Plan struct {
-	ID               string    `json:"id"`
-	PlanDate         string    `json:"plan_date"` // YYYY-MM-DD
-	GableBranchID    *string   `json:"gable_branch_id,omitempty"`
-	GableVehicleID   *string   `json:"gable_vehicle_id,omitempty"`
+	ID             string  `json:"id"`
+	PlanDate       string  `json:"plan_date"` // YYYY-MM-DD
+	GableBranchID  *string `json:"gable_branch_id,omitempty"`
+	GableVehicleID *string `json:"gable_vehicle_id,omitempty"`
+
+	// DepotSource and DepotNote are this plan's routing provenance, produced by
+	// the shared ladder in internal/depot at the moment the origin is resolved.
+	// DepotSource names where the origin came from — REQUEST / BRANCH / CONFIG /
+	// CENTROID / NONE — and always names what actually happened, never what was
+	// asked for. DepotNote is the operator-facing sentence explaining why the
+	// branch rung was declined and where the run was rooted instead; it is empty
+	// when nothing was declined, so a note is always a real warning and never
+	// happy-path noise. Both are byte-identical to the values workflow.Plan
+	// carries for the same run, because both come from the same package.
+	//
+	// They are RESPONSE-ONLY, and that is deliberate rather than an oversight.
+	// route_plans is a column-backed table (migrations/001_ai_lm_core.sql) with
+	// no depot_source or depot_note column, and adding one is a migration. So:
+	//
+	//   - POST /api/v1/routing/plan returns them POPULATED. Service.Plan fills
+	//     them in as it resolves the origin, which is the moment the dispatcher
+	//     is looking at a fresh route and can still act on the warning. That is
+	//     the moment the sentence was written for.
+	//   - GET /api/v1/routing/plan/{id} returns them EMPTY, because
+	//     Repository.Get can only select columns that exist. On a re-read an
+	//     empty DepotNote means "this plan's provenance was never stored" — it
+	//     does NOT mean "no fallback happened". The two are indistinguishable on
+	//     the read path, so nothing downstream may treat an empty note there as
+	//     an all-clear.
+	//
+	// Never fill these in on the read path. A re-resolve would answer today's
+	// question about yesterday's plan (the branch may have been geocoded since,
+	// DEPOT_LAT may have changed), and a fabricated or cached value would be
+	// worse than the empty string: it would look authoritative. An empty string
+	// on GET is the correct answer.
+	//
+	// A migration adding depot_source/depot_note columns would buy exactly one
+	// thing — the warning surviving a page reload or a later fetch. Until then
+	// the slog line Service.Plan emits is the durable copy, and it carries the
+	// same two values word for word.
+	DepotSource string `json:"depot_source,omitempty"`
+	DepotNote   string `json:"depot_note,omitempty"`
+
 	Loads            []Load    `json:"loads"`
 	UnassignedStops  []Stop    `json:"unassigned_stops"`
 	Stops            []Stop    `json:"stops"`

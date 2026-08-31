@@ -147,6 +147,35 @@ Write routes are gated by `middleware.RequireRole("admin","owner","dispatcher","
 `/auth/login` is public (registered as a public path on the auth middleware) — it is
 how a staff session is obtained. Session tokens are HMAC-signed with `SESSION_SECRET`.
 
+### Depot provenance (`depot_source` / `depot_note`)
+
+Both planning surfaces root a run through the one ladder in `internal/depot`
+(REQUEST → BRANCH → CONFIG → CENTROID → NONE) and both report where it landed in
+`depot_source`, plus an operator-facing `depot_note` when the branch rung was possible
+but declined ("your Plano yard has never been geocoded, so this run is rooted at
+Dallas instead"). An empty note on a freshly created plan means nothing was declined —
+notes are warnings, never happy-path noise. The two surfaces differ only in **durability**:
+
+| | `workflow.Plan` | `routing.Plan` |
+|---|---|---|
+| storage | JSONB payload (`workflow_plans`) | **none** — `route_plans` is column-backed |
+| on create (`POST`) | populated | populated |
+| on re-read (`GET`) | populated | **empty** |
+
+`routing`'s fields are response-only on purpose: `route_plans`
+(`migrations/001_ai_lm_core.sql`) has no `depot_source`/`depot_note` column, and adding
+one is a migration. `Service.Plan` therefore puts both values on the `Plan` it returns —
+the moment a dispatcher is looking at a fresh route and can still act on the warning —
+and logs the identical two values via `slog` as the durable copy for support.
+
+The consequence, which is load-bearing: **an empty `depot_note` on `GET
+/api/v1/routing/plan/{id}` means "not stored", not "no fallback happened".** The read
+path must never fill them in — a re-resolve would answer today's question about an old
+plan, and any invented value would read as provenance nobody recorded. A migration
+adding the two columns is the only thing that buys the warning surviving a page reload;
+it would change `Repository.Save`/`Get`, `Plan.DepotSource`'s comment, and
+`TestGetOfAStoredPlanHasNoDepotNote` together.
+
 ## Digital-Twin Geometry Resolution
 
 The Load Builder renders each product as a scaled box (a **digital twin**) against the
@@ -280,6 +309,8 @@ AI_LM consumes these GableLBM endpoints (all `X-Integration-Key` gated; base URL
   them against the orders' `branch_id` to root a plan at the yard the load leaves from
   (`depot_source = BRANCH`) ahead of the install-wide `DEPOT_LAT`/`DEPOT_LNG`; a run spanning
   several branches falls back and records why in `depot_note` rather than picking one.
+  `routing.Plan` roots the same way through the same ladder (`internal/depot`) — see
+  **Depot provenance** below for where the note is and is not readable.
 - `POST /api/integration/delivery-routes`        → write-back of an approved plan
   (`vehicle_id, driver_id, scheduled_date, stops[]{order_id, sequence, lat, lng}`,
   optional `load_manifest` JSON — the 3D packing manifest that powers GableLBM's
