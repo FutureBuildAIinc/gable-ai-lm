@@ -174,10 +174,13 @@ func main() {
 			DepotLng:                  cfg.DepotLng,
 		})
 	workflow.NewHandler(workflowSvc).RegisterRoutes(mux, writeGuard)
+	// DEPOT_LAT/DEPOT_LNG are the install-wide fallback. A plan prefers the
+	// GableLBM branch its orders actually ship from, so this is what it lands
+	// on when a run spans several yards or the branch has no coordinates.
 	if cfg.DepotLat != nil && cfg.DepotLng != nil {
-		logger.Info("Workflow depot configured", "lat", *cfg.DepotLat, "lng", *cfg.DepotLng)
+		logger.Info("Workflow fallback depot configured", "lat", *cfg.DepotLat, "lng", *cfg.DepotLng)
 	} else {
-		logger.Warn("DEPOT_LAT/DEPOT_LNG not set — workflow plans root at the centroid of each day's stops (set them to this yard's coordinates)")
+		logger.Warn("DEPOT_LAT/DEPOT_LNG not set — a plan that cannot root at its orders' GableLBM branch falls back to the centroid of that day's stops (set them to this yard's coordinates)")
 	}
 
 	// Health — liveness.

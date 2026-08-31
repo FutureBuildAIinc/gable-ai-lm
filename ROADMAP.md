@@ -117,7 +117,7 @@ Roughly two paths, and they are genuinely different products:
 ### What it is
 
 The integration adapter is genuinely well built: `backend/internal/gable/client.go`
-holds all six routes, the `X-Integration-Key` header, the bare-JSON-array
+holds all seven routes, the `X-Integration-Key` header, the bare-JSON-array
 decoding and one `do()` helper. The problem is on the other side of it. The
 structs that adapter decodes into are the same structs the rest of the system is
 written against.

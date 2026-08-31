@@ -39,6 +39,7 @@ GableLBM (source of truth)                AI_LM (this service)
   GET  /api/integration/vehicles  ─────▶  internal/fleet      axle/bed profiles by gable id
   GET  /api/integration/drivers   ─────▶  internal/routing    driver assignment
   GET  /api/integration/orders    ─────▶  internal/catalog    product dims; weight from LBM
+  GET  /api/integration/locations ─────▶  internal/workflow   branch depot for a run
   POST /api/integration/          ─────▶  internal/auth      staff entitlement check
        validate-staff                     internal/load       3D placement + axle/GVW solver
   POST /api/integration/             ◀──  internal/workflow   guided 5-step dispatch run

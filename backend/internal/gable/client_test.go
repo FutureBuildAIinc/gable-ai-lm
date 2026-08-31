@@ -57,6 +57,11 @@ func integrationMux(t *testing.T, seen *[]recordedRequest) *http.ServeMux {
 	mux.HandleFunc("GET /api/integration/vehicles", func(w http.ResponseWriter, r *http.Request) {
 		record(w, r, http.StatusOK, `[{"id":"v1","name":"Flatbed 1","vehicle_type":"FLATBED","capacity_weight_lbs":20000}]`)
 	})
+	mux.HandleFunc("GET /api/integration/locations", func(w http.ResponseWriter, r *http.Request) {
+		// One geocoded yard and one that has never been geocoded — GableLBM
+		// omits the coordinate keys entirely for the latter.
+		record(w, r, http.StatusOK, `[{"id":"loc1","name":"Kelowna Yard","address":"2450 Enterprise Way, Kelowna, BC V1X 7K2","latitude":49.8879,"longitude":-119.496},{"id":"loc2","name":"Vernon Yard","address":"115 Kalamalka Rd, Vernon, BC V1T 6V1"}]`)
+	})
 	mux.HandleFunc("GET /api/integration/drivers", func(w http.ResponseWriter, r *http.Request) {
 		record(w, r, http.StatusOK, `[{"id":"d1","name":"Sam","status":"ACTIVE"}]`)
 	})
@@ -64,7 +69,7 @@ func integrationMux(t *testing.T, seen *[]recordedRequest) *http.ServeMux {
 		record(w, r, http.StatusOK, `[{"id":"p1","sku":"2x4","name":"2x4x8","weight_lbs":9,"length_in":null,"width_in":null,"height_in":null,"stackable":null}]`)
 	})
 	mux.HandleFunc("GET /api/integration/orders", func(w http.ResponseWriter, r *http.Request) {
-		record(w, r, http.StatusOK, `[{"id":"o1","status":"CONFIRMED","lines":[]}]`)
+		record(w, r, http.StatusOK, `[{"id":"o1","status":"CONFIRMED","branch_id":"loc1","lines":[]}]`)
 	})
 	mux.HandleFunc("POST /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
 		record(w, r, http.StatusCreated, "")
@@ -194,6 +199,63 @@ func TestNullableProductGeometrySurvivesTheWire(t *testing.T) {
 	}
 	if p.WeightLbs != 9 {
 		t.Errorf("weight = %v, want 9", p.WeightLbs)
+	}
+}
+
+// TestNullableBranchGeometrySurvivesTheWire is the Location twin of the product
+// test above, and it guards the decision Phase 1 depot resolution rests on: a
+// branch GableLBM has never geocoded arrives with its coordinate keys ABSENT,
+// and absent must decode to nil — not to 0,0. Rooting a dealer's whole day at
+// (0,0) would be worse than having no depot at all, because it looks like a
+// real answer.
+func TestNullableBranchGeometrySurvivesTheWire(t *testing.T) {
+	var seen []recordedRequest
+	srv := httptest.NewServer(integrationMux(t, &seen))
+	defer srv.Close()
+
+	locs, err := NewClient(srv.URL, "k").ListLocations(context.Background())
+	if err != nil {
+		t.Fatalf("ListLocations: %v", err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("expected 2 locations, got %d", len(locs))
+	}
+	if locs[0].Latitude == nil || locs[0].Longitude == nil {
+		t.Fatalf("geocoded yard lost its coordinates: %+v", locs[0])
+	}
+	if *locs[0].Latitude != 49.8879 || *locs[0].Longitude != -119.496 {
+		t.Errorf("geocoded yard = (%v, %v), want (49.8879, -119.496)", *locs[0].Latitude, *locs[0].Longitude)
+	}
+	if locs[1].Latitude != nil || locs[1].Longitude != nil {
+		t.Errorf("an ungeocoded yard decoded to a coordinate (%v, %v) — a route would be rooted at a place that was never resolved",
+			locs[1].Latitude, locs[1].Longitude)
+	}
+	if locs[1].Name != "Vernon Yard" || locs[1].Address == "" {
+		t.Errorf("ungeocoded yard lost its identity: %+v", locs[1])
+	}
+
+	got := seen[len(seen)-1]
+	if got.Method != http.MethodGet || got.Path != "/api/integration/locations" {
+		t.Errorf("called %s %s, want GET /api/integration/locations", got.Method, got.Path)
+	}
+	if got.Key != "k" {
+		t.Errorf("X-Integration-Key = %q, want the configured key", got.Key)
+	}
+}
+
+// TestOrderCarriesItsBranch pins that the yard an order ships from survives the
+// wire; without it the branch depot silently degrades to the old global one.
+func TestOrderCarriesItsBranch(t *testing.T) {
+	var seen []recordedRequest
+	srv := httptest.NewServer(integrationMux(t, &seen))
+	defer srv.Close()
+
+	orders, err := NewClient(srv.URL, "k").ListOrdersForDate(context.Background(), "2026-06-26")
+	if err != nil {
+		t.Fatalf("ListOrdersForDate: %v", err)
+	}
+	if len(orders) != 1 || orders[0].BranchID != "loc1" {
+		t.Fatalf("order branch = %+v, want branch_id loc1", orders)
 	}
 }
 

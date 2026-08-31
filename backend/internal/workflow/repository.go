@@ -37,6 +37,7 @@ type payload struct {
 	DepotLat         float64         `json:"depot_lat"`
 	DepotLng         float64         `json:"depot_lng"`
 	DepotSource      string          `json:"depot_source,omitempty"`
+	DepotNote        string          `json:"depot_note,omitempty"`
 	Orders           []OrderAnalysis `json:"orders"`
 	Loads            []TruckLoad     `json:"loads"`
 	UnassignedOrders []Stop          `json:"unassigned_orders"`
@@ -49,6 +50,7 @@ func (r *Repository) marshalPayload(p *Plan) ([]byte, error) {
 		DepotLat:         p.DepotLat,
 		DepotLng:         p.DepotLng,
 		DepotSource:      p.DepotSource,
+		DepotNote:        p.DepotNote,
 		Orders:           p.Orders,
 		Loads:            p.Loads,
 		UnassignedOrders: p.UnassignedOrders,
@@ -65,6 +67,7 @@ func (r *Repository) unmarshalPayload(raw []byte, p *Plan) error {
 	p.DepotLat = pl.DepotLat
 	p.DepotLng = pl.DepotLng
 	p.DepotSource = pl.DepotSource
+	p.DepotNote = pl.DepotNote
 	p.Orders = pl.Orders
 	p.Loads = pl.Loads
 	p.UnassignedOrders = pl.UnassignedOrders

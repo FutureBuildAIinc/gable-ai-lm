@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 // where a run's routing origin came from.
 const (
 	DepotSourceRequest  = "REQUEST"  // supplied on the ingest request
+	DepotSourceBranch   = "BRANCH"   // the GableLBM yard every order on this run ships from
 	DepotSourceConfig   = "CONFIG"   // this install's DEPOT_LAT/DEPOT_LNG
 	DepotSourceCentroid = "CENTROID" // centroid of the day's routable stops
 	DepotSourceNone     = "NONE"     // nothing to root on (no geocoded orders)
@@ -84,6 +86,7 @@ type planStore interface {
 type gableSource interface {
 	ListOrdersForDate(ctx context.Context, date string) ([]gable.Order, error)
 	ListVehicles(ctx context.Context) ([]gable.Vehicle, error)
+	ListLocations(ctx context.Context) ([]gable.Location, error)
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
 	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
 }
@@ -123,10 +126,12 @@ type Config struct {
 	LockMorningAt             string
 	LockAfternoonAt           string
 
-	// DepotLat/DepotLng are this dealer's yard (DEPOT_LAT/DEPOT_LNG). They are
-	// deployment configuration, not a code constant: nil means "not configured",
-	// and a plan then roots at the centroid of its own stops rather than at
-	// somebody else's yard.
+	// DepotLat/DepotLng are this dealer's fallback yard (DEPOT_LAT/DEPOT_LNG).
+	// They are deployment configuration, not a code constant: nil means "not
+	// configured", and a plan then roots at the centroid of its own stops
+	// rather than at somebody else's yard. They are the whole-install answer
+	// and are outranked by the branch the day's orders actually ship from,
+	// which GableLBM knows per order.
 	DepotLat *float64
 	DepotLng *float64
 }
@@ -197,10 +202,33 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		analyses = append(analyses, analyzeOrder(o, byProduct))
 	}
 
-	depotLat, depotLng, depotSource := resolveDepot(req, s.cfg, analyses)
+	// Branch lookup is best effort and deliberately skipped when the request
+	// already named a depot (nothing could outrank it anyway). A GableLBM that
+	// predates /api/integration/locations answers 404 here; that must degrade
+	// to the previous behaviour, not fail every plan for the day.
+	var branches []gable.Location
+	var branchesErr error
+	if req.DepotLat == nil || req.DepotLng == nil {
+		if branches, branchesErr = s.gable.ListLocations(ctx); branchesErr != nil {
+			slog.Warn("could not list GableLBM branches; falling back down the depot chain",
+				"date", req.Date, "err", branchesErr)
+			branches = nil
+		}
+	}
+
+	depotLat, depotLng, depotSource, depotNote := resolveDepot(req, s.cfg, analyses, branches)
+	if branchesErr != nil && anyBranchID(analyses) {
+		// The orders DID name a yard; we simply could not look it up. Say that,
+		// rather than letting the note claim the branch was unknown.
+		depotNote = fmt.Sprintf("could not read GableLBM's branches (%v); %s", branchesErr, depotFallbackPhrase(depotSource))
+	}
 	if depotSource == DepotSourceNone {
 		slog.Warn("no depot for workflow plan: DEPOT_LAT/DEPOT_LNG are unset and no order on this date has a geolocation to take a centroid from",
 			"date", req.Date, "orders", len(analyses))
+	}
+	if depotNote != "" {
+		slog.Info("workflow plan did not root at an order's branch",
+			"date", req.Date, "depot_source", depotSource, "reason", depotNote)
 	}
 
 	plan := &Plan{
@@ -209,6 +237,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		DepotLat:         depotLat,
 		DepotLng:         depotLng,
 		DepotSource:      depotSource,
+		DepotNote:        depotNote,
 		Orders:           analyses,
 		Loads:            []TruckLoad{},
 		UnassignedOrders: []Stop{},
@@ -222,8 +251,11 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 // resolveDepot picks a run's routing origin, in strict precedence:
 //
 //  1. the ingest request (this run's explicit override);
-//  2. this install's configured depot (DEPOT_LAT/DEPOT_LNG) — the dealer's yard;
-//  3. the centroid of the day's routable stops.
+//  2. the GableLBM branch every order on this run ships from — the yard the
+//     load actually leaves from, which the ERP knows per order;
+//  3. this install's configured depot (DEPOT_LAT/DEPOT_LNG) — one yard for the
+//     whole install, which is wrong for a dealer that ships from several;
+//  4. the centroid of the day's routable stops.
 //
 // There is deliberately no built-in coordinate: a hardcoded default would root
 // every other dealer's routes at one customer's yard, which silently corrupts
@@ -231,10 +263,29 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 // at all is available (no depot configured and no geocoded order) it reports
 // DepotSourceNone and (0,0); there are no routable stops in that case, so the
 // origin is unused, but the caller can see and warn about it.
-func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis) (lat, lng float64, source string) {
+//
+// note is non-empty only when the branch step was possible but declined, and it
+// says why in a sentence an operator can act on. The returned source always
+// names what actually happened — support reads it to find where a route was
+// rooted, so it must never flatter the result.
+func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis, branches []gable.Location) (lat, lng float64, source, note string) {
 	if req.DepotLat != nil && req.DepotLng != nil {
-		return *req.DepotLat, *req.DepotLng, DepotSourceRequest
+		return *req.DepotLat, *req.DepotLng, DepotSourceRequest, ""
 	}
+	bLat, bLng, ok, why := resolveBranchDepot(analyses, branches)
+	if ok {
+		return bLat, bLng, DepotSourceBranch, ""
+	}
+	lat, lng, source = resolveFallbackDepot(cfg, analyses)
+	if why != "" {
+		note = why + "; " + depotFallbackPhrase(source)
+	}
+	return lat, lng, source, note
+}
+
+// resolveFallbackDepot is the pre-branch chain, unchanged: configured yard,
+// then the centroid of the day's routable stops, then nothing.
+func resolveFallbackDepot(cfg Config, analyses []OrderAnalysis) (lat, lng float64, source string) {
 	if cfg.DepotLat != nil && cfg.DepotLng != nil {
 		return *cfg.DepotLat, *cfg.DepotLng, DepotSourceConfig
 	}
@@ -254,11 +305,116 @@ func resolveDepot(req IngestRequest, cfg Config, analyses []OrderAnalysis) (lat,
 	return 0, 0, DepotSourceNone
 }
 
+// resolveBranchDepot answers "do all of this run's orders leave from one yard,
+// and do we know where that yard is?".
+//
+// ok is true only when the answer is unambiguous. Every other outcome returns
+// ok=false with a reason, because the alternative — picking one yard out of
+// several, or rooting at a null coordinate read as 0,0 — produces a plan that
+// looks right and is wrong. Splitting a run per branch is Phase 2; until then
+// the honest move is to fall back and say so.
+//
+// A run whose orders carry no branch id at all (a GableLBM that predates
+// orders.branch_id) is not an error and gets no note: ok=false, why="".
+func resolveBranchDepot(analyses []OrderAnalysis, branches []gable.Location) (lat, lng float64, ok bool, why string) {
+	byID := make(map[string]gable.Location, len(branches))
+	for _, b := range branches {
+		byID[b.ID] = b
+	}
+
+	ids := make([]string, 0, 2)
+	seen := make(map[string]bool, 2)
+	for _, a := range analyses {
+		if a.BranchID == "" || seen[a.BranchID] {
+			continue
+		}
+		seen[a.BranchID] = true
+		ids = append(ids, a.BranchID)
+	}
+
+	switch len(ids) {
+	case 0:
+		return 0, 0, false, ""
+	case 1:
+		// The only case that can succeed; fall through to the checks below.
+	default:
+		labels := make([]string, 0, len(ids))
+		for _, id := range ids {
+			labels = append(labels, describeBranch(byID, id))
+		}
+		sort.Strings(labels)
+		return 0, 0, false, fmt.Sprintf(
+			"this run's orders ship from %d different branches (%s), so no single yard is its origin — per-branch plan splitting is not supported yet",
+			len(labels), strings.Join(labels, ", "))
+	}
+
+	id := ids[0]
+	b, found := byID[id]
+	if !found {
+		// Inactive or otherwise absent from GableLBM's branch list.
+		return 0, 0, false, fmt.Sprintf("branch %s is not in GableLBM's active branch list", id)
+	}
+	if b.Latitude == nil || b.Longitude == nil {
+		return 0, 0, false, fmt.Sprintf("branch %s has no coordinates in GableLBM — it has never been geocoded", describeBranch(byID, id))
+	}
+	if !validDepotCoords(*b.Latitude, *b.Longitude) {
+		return 0, 0, false, fmt.Sprintf("branch %s has out-of-range coordinates (%v, %v) in GableLBM",
+			describeBranch(byID, id), *b.Latitude, *b.Longitude)
+	}
+	return *b.Latitude, *b.Longitude, true, ""
+}
+
+// describeBranch renders a branch for an operator: its name when GableLBM knows
+// it, and always its id, because the id is what support can search on.
+func describeBranch(byID map[string]gable.Location, id string) string {
+	if b, ok := byID[id]; ok && b.Name != "" {
+		return fmt.Sprintf("%q (%s)", b.Name, id)
+	}
+	return id
+}
+
+// depotFallbackPhrase completes a note by naming where the run was rooted once
+// the branch step declined.
+func depotFallbackPhrase(source string) string {
+	switch source {
+	case DepotSourceConfig:
+		return "rooted at this install's configured depot (DEPOT_LAT/DEPOT_LNG) instead"
+	case DepotSourceCentroid:
+		return "rooted at the centroid of the day's stops instead"
+	default:
+		return "there is nothing else to root on either: no depot is configured and no order on this date is geocoded"
+	}
+}
+
+// validDepotCoords applies the same range rule the boot-time depot ladder
+// applies (see internal/config.loadDepot). A branch coordinate arrives as DATA
+// over the wire rather than as deployment configuration, so a bad one cannot be
+// a boot failure — but it must not be treated more loosely either: it is
+// refused and recorded, never half-applied and never silently taken as 0,0.
+func validDepotCoords(lat, lng float64) bool {
+	if math.IsNaN(lat) || math.IsNaN(lng) || math.IsInf(lat, 0) || math.IsInf(lng, 0) {
+		return false
+	}
+	return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
+}
+
+// anyBranchID reports whether at least one ingested order named a yard, which
+// is what makes a failed branch lookup worth telling the operator about.
+func anyBranchID(analyses []OrderAnalysis) bool {
+	for _, a := range analyses {
+		if a.BranchID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // analyzeOrder resolves one order's lines against the effective catalog and
 // derives weight/volume/shape metrics.
 func analyzeOrder(o gable.Order, byProduct map[string]catalog.EffectiveProduct) OrderAnalysis {
 	a := OrderAnalysis{
 		OrderID:      o.ID,
+		BranchID:     o.BranchID,
 		CustomerName: o.CustomerName,
 		Address:      o.Address,
 		Lat:          o.Latitude,

@@ -41,7 +41,8 @@ client is `internal/gable.Client`; config resolution is in `internal/config/conf
 | `GET` | `/api/integration/products` | `gable.Client.GetProductsWithWeight` | Catalog pull — weight **+ 3D geometry** |
 | `GET` | `/api/integration/vehicles` | `internal/fleet` | Fleet → axle/bed profiles keyed by gable id |
 | `GET` | `/api/integration/drivers` | `internal/routing` | Driver assignment for route write-back |
-| `GET` | `/api/integration/orders` | `internal/catalog` / routing | Orders + line items + delivery geo |
+| `GET` | `/api/integration/orders` | `internal/catalog` / routing | Orders + line items + delivery geo + `branch_id` |
+| `GET` | `/api/integration/locations` | `internal/workflow` (depot) | Dealer branches (yards) + nullable coordinates |
 | `POST` | `/api/integration/delivery-routes` | `internal/routing` (approve) | Write-back of an approved route plan |
 | `POST` | `/api/integration/validate-staff` | `gable.Client.ValidateStaff` | Staff login entitlement check (pillar 4) |
 
@@ -108,6 +109,24 @@ where present. Drives the daily-order routing optimizer. *(Note: order lines car
 not per-line geometry today — building a load straight from an order still needs a catalog
 join; see the roadmap in `CLAUDE.md`.)*
 
+### `GET /api/integration/locations` — the dealer's yards
+
+The dealer's active branches: `{id, name, address, latitude?, longitude?}`, a bare array
+ordered by name. `latitude`/`longitude` are **nullable and omitted when absent** — a branch
+GableLBM has never geocoded must stay distinguishable from one at 0,0, because rooting a
+whole day's routes at (0,0) looks like an answer and is not one.
+
+This is what lets a plan root at the yard its load actually leaves from. `workflow.Ingest`
+takes the distinct `branch_id` of the day's orders and, when they all ship from one branch
+that has coordinates, uses it (`depot_source = BRANCH`) in preference to the install-wide
+`DEPOT_LAT`/`DEPOT_LNG`. When the orders span several branches, when the branch has no
+coordinates, or when this endpoint cannot be reached, the plan falls back down the chain
+(`CONFIG` → `CENTROID` → `NONE`) and records the reason in `depot_note`. It never picks one
+yard out of several: splitting a run per branch is a later phase.
+
+The lookup is best effort — an older GableLBM without this route answers 404, which costs
+the run its branch depot but not its plan.
+
 ### `POST /api/integration/delivery-routes` — write-back
 
 AI_LM posts an approved plan back:
@@ -141,10 +160,10 @@ is documented here only to complete the picture. Full route table is in `CLAUDE.
 
 ## Replacing the backend
 
-The **six** consumed routes above — four reads, the `validate-staff` check, and the
+The **seven** consumed routes above — five reads, the `validate-staff` check, and the
 delivery-routes write-back — are the entire dependency AI_LM has on GableLBM. Any ERP that
 satisfies this contract (same paths, same `X-Integration-Key` auth, same
-product/vehicle/driver/order shapes, accepting the route write-back, and answering
+product/vehicle/driver/order/location shapes, accepting the route write-back, and answering
 `validate-staff`) is *intended* to host AI_LM unchanged. That is the deliberate licensing
 seam.
 

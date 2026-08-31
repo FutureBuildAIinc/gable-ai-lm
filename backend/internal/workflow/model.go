@@ -77,7 +77,11 @@ type DimOverride struct {
 
 // OrderAnalysis is the deep analysis of one ingested order.
 type OrderAnalysis struct {
-	OrderID         string         `json:"order_id"`
+	OrderID string `json:"order_id"`
+	// BranchID is the GableLBM yard this order ships from. It is carried onto
+	// the analysis so depot resolution can ask "do all of today's orders leave
+	// from one yard?" without re-fetching the orders.
+	BranchID        string         `json:"branch_id,omitempty"`
 	CustomerName    string         `json:"customer_name,omitempty"`
 	Address         string         `json:"address,omitempty"`
 	Lat             *float64       `json:"lat,omitempty"`
@@ -242,9 +246,15 @@ type Plan struct {
 	Version  int     `json:"version"`
 	DepotLat float64 `json:"depot_lat"`
 	DepotLng float64 `json:"depot_lng"`
-	// DepotSource records where the routing origin came from: REQUEST / CONFIG /
-	// CENTROID / NONE.
-	DepotSource      string          `json:"depot_source,omitempty"`
+	// DepotSource records where the routing origin came from: REQUEST / BRANCH /
+	// CONFIG / CENTROID / NONE. Support reads it to see where a route was
+	// rooted, so it must always name what actually happened.
+	DepotSource string `json:"depot_source,omitempty"`
+	// DepotNote explains, in a sentence an operator can act on, why the branch
+	// of an order was NOT used as the origin — orders spanning several yards,
+	// a yard that has never been geocoded, an unknown branch id, or GableLBM
+	// being unable to answer. Empty when there is nothing to explain.
+	DepotNote        string          `json:"depot_note,omitempty"`
 	Orders           []OrderAnalysis `json:"orders"`
 	Loads            []TruckLoad     `json:"loads"`
 	UnassignedOrders []Stop          `json:"unassigned_orders"`

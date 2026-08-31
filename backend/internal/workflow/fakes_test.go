@@ -154,9 +154,14 @@ func (s errPlanStore) GetLatestForDate(ctx context.Context, d string) (*Plan, er
 // fakeGable is the GableLBM integration double. pushed records every route
 // written back so a test can assert what actually reached the dispatch board.
 type fakeGable struct {
-	orders   []gable.Order
-	vehicles []gable.Vehicle
-	drivers  []gable.Driver
+	orders    []gable.Order
+	vehicles  []gable.Vehicle
+	drivers   []gable.Driver
+	locations []gable.Location
+
+	// locErr simulates a GableLBM that cannot answer the branch lookup —
+	// including one that predates /api/integration/locations entirely.
+	locErr error
 
 	pushed  []gable.DeliveryRoute
 	pushErr error
@@ -166,7 +171,13 @@ func (f *fakeGable) ListOrdersForDate(context.Context, string) ([]gable.Order, e
 	return f.orders, nil
 }
 func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) { return f.vehicles, nil }
-func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error)   { return f.drivers, nil }
+func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
+	if f.locErr != nil {
+		return nil, f.locErr
+	}
+	return f.locations, nil
+}
+func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { return f.drivers, nil }
 func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
 	if f.pushErr != nil {
 		return f.pushErr
