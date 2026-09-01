@@ -154,6 +154,51 @@ recall: there is nothing left upstream to withdraw, so no `recall` call is made.
 would leave every gate keyed on `live_routes` — including the re-ingest gate — reading a
 ledger that no longer mirrors the board.
 
+Three properties of that correction are load-bearing, and each of them was a live defect:
+
+- **It is keyed on every truck the plan CLAIMS, not the trucks the current attempt WROTE.**
+  A resume skips the trucks already on the board byte for byte, so a correction that one
+  attempt failed to pay is invisible to every later attempt that keys on its own writes.
+  Nothing revisits it: that is a permanent double claim, not a window.
+- **It runs on the partial-push exit too.** The trucks written before GableLBM went away
+  have already deleted another plan's route upstream. Returning first left that plan
+  claiming a route the board no longer held — and since `recall` is keyed
+  `(vehicle_id, scheduled_date)` and not on a stored `route_id`, that stale claim later
+  cancels *somebody else's live route*.
+- **A correction that is abandoned makes the push give up its own claim.** When another
+  plan's row cannot be written (a version conflict that will not clear), the pushing plan
+  retracts its `live_routes` entry for that truck rather than assert a claim it failed to
+  make exclusive. The truck keeps its `pushed_at`/digest ack, so the next resume sees no
+  live claim, re-sends the route and tries the correction again.
+
+**The ledger write is version-checked, and a lost race must not discard it.** `Push` reads
+the plan, crosses several ERP round-trips, and only then saves. Any concurrent write to the
+same plan — lock, unlock, proof, sign-off, priority, dimensions, resequence, assign, pack —
+bumps `version`, and returning that `409` straight to the caller used to throw away the
+ledger naming routes that were **already on the dealer's board**: an orphan reached with no
+ERP failure and no second plan involved. A conflict now re-reads and re-states the same
+outcome on fresh state. Two boundaries on that replay:
+
+- The **ledger** is replayed unconditionally — it records what upstream holds, which is true
+  whatever else happened to the plan. The **transition** is not: it is a decision taken
+  against gates this push evaluated, so a plan whose status somebody else has changed (a
+  re-pack that invalidated the review) keeps their status and the push still answers `409`.
+- A conflict that will not clear at all is the one case where the board cannot be recorded.
+  The routes *this attempt* wrote are then **withdrawn** via `recall`, so the dealer is never
+  left holding a route no ledger names. Trucks whose claim the push handed to another plan
+  are excluded: another live ledger names those, and recalling one would cancel a route that
+  plan relies on.
+
+> **Boundary of the invariant.** "No truck claimed by two plans, and no live route upstream
+> that no ledger names" holds **within `internal/workflow`**, and **not across the
+> `internal/routing` module**. `routing.Service.ApprovePlan`
+> (`internal/routing/service.go:352`) posts to this same endpoint with **no `live_routes`
+> write of any kind**, so routes it puts on the dealer's board are invisible to
+> `gateSupersede`, to `clearDisplacedClaims` and to every recall path — all of which read
+> workflow plans. Whether `routing` should share the workflow ledger or have its approve
+> path superseded is an open design question, deliberately not answered here. This harm
+> class is **not** closed ecosystem-wide.
+
 ### `POST /api/integration/delivery-routes/recall` — withdraw
 
 The inverse of the write-back, and the reason a dispatch board can no longer outlive the
