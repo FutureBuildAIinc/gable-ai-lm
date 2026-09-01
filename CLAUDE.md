@@ -132,7 +132,6 @@ GableLBM (source of truth)            AI_LM
 | GET    | `/load/{id}`                            | load |
 | POST   | `/routing/plan`                         | routing |
 | GET    | `/routing/plan/{id}`                    | routing |
-| POST   | `/routing/plan/{id}/approve`            | routing (write-back) |
 | POST   | `/compliance/check-route`               | compliance |
 | GET/POST | `/compliance/restricted-points`       | compliance |
 | PUT    | `/compliance/restricted-points/{id}`    | compliance |

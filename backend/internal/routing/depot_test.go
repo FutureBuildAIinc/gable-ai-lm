@@ -88,8 +88,6 @@ func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
 	return f.locations, nil
 }
 
-func (f *fakeGable) PushDeliveryRoute(context.Context, gable.DeliveryRoute) error { return nil }
-
 // fakeStore stands in for *Repository so planning can be exercised with no
 // Postgres.
 type fakeStore struct{ saved *Plan }
@@ -127,7 +125,7 @@ func planWith(t *testing.T, g *fakeGable, cfg Config, req PlanRequest) (*Plan, *
 	active = rec
 	t.Cleanup(func() { active = prev })
 
-	svc := NewService(&fakeStore{}, g, g, g, g, g, cfg)
+	svc := NewService(&fakeStore{}, g, g, g, g, cfg)
 	plan, err := svc.Plan(context.Background(), req)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
@@ -277,7 +275,7 @@ func resolveWith(t *testing.T, g *fakeGable, cfg Config, req PlanRequest) (lat, 
 			pts = append(pts, depot.Point{Lat: *o.Latitude, Lng: *o.Longitude})
 		}
 	}
-	svc := NewService(&fakeStore{}, g, g, g, g, g, cfg)
+	svc := NewService(&fakeStore{}, g, g, g, g, cfg)
 	return svc.resolveDepot(ctx, req, orders, pts)
 }
 

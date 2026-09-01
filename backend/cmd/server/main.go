@@ -201,7 +201,7 @@ func main() {
 	// configured depot for the same reason the workflow is: both root their
 	// runs through the one ladder in internal/depot, and an unwired dependency
 	// there is a nil panic on the first plan that names a branch.
-	routingSvc := routing.NewService(routing.NewRepository(db), gableClient, gableClient, gableClient, gableClient, gableClient,
+	routingSvc := routing.NewService(routing.NewRepository(db), gableClient, gableClient, gableClient, gableClient,
 		routing.Config{DepotLat: cfg.DepotLat, DepotLng: cfg.DepotLng})
 	routing.NewHandler(routingSvc).RegisterRoutes(mux, writeGuard)
 

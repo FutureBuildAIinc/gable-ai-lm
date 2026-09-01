@@ -44,7 +44,7 @@ client is `internal/gable.Client`; config resolution is in `internal/config/conf
 | `GET` | `/api/integration/drivers` | `internal/routing` | Driver assignment for route write-back |
 | `GET` | `/api/integration/orders` | `internal/catalog` / routing | Orders + line items + delivery geo + `branch_id` |
 | `GET` | `/api/integration/locations` | `internal/workflow` (depot) | Dealer branches (yards) + nullable coordinates |
-| `POST` | `/api/integration/delivery-routes` | `internal/routing` (approve), `internal/workflow` (push) | Write-back of an approved route plan |
+| `POST` | `/api/integration/delivery-routes` | `internal/workflow` (push) — **the only writer** | Write-back of an approved route plan |
 | `POST` | `/api/integration/delivery-routes/recall` | `internal/workflow` (re-assign, re-ingest) | Withdraw a pushed route the plan no longer contains |
 | `POST` | `/api/integration/validate-staff` | `gable.Client.ValidateStaff` | Staff login entitlement check (pillar 4) |
 
@@ -189,15 +189,20 @@ outcome on fresh state. Two boundaries on that replay:
   are excluded: another live ledger names those, and recalling one would cancel a route that
   plan relies on.
 
-> **Boundary of the invariant.** "No truck claimed by two plans, and no live route upstream
-> that no ledger names" holds **within `internal/workflow`**, and **not across the
-> `internal/routing` module**. `routing.Service.ApprovePlan`
-> (`internal/routing/service.go:352`) posts to this same endpoint with **no `live_routes`
-> write of any kind**, so routes it puts on the dealer's board are invisible to
-> `gateSupersede`, to `clearDisplacedClaims` and to every recall path — all of which read
-> workflow plans. Whether `routing` should share the workflow ledger or have its approve
-> path superseded is an open design question, deliberately not answered here. This harm
-> class is **not** closed ecosystem-wide.
+> **One writer, by construction.** "No truck claimed by two plans, and no live route
+> upstream that no ledger names" depends on there being exactly ONE place in the binary
+> that can reach this endpoint. There used to be two. `internal/routing` served
+> `POST /api/v1/routing/plan/{id}/approve`, which pushed here with **no `live_routes`
+> write of any kind** — so routes it put on the dealer's board were invisible to
+> `gateSupersede`, to `clearDisplacedClaims` and to every recall path, all of which read
+> workflow plans, and a later re-ingest would plan straight over them. That approve path
+> was **removed** rather than wrapped: the workflow module already does this job with a
+> ledger, gates and recall, and the routing endpoint had no consumer. `internal/routing`
+> now serves plan/get only — read and compute, no upstream write.
+>
+> `TestPushDeliveryRouteHasExactlyOneWriter`
+> (`internal/workflow/single_writer_test.go`) parses every non-test file in the module and
+> fails if a second call site appears, so the second writer cannot come back silently.
 
 ### `POST /api/integration/delivery-routes/recall` — withdraw
 

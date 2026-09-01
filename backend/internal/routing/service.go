@@ -36,11 +36,6 @@ type locationSource interface {
 	ListLocations(ctx context.Context) ([]gable.Location, error)
 }
 
-// routeSink writes an approved route back to GableLBM (satisfied by *gable.Client).
-type routeSink interface {
-	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
-}
-
 // planStore is the persistence seam for route plans (satisfied by
 // *Repository). It is declared consumer-side like every other seam in this
 // module so planning can be exercised against an in-memory store with no
@@ -68,12 +63,11 @@ type Service struct {
 	vehicles  vehicleSource
 	drivers   driverSource
 	locations locationSource
-	sink      routeSink
 	cfg       Config
 }
 
-func NewService(repo planStore, orders orderSource, vehicles vehicleSource, drivers driverSource, locations locationSource, sink routeSink, cfg Config) *Service {
-	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, locations: locations, sink: sink, cfg: cfg}
+func NewService(repo planStore, orders orderSource, vehicles vehicleSource, drivers driverSource, locations locationSource, cfg Config) *Service {
+	return &Service{repo: repo, orders: orders, vehicles: vehicles, drivers: drivers, locations: locations, cfg: cfg}
 }
 
 // Plan pulls confirmed orders for the date, optimizes the stop sequence, and
@@ -320,43 +314,4 @@ func joinNotes(first, second string) string {
 // Get returns a stored plan by id.
 func (s *Service) Get(ctx context.Context, id string) (*Plan, error) {
 	return s.repo.Get(ctx, id)
-}
-
-// Approve marks a plan APPROVED and writes the route back to GableLBM.
-func (s *Service) Approve(ctx context.Context, id string) (*Plan, error) {
-	plan, err := s.repo.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(plan.Loads) == 0 {
-		return nil, fmt.Errorf("plan has no loads assigned; cannot write back")
-	}
-
-	// One delivery_route per load. Each push is idempotent upstream on
-	// (vehicle_id, scheduled_date).
-	for _, load := range plan.Loads {
-		route := gable.DeliveryRoute{
-			VehicleID:     load.VehicleID,
-			DriverID:      load.DriverID,
-			ScheduledDate: plan.PlanDate,
-		}
-		for _, st := range load.Stops {
-			route.Stops = append(route.Stops, gable.RouteStop{
-				OrderID:  st.OrderID,
-				Sequence: st.Sequence,
-				Lat:      st.Lat,
-				Lng:      st.Lng,
-			})
-		}
-		if err := s.sink.PushDeliveryRoute(ctx, route); err != nil {
-			return nil, fmt.Errorf("write back to GableLBM (vehicle %s): %w", load.VehicleID, err)
-		}
-	}
-
-	if err := s.repo.UpdateStatus(ctx, id, "APPROVED"); err != nil {
-		return nil, err
-	}
-	plan.Status = "APPROVED"
-	return plan, nil
 }

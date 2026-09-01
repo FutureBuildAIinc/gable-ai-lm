@@ -612,11 +612,6 @@ class AiLmService {
   getRoutePlan(id: string): Promise<RoutePlan> {
     return fetchWithAuth(`${BASE}/routing/plan/${id}`).then((r) => jsonOrThrow(r));
   }
-  approveRoutePlan(id: string): Promise<RoutePlan> {
-    return fetchWithAuth(`${BASE}/routing/plan/${id}/approve`, { method: 'POST' }).then((r) =>
-      jsonOrThrow(r),
-    );
-  }
 
   // compliance
   listRestrictedPoints(): Promise<RestrictedPoint[]> {

@@ -175,16 +175,13 @@ describe('aiLmService — routing', () => {
     expect(lastCall().body).toEqual({ date: '2026-08-12' });
   });
 
-  it('reads and approves a route plan by id', async () => {
+  it('reads a route plan by id', async () => {
+    // Read/compute only. There is deliberately no approve call here: the
+    // routing module has no write-back path, so nothing in this service can
+    // put a route on the dealer's board. That is internal/workflow's job,
+    // and it is the only writer.
     await aiLmService.getRoutePlan('rp-2');
     expect(lastCall()).toMatchObject({ url: '/api/v1/routing/plan/rp-2', method: 'GET' });
-
-    await aiLmService.approveRoutePlan('rp-2');
-    expect(lastCall()).toMatchObject({
-      url: '/api/v1/routing/plan/rp-2/approve',
-      method: 'POST',
-      body: undefined,
-    });
   });
 });
 

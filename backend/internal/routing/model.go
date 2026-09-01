@@ -4,7 +4,14 @@
 // Package routing builds a pre-optimized daily delivery route from confirmed
 // GableLBM orders. The MVP optimizer is a deterministic nearest-neighbor + 2-opt
 // heuristic over haversine distances; it is pluggable for a real distance-matrix
-// provider later. Approved plans are written back to GableLBM.
+// provider later.
+//
+// This module is read-and-compute only: it plans and it caches, and it writes
+// nothing back to GableLBM. Putting a route on the dealer's dispatch board is
+// internal/workflow's job and only its job, because a push is sound only when
+// the same step also writes the live-route ledger entry that gateSupersede,
+// clearDisplacedClaims and the recall paths all read. See
+// TestPushDeliveryRouteHasExactlyOneWriter.
 package routing
 
 import "time"

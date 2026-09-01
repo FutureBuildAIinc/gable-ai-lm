@@ -33,7 +33,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, roleGuard ...func(http.Hand
 
 	mux.HandleFunc("POST /api/v1/routing/plan", guard(h.HandlePlan))
 	mux.HandleFunc("GET /api/v1/routing/plan/{id}", guard(h.HandleGet))
-	mux.HandleFunc("POST /api/v1/routing/plan/{id}/approve", guard(h.HandleApprove))
 }
 
 func (h *Handler) HandlePlan(w http.ResponseWriter, r *http.Request) {
@@ -59,20 +58,6 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		httputil.RespondError(w, r, "failed to get route plan", http.StatusInternalServerError, err)
-		return
-	}
-	httputil.RespondJSON(w, http.StatusOK, plan)
-}
-
-func (h *Handler) HandleApprove(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	plan, err := h.svc.Approve(r.Context(), id)
-	if errors.Is(err, ErrNotFound) {
-		httputil.RespondError(w, r, "route plan not found", http.StatusNotFound, err)
-		return
-	}
-	if err != nil {
-		httputil.RespondError(w, r, "failed to approve route plan", http.StatusBadGateway, err)
 		return
 	}
 	httputil.RespondJSON(w, http.StatusOK, plan)
