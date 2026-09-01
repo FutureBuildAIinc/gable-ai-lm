@@ -6,6 +6,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -97,9 +98,21 @@ func (d *dispatchDay) push(planID string) {
 	}
 }
 
-// claims maps every truck some plan for this date still believes is live, to
-// the plans claiming it.
+// claims maps every truck some plan for this date still HOLDS — published as
+// intent or confirmed on the board — to the plans holding it.
 func (d *dispatchDay) claims() map[string][]string {
+	d.t.Helper()
+	return d.claimsWhere(func(LiveRoute) bool { return true })
+}
+
+// confirmedClaims is claims narrowed to the trucks a plan says are KNOWN to be
+// on the dispatch board.
+func (d *dispatchDay) confirmedClaims() map[string][]string {
+	d.t.Helper()
+	return d.claimsWhere(LiveRoute.Confirmed)
+}
+
+func (d *dispatchDay) claimsWhere(keep func(LiveRoute) bool) map[string][]string {
 	d.t.Helper()
 	plans, err := d.store.ListForDate(context.Background(), d.date)
 	if err != nil {
@@ -108,7 +121,9 @@ func (d *dispatchDay) claims() map[string][]string {
 	out := map[string][]string{}
 	for _, p := range plans {
 		for _, r := range liveRoutes(p) {
-			out[r.VehicleID] = append(out[r.VehicleID], p.ID)
+			if keep(r) {
+				out[r.VehicleID] = append(out[r.VehicleID], p.ID)
+			}
 		}
 	}
 	return out
@@ -130,26 +145,74 @@ func (d *dispatchDay) board() map[string]bool {
 // the ledgers as stored, and the board as the ERP double holds it.
 func (d *dispatchDay) assertAcceptance() {
 	d.t.Helper()
-	claims, board := d.claims(), d.board()
+	for _, v := range d.acceptanceViolations() {
+		d.t.Error(v)
+	}
+}
+
+// acceptanceViolations is assertAcceptance's verdict as DATA rather than as a
+// test failure, so a concurrency trial can run the same oracle several hundred
+// times and report how many trials violated it. Reporting "no failures
+// observed" without a trial count is how a 1-in-400 defect gets called closed;
+// the count is the deliverable, so the oracle has to be countable.
+// assertAcceptanceExceptStranded is assertAcceptance for the one state this
+// system cannot get itself out of: a route GableLBM ITSELF refused to take back.
+//
+// It is deliberately not a way to skip the oracle. Acceptance I is asserted in
+// full, acceptance II is asserted in full for every truck but the named ones,
+// and the named ones have to be named — a test that has to reach for this is
+// stating, on the record, which truck the dealer is left dispatching and why.
+func (d *dispatchDay) assertAcceptanceExceptStranded(reason string, vehicles ...string) {
+	d.t.Helper()
+	if reason == "" {
+		d.t.Fatal("assertAcceptanceExceptStranded needs a reason: an unnamed exception is a skipped oracle")
+	}
+	for _, v := range d.acceptanceViolations(vehicles...) {
+		d.t.Error(v)
+	}
+}
+
+func (d *dispatchDay) acceptanceViolations(stranded ...string) []string {
+	d.t.Helper()
+	claims, confirmed, board := d.claims(), d.confirmedClaims(), d.board()
+	unrecallable := map[string]bool{}
+	for _, v := range stranded {
+		unrecallable[v] = true
+	}
+	var out []string
 
 	for vehicle, planIDs := range claims {
 		if len(planIDs) > 1 {
-			d.t.Errorf("acceptance I: truck %s on %s is claimed live by %v — the ERP holds at most one non-dispatched route per truck per day, so at least one of those ledgers is lying",
-				vehicle, d.date, planIDs)
+			out = append(out, fmt.Sprintf("acceptance I: truck %s on %s is claimed live by %v — the ERP holds at most one non-dispatched route per truck per day, so at least one of those ledgers is lying",
+				vehicle, d.date, sorted(planIDs)))
 		}
 	}
 	for vehicle := range board {
-		if len(claims[vehicle]) == 0 {
-			d.t.Errorf("acceptance II: truck %s is live on the dispatch board for %s and NO plan's ledger names it — nothing in this system can ever recall it",
-				vehicle, d.date)
+		if len(claims[vehicle]) == 0 && !unrecallable[vehicle] {
+			out = append(out, fmt.Sprintf("acceptance II: truck %s is live on the dispatch board for %s and NO plan\u2019s ledger names it — nothing in this system can ever recall it",
+				vehicle, d.date))
 		}
 	}
-	for vehicle, planIDs := range claims {
+	// The mirror clause is asserted on CONFIRMED claims, and deliberately not
+	// on published ones.
+	//
+	// "Claimed but not on the board" is not a divergence to be stamped out — it
+	// is the window this design chose, spelled out. Push publishes its claim
+	// before the wire call so the gap fails as an OVER-CLAIM rather than as an
+	// orphan, and asserting that every claim matches the board would be
+	// asserting that window away and taking the orphan back. The over-claim
+	// costs a redundant, idempotent recall (recallRoutes says so itself) and is
+	// bounded by the claim lease. A CONFIRMED claim makes the stronger promise —
+	// "this route is up there" — and every gate and recall path in this package
+	// believes it, so that one is held to the board exactly.
+	for vehicle, planIDs := range confirmed {
 		if !board[vehicle] {
-			d.t.Errorf("acceptance II: %v claim truck %s live on %s but the board holds no such route — every gate keyed on that ledger is reading a lie",
-				planIDs, vehicle, d.date)
+			out = append(out, fmt.Sprintf("acceptance II: %v claim truck %s CONFIRMED live on %s but the board holds no such route — every gate keyed on that ledger is reading a lie",
+				sorted(planIDs), vehicle, d.date))
 		}
 	}
+	sort.Strings(out)
+	return out
 }
 
 // planForTrucks builds a REVIEWED, packed, signed plan carrying exactly the

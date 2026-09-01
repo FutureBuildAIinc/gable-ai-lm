@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -152,6 +153,47 @@ type Config struct {
 	// which GableLBM knows per order.
 	DepotLat *float64
 	DepotLng *float64
+
+	// PendingClaimLease bounds how long one plan's PENDING claim on a truck
+	// blocks another plan's push for the same date. Zero means
+	// defaultPendingClaimLease.
+	//
+	// It exists because the write-ahead claim is the only thing a crashed
+	// process leaves behind, and a claim nothing can ever resolve would wedge
+	// the date for good. See Service.claimLease for the full argument.
+	PendingClaimLease time.Duration
+}
+
+// defaultPendingClaimLease is how long a published-but-unconfirmed claim is
+// treated as belonging to a push that is still running.
+//
+// It is generous relative to a push (a handful of ERP round-trips) and short
+// relative to a dispatch day, because both mistakes are recoverable and only
+// one is dangerous: too long and a second dispatcher waits, too short and two
+// pushes race — and the race is the harm.
+const defaultPendingClaimLease = 2 * time.Minute
+
+// claimLease answers "how long may an unresolved PENDING claim hold a truck?"
+//
+// A PENDING claim is published before the wire call and resolved — confirmed or
+// withdrawn — before Push returns, so under ordinary operation this lease is
+// never consulted. It exists for the one case that has no in-process answer: a
+// process that dies between publishing the claim and resolving it. That claim
+// is durable, and nothing in the dead process is coming back to clear it.
+//
+// The lease is what stops that from wedging the date. Past it, a rival push
+// treats the stale claim exactly as it treats a confirmed one — it displaces
+// it, tombstones it, and takes the truck — which is sound because the rival's
+// own ReplaceDeliveryRoute DELETEs whatever route is upstream for that
+// (vehicle, date) anyway. So the worst a crashed push can cost anyone else is
+// one lease, and the plan that owns the stale claim can always resolve it
+// itself, at once, by pushing again: a PENDING claim never satisfies the
+// resume's "already sent" skip, so the route is re-sent and confirmed.
+func (s *Service) claimLease() time.Duration {
+	if s.cfg.PendingClaimLease > 0 {
+		return s.cfg.PendingClaimLease
+	}
+	return defaultPendingClaimLease
 }
 
 // Service orchestrates the five-step dispatch workflow.
@@ -714,33 +756,67 @@ func (s *Service) recallRoutes(ctx context.Context, p *Plan, doomed []LiveRoute,
 	}
 	now := time.Now()
 	for _, r := range doomed {
-		res, err := s.gable.RecallDeliveryRoute(ctx, gable.RouteRecall{
-			VehicleID:     r.VehicleID,
-			ScheduledDate: p.PlanDate,
-			Reason:        note,
-			RecalledBy:    approvedBy,
-		})
-		if err != nil {
-			slog.Error("could not recall an orphaned route from GableLBM",
-				"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName, "vehicle_id", r.VehicleID, "error", err)
+		if err := s.recallOne(ctx, p, r, approvedBy, note, now); err != nil {
 			if errors.Is(err, gable.ErrRouteDispatched) {
 				return refusedf("truck %s has already left the yard on this run — its route cannot be recalled, so %s; call the driver first", nameOrID(r), blocked)
 			}
 			return fmt.Errorf("recall route from GableLBM (truck %s): %w", nameOrID(r), err)
 		}
-		slog.Info("recalled an orphaned route from the dispatch board",
-			"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName,
-			"was_live", res.Recalled, "stops", res.StopCount, "approved_by", approvedBy)
+	}
+	return nil
+}
 
-		for i := range p.LiveRoutes {
-			if p.LiveRoutes[i].VehicleID != r.VehicleID || !p.LiveRoutes[i].Live() {
-				continue
-			}
-			t := now
-			p.LiveRoutes[i].RecalledAt = &t
-			p.LiveRoutes[i].RecalledBy = approvedBy
-			p.LiveRoutes[i].RecallNote = note
+// recallEach is recallRoutes for the callers that must FINISH THE PASS: it
+// attempts every truck and reports the ones it could not take back, instead of
+// returning on the first failure.
+//
+// The two rules are not interchangeable and the difference is which state the
+// caller can fall back to. recallRoutes' callers abort and persist NOTHING, so
+// a half-recalled board that the plan has half-forgotten is the worst outcome
+// and stopping early is right. Its caller here has nothing to fall back to —
+// these routes are on the dealer's board with no ledger naming them — and
+// stopping at the first truck it cannot withdraw abandons every truck AFTER it
+// for a reason that has nothing to do with them. That is the same defect the
+// ledger correction had, on the withdrawal path.
+func (s *Service) recallEach(ctx context.Context, p *Plan, doomed []LiveRoute, approvedBy, note string) []LiveRoute {
+	now := time.Now()
+	var failed []LiveRoute
+	for _, r := range doomed {
+		if err := s.recallOne(ctx, p, r, approvedBy, note, now); err != nil {
+			failed = append(failed, r)
 		}
+	}
+	return failed
+}
+
+// recallOne withdraws a single route from the dispatch board and tombstones it
+// on the plan. It is the shared body of recallRoutes and recallEach, so the two
+// abort rules cannot drift apart on anything else — the wire call, the
+// idempotent-success reading, the tombstone.
+func (s *Service) recallOne(ctx context.Context, p *Plan, r LiveRoute, approvedBy, note string, at time.Time) error {
+	res, err := s.gable.RecallDeliveryRoute(ctx, gable.RouteRecall{
+		VehicleID:     r.VehicleID,
+		ScheduledDate: p.PlanDate,
+		Reason:        note,
+		RecalledBy:    approvedBy,
+	})
+	if err != nil {
+		slog.Error("could not recall an orphaned route from GableLBM",
+			"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName, "vehicle_id", r.VehicleID, "error", err)
+		return err
+	}
+	slog.Info("recalled an orphaned route from the dispatch board",
+		"plan", p.ID, "date", p.PlanDate, "vehicle", r.VehicleName,
+		"was_live", res.Recalled, "stops", res.StopCount, "approved_by", approvedBy)
+
+	for i := range p.LiveRoutes {
+		if p.LiveRoutes[i].VehicleID != r.VehicleID || !p.LiveRoutes[i].Live() {
+			continue
+		}
+		t := at
+		p.LiveRoutes[i].RecalledAt = &t
+		p.LiveRoutes[i].RecalledBy = approvedBy
+		p.LiveRoutes[i].RecallNote = note
 	}
 	return nil
 }
@@ -1180,6 +1256,87 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		return nil, refusedf("yard proof + sign-off required before depart on: %s", strings.Join(unsigned, ", "))
 	}
 
+	// -----------------------------------------------------------------------
+	// WRITE-AHEAD. The claim is published BEFORE the wire call, not after it.
+	//
+	// This is an ORDERING fix, and it is worth stating why, because three
+	// previous attempts corrected the CORRECTION and left the harm reachable.
+	//
+	// There is no distributed transaction across AI_LM and GableLBM, so there
+	// is always a window in which the two systems disagree. The window cannot
+	// be removed. It CAN be pointed in the safe direction, and it used to point
+	// in the dangerous one:
+	//
+	//	before  the route is on the dealer's board and NO STORED LEDGER NAMES
+	//	        IT. A rival push looking into that window sees nothing to
+	//	        correct, takes the truck, and both plans persist a live claim on
+	//	        it. That is the orphan and the double claim, in one gap.
+	//	after   the truck is CLAIMED and not yet on the board. A rival push
+	//	        looking into that window SEES the claim, and either backs off or
+	//	        displaces it deliberately.
+	//
+	// The second is an over-claim, which is the direction this package already
+	// chose everywhere else: recallRoutes says it outright — over-reporting
+	// what is live costs a redundant, idempotent recall and nothing else, while
+	// under-reporting leaves a truck loading for a run that no longer exists.
+	//
+	// The order below is therefore: reserve, look, write, confirm.
+	// -----------------------------------------------------------------------
+	now := time.Now()
+
+	// What this attempt will send, decided once, up front. The digest is
+	// computed here rather than inside the write loop because the reservation
+	// has to know which trucks are in play BEFORE the first wire call, and
+	// "which trucks are in play" is exactly "which ones the skip does not
+	// cover".
+	targets := pushTargets(p)
+
+	// 1. Publish the intent. Every truck this attempt may write is claimed
+	//    PENDING and SAVED, so it is visible to another plan's ListForDate from
+	//    this moment on. A failure here has written nothing upstream: the plan
+	//    is exactly as it was and the dispatcher retries.
+	reserved := reserveClaims(p, targets, now)
+	if len(reserved) > 0 {
+		if err := s.repo.Update(ctx, p); err != nil {
+			return nil, fmt.Errorf("reserve the trucks this push is about to write: %w", err)
+		}
+	}
+
+	// 2. Look, ONCE, and look before writing anything. This read is now a
+	//    PRECONDITION rather than a correction, which is the substantive
+	//    difference: a push no longer displaces a rival it was unable to check
+	//    for. The same answer is used twice — to refuse a contested truck here,
+	//    and to correct the ledgers this push displaces after the write loop —
+	//    and one read is enough for both because no rival can acquire a claim
+	//    inside this window without seeing the reservation above.
+	others, listErr := s.repo.ListForDate(ctx, p.PlanDate)
+	if listErr != nil {
+		// Nothing is known about who else holds these trucks, and — crucially —
+		// nothing has been written to the dealer's board yet. Handing the
+		// reservation back is therefore free, and it is the only answer that
+		// cannot leave two plans holding one truck. This is the branch that
+		// used to persist the pushing plan WITH the claim it had just failed to
+		// make exclusive.
+		s.releaseReservation(ctx, p, reserved, now,
+			fmt.Sprintf("released: the other plans for %s could not be read, so this push could not tell whether another plan holds this truck", p.PlanDate))
+		return nil, fmt.Errorf("look up the other plans for %s: %w", p.PlanDate, listErr)
+	}
+
+	// 3. Refuse a truck another push is holding right now.
+	//
+	//    Both racers publish before they look, so at most one of them can look
+	//    and see nothing: for neither to see the other, each would have to have
+	//    looked before the other wrote, and that orders the four events in a
+	//    cycle. The one that sees a rival intent therefore stands down. Both
+	//    standing down is possible and is harmless — nothing is on the board
+	//    and the dispatcher pushes again.
+	if held := contestedClaims(others, p.ID, targets, now, s.claimLease()); len(held) > 0 {
+		s.releaseReservation(ctx, p, reserved, now,
+			"released: another plan for this date published a claim on this truck first")
+		return nil, fmt.Errorf("%w — another push for %s is already holding %s, and nothing was written to the dispatch board",
+			ErrVersionConflict, p.PlanDate, strings.Join(held, ", "))
+	}
+
 	// The write loop is per-truck and every truck is acknowledged on the plan
 	// as it lands. That acknowledgement is the whole difference between a push
 	// that can be resumed and one that cannot: this loop used to return on the
@@ -1187,7 +1344,6 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	// of 5 left trucks 1 and 2 live on the dealer's board, the plan reading
 	// REVIEWED, and NO record anywhere of which routes had actually been
 	// written. Nothing was resumable and nothing was recallable.
-	now := time.Now()
 	var (
 		pushErr     error
 		failedTruck string
@@ -1195,39 +1351,40 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		acks        []pushAck
 		skipped     []string
 	)
-	for i := range p.Loads {
-		l := &p.Loads[i]
-		route := deliveryRoute(p, *l)
-		digest := routeDigest(route)
+	for _, tg := range targets {
+		l := &p.Loads[tg.load]
 
 		// Already on the board, byte for byte. Skipping is what makes a resume
 		// cheap, and the digest — not the timestamp — is what makes it safe:
 		// any change to stops, driver or manifest since the last push produces
 		// a different digest and re-sends.
 		//
-		// The LEDGER has the last word, though. A digest records what this plan
-		// once sent; the ledger records what this plan still believes is up
-		// there, and clearDisplacedClaims tombstones the entry when another
+		// The LEDGER has the last word, though, and it now has to say CONFIRMED
+		// and not merely "claimed". A digest records what this plan once sent;
+		// a PENDING claim records that this plan published an intent and cannot
+		// prove the wire call happened, so it always re-sends. And
+		// clearDisplacedClaims tombstones the entry outright when another
 		// plan's push destroys the route (the ERP keeps at most one
 		// non-dispatched route per truck per day). Skipping on the digest alone
 		// would leave that truck with no route at all and a plan convinced it
 		// had sent one.
-		if l.PushedAt != nil && l.PushedDigest == digest && routeIsLive(p, l.VehicleID) {
+		if tg.skip {
 			skipped = append(skipped, l.VehicleName)
 			continue
 		}
 
-		if err := s.gable.PushDeliveryRoute(ctx, route); err != nil {
+		if err := s.gable.PushDeliveryRoute(ctx, tg.route); err != nil {
 			pushErr, failedTruck = err, l.VehicleName
 			break
 		}
 
 		t := now
 		l.PushedAt = &t
-		l.PushedDigest = digest
-		markRouteLive(p, l.VehicleID, l.VehicleName, now)
+		l.PushedDigest = tg.digest
+		// 4. Confirm: PENDING -> LIVE, on the claim already published above.
+		confirmClaim(p, l.VehicleID, l.VehicleName, now)
 		wrote = append(wrote, l.VehicleName)
-		acks = append(acks, pushAck{vehicleID: l.VehicleID, vehicleName: l.VehicleName, digest: digest})
+		acks = append(acks, pushAck{vehicleID: l.VehicleID, vehicleName: l.VehicleName, digest: tg.digest})
 		// Metered per route, inside the loop, because that is where the value
 		// actually occurs: a push that fails on the fourth truck still put
 		// three real routes on the dealer's dispatch board, and they do not
@@ -1251,25 +1408,17 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	}
 
 	// Keep the ledger truthful at the source. See clearDisplacedClaims: every
-	// truck this plan claims live has destroyed whatever route another plan
+	// truck this plan has CONFIRMED has destroyed whatever route another plan
 	// for this date had on that truck, and that plan's ledger is now lying.
 	//
-	// The set is every truck THIS PLAN CURRENTLY CLAIMS, and deliberately not
-	// the trucks this attempt happened to write. The two differ on exactly the
-	// path that used to defeat the correction. A push that died part-way
-	// returned before correcting anything, and its resume then SKIPS the
-	// trucks that already landed — so the correction owed for one of them is
-	// invisible to the only attempt left that could pay it. Nothing ever
-	// revisits it: that is a permanent double claim, not a window. The pass is
-	// idempotent and makes no wire call, so widening it costs one ListForDate.
-	//
-	// It runs on the partial-push exit too, and for the same reason: the
-	// trucks written before GableLBM went away have ALREADY deleted another
-	// plan's route upstream. Returning first is what left that plan claiming a
-	// route the dealer's board no longer holds — and the recall path is keyed
-	// (vehicle, date), so that stale claim later cancels somebody else's LIVE
-	// route.
-	uncleared, clearErr := s.clearDisplacedClaims(ctx, p, claimedVehicleIDs(p), now)
+	// The set is every truck THIS PLAN NOW HOLDS CONFIRMED, and deliberately
+	// not the trucks this attempt happened to write. The two differ on exactly
+	// the path that used to defeat the correction: a push that died part-way,
+	// resumed, and SKIPPED the trucks that already landed — so the correction
+	// owed for one of them was invisible to the only attempt left that could
+	// pay it. It is not the reserved set either: a truck this push claimed and
+	// never managed to write has displaced nobody.
+	uncleared, clearErr := s.clearDisplacedClaims(ctx, p, others, confirmedVehicleIDs(p), now)
 	if clearErr != nil {
 		slog.Error("a push could not correct every ledger it displaced",
 			"plan", p.ID, "date", p.PlanDate,
@@ -1281,9 +1430,21 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	// rival claim still stands keeps the date to one claimant per truck, and
 	// costs nothing upstream: the route on the board is ours, and the rival
 	// ledger naming it is the one that survives. The load keeps its push ack,
-	// so the next resume reads routeIsLive == false, re-sends the route and
+	// so the next resume reads Confirmed == false, re-sends the route and
 	// tries the correction again.
-	out := pushOutcome{acks: acks, retracted: uncleared, fromStatus: p.Status, status: p.Status, at: now}
+	//
+	// abandoned is the other half of the write-ahead bargain: a truck claimed
+	// as intent and then never written must hand the claim straight back, or
+	// the over-claim this ordering deliberately accepts inside the window would
+	// outlive the window.
+	out := &pushOutcome{
+		acks:       acks,
+		retracted:  uncleared,
+		abandoned:  unwritten(reserved, acks, uncleared),
+		fromStatus: p.Status,
+		status:     p.Status,
+		at:         now,
+	}
 	if pushErr == nil && clearErr == nil {
 		out.status = planTransitions[actionPush].to
 	}
@@ -1298,13 +1459,193 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 		// logged above and inside persistPush, and neither is allowed to leave
 		// the board and the ledgers disagreeing.
 		return nil, refusedf("push stopped at truck %s: %d of %d truck(s) are now live on the dispatch board (%s). GableLBM was not reachable for the rest — run push again to finish the run; the trucks already written are skipped",
-			failedTruck, len(liveRoutes(p)), len(p.Loads), strings.Join(wrote, ", "))
+			failedTruck, len(confirmedVehicleIDs(p)), len(p.Loads), strings.Join(wrote, ", "))
 	case clearErr != nil:
 		return nil, clearErr
 	case persistErr != nil:
 		return nil, persistErr
 	}
 	return p, nil
+}
+
+// pushTarget is one truck's share of a push attempt, decided before any wire
+// call so the reservation and the write loop cannot disagree about which trucks
+// are in play.
+type pushTarget struct {
+	load   int // index into Plan.Loads
+	route  gable.DeliveryRoute
+	digest string
+	skip   bool // already on the board, byte for byte, and CONFIRMED
+}
+
+// pushTargets renders every load as what this attempt would send it, and marks
+// the ones the resume skip already covers.
+func pushTargets(p *Plan) []pushTarget {
+	out := make([]pushTarget, 0, len(p.Loads))
+	for i := range p.Loads {
+		l := &p.Loads[i]
+		route := deliveryRoute(p, *l)
+		digest := routeDigest(route)
+		out = append(out, pushTarget{
+			load:   i,
+			route:  route,
+			digest: digest,
+			skip:   l.PushedAt != nil && l.PushedDigest == digest && routeIsConfirmed(p, l.VehicleID),
+		})
+	}
+	return out
+}
+
+// reserveClaims publishes this attempt's intent to hold every truck it may
+// write, and reports the trucks whose claim is PENDING as a result.
+//
+// A truck this plan already holds CONFIRMED is left alone: the route really is
+// on the board, and demoting a confirmed claim to an intent would throw away
+// the one fact that makes it recallable. A truck already PENDING — this plan's
+// own earlier attempt, or a process that died mid-push — is returned in the set
+// anyway, because this attempt is now the thing that has to resolve it.
+func reserveClaims(p *Plan, targets []pushTarget, at time.Time) []string {
+	var reserved []string
+	for _, tg := range targets {
+		if tg.skip {
+			continue
+		}
+		l := p.Loads[tg.load]
+		claim := heldClaim(p, l.VehicleID)
+		switch {
+		case claim == nil:
+			t := at
+			p.LiveRoutes = append(p.LiveRoutes, LiveRoute{
+				VehicleID: l.VehicleID, VehicleName: l.VehicleName,
+				State: ClaimPending, ClaimedAt: &t,
+			})
+			reserved = append(reserved, l.VehicleID)
+		case claim.Pending():
+			claim.VehicleName = l.VehicleName
+			reserved = append(reserved, l.VehicleID)
+		}
+	}
+	return reserved
+}
+
+// namesVehicle reports whether this plan's ledger mentions a truck at all,
+// tombstones included. It is the "has this chapter been closed?" reading, as
+// against heldClaim's "is it open?".
+func namesVehicle(p *Plan, vehicleID string) bool {
+	for _, r := range p.LiveRoutes {
+		if r.VehicleID == vehicleID {
+			return true
+		}
+	}
+	return false
+}
+
+// heldClaim returns this plan's live (PENDING or LIVE) ledger entry for a
+// truck, or nil. It is a pointer into p.LiveRoutes so callers can promote it.
+func heldClaim(p *Plan, vehicleID string) *LiveRoute {
+	for i := range p.LiveRoutes {
+		if p.LiveRoutes[i].VehicleID == vehicleID && p.LiveRoutes[i].Live() {
+			return &p.LiveRoutes[i]
+		}
+	}
+	return nil
+}
+
+// contestedClaims names the trucks this push must NOT take, because another
+// plan for the date has published an intent on them that is still within its
+// lease. It returns operator-facing truck names, sorted, so the refusal reads
+// the same every time.
+//
+// A rival's CONFIRMED claim is not contested. That is the ordinary
+// displacement this module has always handled: the push replaces the route
+// upstream and clearDisplacedClaims corrects the ledger afterwards. An EXPIRED
+// pending claim is not contested either — see Service.claimLease for why that
+// is what stops a dead process wedging the date.
+func contestedClaims(others []*Plan, selfID string, targets []pushTarget, now time.Time, lease time.Duration) []string {
+	wanted := map[string]bool{}
+	for _, tg := range targets {
+		if !tg.skip {
+			wanted[tg.route.VehicleID] = true
+		}
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, other := range others {
+		if other.ID == selfID {
+			continue
+		}
+		for _, r := range other.LiveRoutes {
+			if !r.Pending() || !wanted[r.VehicleID] || seen[r.VehicleID] {
+				continue
+			}
+			if r.ClaimedAt != nil && now.Sub(*r.ClaimedAt) >= lease {
+				continue
+			}
+			seen[r.VehicleID] = true
+			out = append(out, nameOrID(r))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// releaseReservation hands back claims this push published and then decided not
+// to use, on an exit that wrote NOTHING to the dealer's board.
+//
+// It is best-effort by construction and that is safe in this one direction: a
+// release that fails to persist leaves an over-claim, which blocks other plans
+// for at most one lease and is cleared by this plan's own next push. A release
+// that was never attempted would leave it there indefinitely.
+func (s *Service) releaseReservation(ctx context.Context, p *Plan, reserved []string, at time.Time, note string) {
+	if len(reserved) == 0 {
+		return
+	}
+	const attempts = 3
+	var err error
+	for i := 0; i < attempts; i++ {
+		for _, id := range reserved {
+			retractClaim(p, id, vehicleNameFor(p, id), at, note)
+		}
+		if err = s.repo.Update(ctx, p); err == nil {
+			return
+		}
+		if !errors.Is(err, ErrVersionConflict) || i == attempts-1 {
+			break
+		}
+		fresh, gerr := s.repo.Get(ctx, p.ID)
+		if gerr != nil {
+			err = gerr
+			break
+		}
+		*p = *fresh
+	}
+	slog.Error("could not hand back a push reservation — the trucks stay claimed until this plan pushes again or the claim lease runs out",
+		"plan", p.ID, "date", p.PlanDate, "trucks", strings.Join(reserved, ", "),
+		"lease", s.claimLease(), "error", err)
+}
+
+// unwritten is the reserved trucks this attempt never put on the board, and
+// therefore the claims it has to give straight back.
+//
+// Trucks whose rival correction failed are excluded: those are already handed
+// back through pushOutcome.retracted, with the note that says why, and
+// tombstoning one twice with two different reasons would make "who stopped
+// claiming this, and what for" unanswerable.
+func unwritten(reserved []string, acks []pushAck, retracted []string) []string {
+	done := make(map[string]bool, len(acks)+len(retracted))
+	for _, a := range acks {
+		done[a.vehicleID] = true
+	}
+	for _, id := range retracted {
+		done[id] = true
+	}
+	out := make([]string, 0, len(reserved))
+	for _, id := range reserved {
+		if !done[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // pushAck is one truck this push attempt wrote to GableLBM, with the digest
@@ -1327,6 +1668,12 @@ type pushAck struct {
 type pushOutcome struct {
 	acks      []pushAck // trucks this attempt wrote upstream
 	retracted []string  // vehicle ids whose displaced rival claim could not be cleared
+	abandoned []string  // vehicle ids claimed as intent and never written
+	// disowned is filled in BY applyTo: trucks whose published claim was gone
+	// from the plan by the time the outcome was replayed, because another plan
+	// displaced them. They are not re-asserted and not withdrawn from the
+	// board — the plan that took them over is the one that names them now.
+	disowned []string
 	// fromStatus is the status the push's gates were evaluated against, and
 	// status is the one those gates earned. They are kept apart because the
 	// two halves of this outcome replay differently: the LEDGER is a record of
@@ -1346,9 +1693,29 @@ type pushOutcome struct {
 // ledger has been re-stated — that part is never given up — but the plan had
 // moved to a status this push never evaluated, so its status is left exactly
 // as the other writer set it.
-func (o pushOutcome) applyTo(p *Plan) bool {
+//
+// A REPLAY MUST NOT RESURRECT A CLAIM THAT IS NO LONGER THIS PLAN'S TO MAKE.
+// The claim for every truck here was published on the plan before the wire
+// call, so on a fresh copy it is either still held by this plan or it has been
+// TOMBSTONED by somebody who displaced it. In the second case the truck now
+// belongs to another plan, whose ledger names the route on the board;
+// re-asserting it would put the date back to two plans holding one truck —
+// which is exactly the state a version conflict used to save us from, before
+// the replay was introduced. It is dropped instead, and recorded in disowned so
+// the caller does not go on to withdraw a route somebody else is relying on.
+func (o *pushOutcome) applyTo(p *Plan) bool {
+	o.disowned = nil
 	for _, a := range o.acks {
-		markRouteLive(p, a.vehicleID, a.vehicleName, o.at)
+		// TOMBSTONED, not merely missing. The two are different facts and only
+		// one of them means "not ours any more": a tombstone is somebody
+		// writing down that they displaced this claim, whereas an entry that is
+		// absent altogether is a reservation that never reached the store, and
+		// its route IS on the dealer's board and must be named by somebody.
+		if heldClaim(p, a.vehicleID) == nil && namesVehicle(p, a.vehicleID) {
+			o.disowned = append(o.disowned, a.vehicleID)
+			continue
+		}
+		confirmClaim(p, a.vehicleID, a.vehicleName, o.at)
 		for i := range p.Loads {
 			if p.Loads[i].VehicleID != a.vehicleID {
 				continue
@@ -1361,6 +1728,10 @@ func (o pushOutcome) applyTo(p *Plan) bool {
 	note := fmt.Sprintf("another plan for %s still claims this truck and its ledger could not be corrected", p.PlanDate)
 	for _, id := range o.retracted {
 		retractClaim(p, id, vehicleNameFor(p, id), o.at, note)
+	}
+	for _, id := range o.abandoned {
+		retractClaim(p, id, vehicleNameFor(p, id), o.at,
+			"claimed ahead of the push and never written to the dispatch board")
 	}
 	if p.Status != o.fromStatus {
 		return false
@@ -1379,7 +1750,12 @@ func retractClaim(p *Plan, vehicleID, vehicleName string, at time.Time, note str
 		if r.VehicleID != vehicleID {
 			continue
 		}
-		if !r.Live() && !r.PushedAt.Equal(at) {
+		// Reuse the entry this same call already tombstoned (a replay), and
+		// leave an OLDER closed chapter for the same truck alone. The key is
+		// the tombstone's own timestamp: a PENDING claim has no PushedAt to
+		// compare, so keying on that one silently appended a duplicate
+		// tombstone on every replay.
+		if !r.Live() && !(r.RecalledAt != nil && r.RecalledAt.Equal(at)) {
 			continue
 		}
 		t := at
@@ -1438,7 +1814,7 @@ func vehicleNameFor(p *Plan, vehicleID string) string {
 //
 // A conflict that will not clear is the one case where the board cannot be
 // recorded at all, and there the routes come back off: see withdrawUnrecorded.
-func (s *Service) persistPush(ctx context.Context, p *Plan, out pushOutcome) error {
+func (s *Service) persistPush(ctx context.Context, p *Plan, out *pushOutcome) error {
 	const attempts = 3
 	var err error
 	current := true
@@ -1462,44 +1838,78 @@ func (s *Service) persistPush(ctx context.Context, p *Plan, out pushOutcome) err
 		current = out.applyTo(fresh)
 		*p = *fresh
 	}
-	slog.Error("could not record a push — withdrawing the routes it wrote rather than leave them on the board unnamed",
+	// The routes this push wrote were claimed on this plan and SAVED before the
+	// wire call, so this failure is a lost CONFIRMATION, not a lost ledger:
+	// they are still named, still recallable and still visible to every gate,
+	// and the dispatcher's retry re-sends them (a PENDING claim never satisfies
+	// the resume skip) and confirms them. withdrawUnrecorded therefore finds
+	// nothing to do unless that reservation is genuinely absent from the store.
+	slog.Error("could not record a push — its claims stay published so the routes it wrote are still named",
 		"plan", p.ID, "date", p.PlanDate, "routes", len(out.acks), "error", err)
 	s.withdrawUnrecorded(ctx, p, out)
 	return err
 }
 
 // withdrawUnrecorded takes back off the dispatch board the routes THIS attempt
-// wrote and could not record anywhere.
+// wrote that NO ledger anywhere names.
 //
-// This is not the second recall path clearDisplacedClaims disclaims. There the
-// route upstream had already been destroyed by somebody else and there was
-// nothing to withdraw. Here the routes are this push's own, seconds old, and
-// nothing in the system names them or ever will — the alternative is to leave
-// the dealer holding routes no ledger can recall and no gate can see.
+// Write-ahead changes what that set is, and almost always empties it. Every
+// truck this push wrote was claimed on this plan and SAVED before the wire call,
+// so a save that later failed still leaves the routes named, recallable and
+// visible to gateSupersede: there is nothing to withdraw, and withdrawing
+// anyway would take routes off the dealer's board while a stored claim still
+// points at them — the mirror lie, from the other side. So the set is computed
+// from what the store actually holds, not assumed.
 //
-// Trucks whose claim this push gave up (see pushOutcome.retracted) are left
-// alone: another plan's ledger still names those routes, so they are not
-// orphans, and recalling one would cancel a route that plan is relying on.
-func (s *Service) withdrawUnrecorded(ctx context.Context, p *Plan, out pushOutcome) {
-	given := make(map[string]bool, len(out.retracted))
+// It is not empty in one case, and that case is why this survives: a plan whose
+// reservation is not in the store when we look — it never landed, or the row is
+// gone. Then the routes really are unnameable, nothing can ever recall them,
+// and the alternative is leaving the dealer dispatching trucks this system
+// cannot see.
+//
+// Trucks whose claim this push gave up (see pushOutcome.retracted) and trucks
+// another plan took over inside the window (pushOutcome.disowned) are left
+// alone: another plan's ledger names those routes, so they are not orphans, and
+// recalling one would cancel a route that plan is relying on.
+func (s *Service) withdrawUnrecorded(ctx context.Context, p *Plan, out *pushOutcome) {
+	spoken := make(map[string]bool, len(out.retracted)+len(out.disowned))
 	for _, id := range out.retracted {
-		given[id] = true
+		spoken[id] = true
 	}
+	for _, id := range out.disowned {
+		spoken[id] = true
+	}
+
+	stored, err := s.repo.Get(ctx, p.ID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		slog.Error("could not read back a push that failed to record itself — leaving the routes on the board rather than withdraw ones a stored claim may still name",
+			"plan", p.ID, "date", p.PlanDate, "error", err)
+		return
+	}
+
 	doomed := make([]LiveRoute, 0, len(out.acks))
 	for _, a := range out.acks {
-		if given[a.vehicleID] {
+		if spoken[a.vehicleID] {
 			continue
+		}
+		if stored != nil && heldClaim(stored, a.vehicleID) != nil {
+			continue // the reservation is in the store: this route is named
 		}
 		doomed = append(doomed, LiveRoute{VehicleID: a.vehicleID, VehicleName: a.vehicleName, PushedAt: out.at})
 	}
 	if len(doomed) == 0 {
 		return
 	}
-	if err := s.recallRoutes(ctx, p, doomed, systemRecaller,
-		"withdrawn: this push could not be recorded",
-		"the push that wrote it could not be recorded"); err != nil {
-		slog.Error("could not withdraw the routes of a push that was never recorded — the dispatch board is ahead of every ledger for this date",
-			"plan", p.ID, "date", p.PlanDate, "error", err)
+	slog.Error("withdrawing routes a push wrote that no ledger anywhere names",
+		"plan", p.ID, "date", p.PlanDate, "routes", len(doomed))
+	if failed := s.recallEach(ctx, p, doomed, systemRecaller,
+		"withdrawn: this push could not be recorded"); len(failed) > 0 {
+		names := make([]string, 0, len(failed))
+		for _, r := range failed {
+			names = append(names, nameOrID(r))
+		}
+		slog.Error("could not withdraw every route of a push that was never recorded — the dispatch board is ahead of every ledger for this date",
+			"plan", p.ID, "date", p.PlanDate, "stranded", strings.Join(names, ", "))
 	}
 }
 
@@ -1532,21 +1942,22 @@ func (s *Service) withdrawUnrecorded(ctx context.Context, p *Plan, out pushOutco
 // than leave the date with two plans holding one. It also keeps going after a
 // failure instead of returning on the first one, so a second displaced ledger
 // is not left lying for a reason that has nothing to do with it.
-func (s *Service) clearDisplacedClaims(ctx context.Context, p *Plan, vehicleIDs []string, at time.Time) ([]string, error) {
+//
+// It is handed the date's plans rather than reading them itself, because the
+// read now has to happen BEFORE the wire call — see Push. That is not a
+// refactor: a correction that reads afterwards can only ever apologise for a
+// displacement it has already committed, and the read failing is what used to
+// leave the pushing plan holding a claim it had just failed to make exclusive.
+// Reading once, up front, makes the same answer serve as the precondition and
+// as the correction, and no rival can take a claim inside the window without
+// seeing this push's own published intent.
+func (s *Service) clearDisplacedClaims(ctx context.Context, p *Plan, others []*Plan, vehicleIDs []string, at time.Time) ([]string, error) {
 	if len(vehicleIDs) == 0 {
 		return nil, nil
 	}
 	displaced := make(map[string]bool, len(vehicleIDs))
 	for _, id := range vehicleIDs {
 		displaced[id] = true
-	}
-	others, err := s.repo.ListForDate(ctx, p.PlanDate)
-	if err != nil {
-		// Nothing is known about who else claims these trucks, so nothing can
-		// be given up. Retracting on a guess would strand every route this
-		// push just wrote with no ledger naming it — the worse of the two
-		// failures by a distance, and the one this package exists to prevent.
-		return nil, fmt.Errorf("look up the other plans for %s: %w", p.PlanDate, err)
 	}
 	var uncleared []string
 	var firstErr error
@@ -1562,18 +1973,6 @@ func (s *Service) clearDisplacedClaims(ctx context.Context, p *Plan, vehicleIDs 
 		}
 	}
 	return uncleared, firstErr
-}
-
-// claimedVehicleIDs is the set of trucks this plan's ledger currently claims
-// live — the trucks whose route upstream belongs to this plan, and therefore
-// the trucks whose rival claims it has displaced.
-func claimedVehicleIDs(p *Plan) []string {
-	live := liveRoutes(p)
-	out := make([]string, 0, len(live))
-	for _, r := range live {
-		out = append(out, r.VehicleID)
-	}
-	return out
 }
 
 // claimedFrom is claimsAnyOf's answer spelled out: which of these trucks does
@@ -1702,20 +2101,49 @@ func routeDigest(route gable.DeliveryRoute) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// markRouteLive records that a truck's route is now on the dispatch board,
-// reviving a previously recalled entry for the same truck rather than
-// accumulating duplicates.
-func markRouteLive(p *Plan, vehicleID, vehicleName string, at time.Time) {
-	for i := range p.LiveRoutes {
-		if p.LiveRoutes[i].VehicleID == vehicleID && p.LiveRoutes[i].Live() {
-			p.LiveRoutes[i].PushedAt = at
-			p.LiveRoutes[i].VehicleName = vehicleName
-			return
-		}
+// confirmClaim promotes this plan's published claim on a truck from PENDING to
+// LIVE: the route is now known to be on the dispatch board.
+//
+// It is the second half of the write-ahead pair and it is idempotent, so the
+// first save and every replay of it write the same thing. The append is a
+// fallback for a claim that was never reserved — Push always reserves first, so
+// it should not fire, but a confirmed claim that failed to record itself would
+// be an orphan and this is the cheaper of the two mistakes.
+func confirmClaim(p *Plan, vehicleID, vehicleName string, at time.Time) {
+	if r := heldClaim(p, vehicleID); r != nil {
+		r.State = ClaimLive
+		r.PushedAt = at
+		r.VehicleName = vehicleName
+		return
 	}
 	p.LiveRoutes = append(p.LiveRoutes, LiveRoute{
-		VehicleID: vehicleID, VehicleName: vehicleName, PushedAt: at,
+		VehicleID: vehicleID, VehicleName: vehicleName, State: ClaimLive, PushedAt: at,
 	})
+}
+
+// routeIsConfirmed reports whether this plan's ledger says this truck's route
+// is KNOWN to be on the dispatch board — not merely claimed ahead of a wire
+// call that may never have happened. It is the reading the resume skip needs.
+func routeIsConfirmed(p *Plan, vehicleID string) bool {
+	for _, r := range p.LiveRoutes {
+		if r.VehicleID == vehicleID && r.Confirmed() {
+			return true
+		}
+	}
+	return false
+}
+
+// confirmedVehicleIDs is the set of trucks whose route this plan KNOWS it put
+// on the dispatch board, and therefore the set whose rival claims it has
+// displaced. A truck merely claimed and never written has displaced nobody.
+func confirmedVehicleIDs(p *Plan) []string {
+	out := make([]string, 0, len(p.LiveRoutes))
+	for _, r := range p.LiveRoutes {
+		if r.Confirmed() {
+			out = append(out, r.VehicleID)
+		}
+	}
+	return out
 }
 
 // buildManifest assembles the yard-facing packing manifest for one truck. It is

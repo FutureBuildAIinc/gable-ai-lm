@@ -41,6 +41,15 @@ type fakePlanStore struct {
 	// letting a test land a competing writer inside another actor's
 	// read-modify-write window (two dispatch users, two goroutines, one plan).
 	beforeUpdate func()
+	// beforeUpdateSkip is how many Updates to let past FIRST.
+	//
+	// It exists because Push now writes twice: it publishes its claim BEFORE
+	// the ERP round-trips and confirms it after. A test that means "a
+	// dispatcher acted while the push was out at the ERP" has to land on the
+	// second write; landing on the first is a different scenario — a competing
+	// write that arrives before anything has been sent — and would quietly stop
+	// exercising the replay it was written for.
+	beforeUpdateSkip int
 }
 
 func newFakePlanStore(seed ...*Plan) *fakePlanStore {
@@ -114,6 +123,13 @@ func (s *fakePlanStore) Update(_ context.Context, p *Plan) error {
 func (s *fakePlanStore) takeHook() func() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.beforeUpdate == nil {
+		return nil
+	}
+	if s.beforeUpdateSkip > 0 {
+		s.beforeUpdateSkip--
+		return nil
+	}
 	hook := s.beforeUpdate
 	s.beforeUpdate = nil
 	return hook
@@ -191,6 +207,14 @@ func (s errPlanStore) ListForDate(ctx context.Context, d string) ([]*Plan, error
 // fakeGable is the GableLBM integration double. pushed records every route
 // written back so a test can assert what actually reached the dispatch board.
 type fakeGable struct {
+	// mu makes the double safe to drive from two request goroutines at once.
+	// The real ERP is a server; a double that data-races under -race reports
+	// its own defect instead of the one under test, and a concurrency trial
+	// against it proves nothing. Every method below takes it, and every hook is
+	// TAKEN under it and CALLED outside it, so a hook that pushes cannot
+	// deadlock on the lock its caller already holds.
+	mu sync.Mutex
+
 	orders    []gable.Order
 	vehicles  []gable.Vehicle
 	drivers   []gable.Driver
@@ -220,6 +244,15 @@ type fakeGable struct {
 	pushed  []gable.DeliveryRoute
 	pushErr error
 
+	// onFirstPush fires once, INSIDE the first PushDeliveryRoute of a run.
+	//
+	// That instant is the whole subject of the write-ahead ordering: the route
+	// is on its way to the dealer's board and the claim naming it has either
+	// been published already or has not. A test that wants to look into the
+	// window — or land a rival push in it — has to be here, because it is the
+	// only place the two systems are knowingly out of step.
+	onFirstPush func()
+
 	// pushErrAfter, when > 0, lets the Nth push and every one before it
 	// succeed and fails the rest — the mid-loop failure a partial push is.
 	pushErrAfter int
@@ -236,6 +269,7 @@ type fakeGable struct {
 	// recallErr fails every recall (a GableLBM that cannot be reached);
 	// recallDispatched fails them with the terminal 409 instead.
 	recallErr        error
+	recallErrFor     map[string]error
 	recallDispatched bool
 	// recallMissing marks the recall as having found nothing on the board —
 	// the idempotent no-op, which is a success.
@@ -243,22 +277,37 @@ type fakeGable struct {
 }
 
 func (f *fakeGable) ListOrdersForDate(_ context.Context, date string) ([]gable.Order, error) {
+	f.mu.Lock()
 	f.orderDates = append(f.orderDates, date)
-	if hook := f.onListOrders; hook != nil {
-		f.onListOrders = nil
+	hook := f.onListOrders
+	f.onListOrders = nil
+	f.mu.Unlock()
+	if hook != nil {
 		hook()
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.orders, nil
 }
-func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) { return f.vehicles, nil }
+func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vehicles, nil
+}
 func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.locationCalls++
 	if f.locErr != nil {
 		return nil, f.locErr
 	}
 	return f.locations, nil
 }
-func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { return f.drivers, nil }
+func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.drivers, nil
+}
 
 // PushDeliveryRoute models the upstream write as it actually behaves.
 //
@@ -269,6 +318,15 @@ func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { retur
 // — and every assertion of the form "the ledger mirrors the board" was
 // therefore being made against a board that does not exist.
 func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
+	f.mu.Lock()
+	hook := f.onFirstPush
+	f.onFirstPush = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pushCalls++
 	if f.pushErrAfter > 0 && f.pushCalls > f.pushErrAfter {
 		return fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
@@ -288,6 +346,16 @@ func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) 
 }
 
 func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall) (*gable.RouteRecallResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// recallErrFor fails the withdrawal of ONE named truck and lets the rest
+	// through. A single blanket recallErr cannot express the case that matters
+	// for a multi-truck withdrawal — the second truck must still be attempted
+	// after the first one fails — because with every truck failing, "stopped at
+	// the first" and "tried them all" produce the same board.
+	if err := f.recallErrFor[rc.VehicleID]; err != nil {
+		return nil, err
+	}
 	if f.recallDispatched {
 		return nil, fmt.Errorf("%w (truck %s on %s)", gable.ErrRouteDispatched, rc.VehicleID, rc.ScheduledDate)
 	}
@@ -316,6 +384,8 @@ func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall)
 
 // recalledIDs lists the vehicles recalled, in call order.
 func (f *fakeGable) recalledIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.recalled))
 	for _, r := range f.recalled {
 		out = append(out, r.VehicleID)
@@ -325,6 +395,8 @@ func (f *fakeGable) recalledIDs() []string {
 
 // pushedIDs lists the vehicles currently live on the fake dispatch board.
 func (f *fakeGable) pushedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.pushed))
 	for _, r := range f.pushed {
 		out = append(out, r.VehicleID)
