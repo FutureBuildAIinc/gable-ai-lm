@@ -125,6 +125,20 @@ func TestConcurrentMutationRejectsStaleWrite(t *testing.T) {
 
 // TestConcurrentPushRejectsStaleWrite covers the most dangerous mutation: two
 // pushes racing must not both mark the plan PUSHED off a stale read.
+//
+// The scenario is specific and the hook has to land in a specific place: the
+// push is OUT AT THE ERP, and a re-pack commits underneath it, invalidating the
+// review its gates were evaluated against. The plan must come back PACKED, not
+// PUSHED, and the caller must be told.
+//
+// So this test asserts, before anything else, that PushDeliveryRoute was
+// actually reached. That is not belt and braces. Round 5 (64dd597) gave Push a
+// second, EARLIER write — it published a claim before calling the ERP — and
+// beforeUpdate fires on the FIRST Update it sees. The hook therefore landed
+// before the wire call, the push conflicted on its reservation, the ERP was
+// never touched, and this test went on passing while testing a scenario that
+// no longer contained a push. A test that cannot tell which write it landed on
+// has to check what ran.
 func TestConcurrentPushRejectsStaleWrite(t *testing.T) {
 	p := planWithPackedLoad()
 	p.Loads[0].Proof.SignedOff = true
@@ -146,6 +160,12 @@ func TestConcurrentPushRejectsStaleWrite(t *testing.T) {
 
 	if _, err := svc.Push(context.Background(), "plan-1"); !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("a push racing another write must conflict, got %v", err)
+	}
+	g.mu.Lock()
+	calls := g.pushCalls
+	g.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("the competing write landed BEFORE the ERP was called, so this test never exercised a push racing anything — the hook is on the wrong write")
 	}
 	if got := store.stored("plan-1").Status; got != StatusPacked {
 		t.Fatalf("the competing status change must survive, got %q", got)

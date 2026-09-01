@@ -80,24 +80,37 @@ func (db *DB) Close() {
 }
 
 // RunInTx executes a function within a database transaction.
-func (db *DB) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
+//
+// The return value is NAMED, and that is load-bearing rather than stylistic.
+// The deferred block below is what commits, so it runs AFTER the return value
+// has been fixed; with an unnamed result, `err = tx.Commit(ctx)` assigned to a
+// local nothing would ever read and a transaction that FAILED TO COMMIT was
+// reported to the caller as success. For a caller that writes a ledger
+// recording what it has already sent to another system, that is the exact
+// shape of the harm the ledger exists to prevent: the remote write stands, the
+// local record of it is rolled back, and the caller is told it worked. A
+// commit error is now returned like any other.
+func (db *DB) RunInTx(ctx context.Context, fn func(ctx context.Context) error) (err error) {
 	if _, ok := ctx.Value(txKey{}).(pgx.Tx); ok {
 		return fn(ctx)
 	}
 
-	tx, err := db.Pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	tx, beginErr := db.Pool.Begin(ctx)
+	if beginErr != nil {
+		return fmt.Errorf("failed to begin transaction: %w", beginErr)
 	}
 
 	defer func() {
 		if p := recover(); p != nil {
 			_ = tx.Rollback(ctx)
 			panic(p)
-		} else if err != nil {
+		}
+		if err != nil {
 			_ = tx.Rollback(ctx)
-		} else {
-			err = tx.Commit(ctx)
+			return
+		}
+		if cerr := tx.Commit(ctx); cerr != nil {
+			err = fmt.Errorf("commit transaction: %w", cerr)
 		}
 	}()
 

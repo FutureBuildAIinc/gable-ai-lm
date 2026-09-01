@@ -239,6 +239,9 @@ func (s failingCreateStore) GetLatestForDate(ctx context.Context, d string) (*Pl
 	return s.inner.GetLatestForDate(ctx, d)
 }
 
+func (s failingCreateStore) WithDateLock(ctx context.Context, d string, fn func(context.Context) error) error {
+	return s.inner.WithDateLock(ctx, d, fn)
+}
 func (s failingCreateStore) ListForDate(ctx context.Context, d string) ([]*Plan, error) {
 	return s.inner.ListForDate(ctx, d)
 }

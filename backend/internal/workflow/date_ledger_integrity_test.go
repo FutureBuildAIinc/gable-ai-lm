@@ -6,6 +6,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -116,6 +117,8 @@ func (d *dispatchDay) claims() map[string][]string {
 
 // board lists the trucks actually holding a route upstream for this date.
 func (d *dispatchDay) board() map[string]bool {
+	d.g.mu.Lock()
+	defer d.g.mu.Unlock()
 	out := map[string]bool{}
 	for _, r := range d.g.pushed {
 		if r.ScheduledDate == d.date {
@@ -130,26 +133,45 @@ func (d *dispatchDay) board() map[string]bool {
 // the ledgers as stored, and the board as the ERP double holds it.
 func (d *dispatchDay) assertAcceptance() {
 	d.t.Helper()
+	for _, v := range d.acceptanceViolations() {
+		d.t.Error(v)
+	}
+}
+
+// acceptanceViolations is assertAcceptance's verdict as DATA rather than as a
+// test failure, so a concurrency trial can run the SAME oracle several hundred
+// times and report how many trials violated it.
+//
+// It is the one oracle, not a second copy of it: reporting "no failures
+// observed" without a trial count is how a 1-in-400 defect gets called closed,
+// and an oracle that only knows how to fail a test cannot be counted. Two
+// oracles could drift, so assertAcceptance delegates here rather than
+// duplicating the clauses.
+func (d *dispatchDay) acceptanceViolations() []string {
+	d.t.Helper()
 	claims, board := d.claims(), d.board()
+	var out []string
 
 	for vehicle, planIDs := range claims {
 		if len(planIDs) > 1 {
-			d.t.Errorf("acceptance I: truck %s on %s is claimed live by %v — the ERP holds at most one non-dispatched route per truck per day, so at least one of those ledgers is lying",
-				vehicle, d.date, planIDs)
+			out = append(out, fmt.Sprintf("acceptance I: truck %s on %s is claimed live by %v — the ERP holds at most one non-dispatched route per truck per day, so at least one of those ledgers is lying",
+				vehicle, d.date, sorted(planIDs)))
 		}
 	}
 	for vehicle := range board {
 		if len(claims[vehicle]) == 0 {
-			d.t.Errorf("acceptance II: truck %s is live on the dispatch board for %s and NO plan's ledger names it — nothing in this system can ever recall it",
-				vehicle, d.date)
+			out = append(out, fmt.Sprintf("acceptance II: truck %s is live on the dispatch board for %s and NO plan's ledger names it — nothing in this system can ever recall it",
+				vehicle, d.date))
 		}
 	}
 	for vehicle, planIDs := range claims {
 		if !board[vehicle] {
-			d.t.Errorf("acceptance II: %v claim truck %s live on %s but the board holds no such route — every gate keyed on that ledger is reading a lie",
-				planIDs, vehicle, d.date)
+			out = append(out, fmt.Sprintf("acceptance II: %v claim truck %s live on %s but the board holds no such route — every gate keyed on that ledger is reading a lie",
+				sorted(planIDs), vehicle, d.date))
 		}
 	}
+	sort.Strings(out)
+	return out
 }
 
 // planForTrucks builds a REVIEWED, packed, signed plan carrying exactly the

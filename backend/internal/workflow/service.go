@@ -93,6 +93,12 @@ type planStore interface {
 	// nothing forces the one holding live routes to be the latest — so every
 	// gate that asks "is this date live?" must ask about all of them.
 	ListForDate(ctx context.Context, date string) ([]*Plan, error)
+	// WithDateLock runs fn under an exclusive, transaction-scoped lock on one
+	// dispatch DATE, and returns ErrDateBusy — having run nothing — if another
+	// holder has it. It is the narrowest transaction seam that makes Push
+	// serializable per date; see Repository.WithDateLock for the mechanism and
+	// Service.Push for why the whole push runs inside it.
+	WithDateLock(ctx context.Context, date string, fn func(ctx context.Context) error) error
 }
 
 // gableSource is the GableLBM integration surface the workflow consumes
@@ -1121,10 +1127,89 @@ func statusLabel(s string) string {
 // capacityFindings): an over-rating on the per-axle estimate, or a line with no
 // digital-twin geometry. Both are carried onto the review, logged here, and
 // written onto the manifest that reaches the yard — the dispatcher decides.
+//
+// # Serialization
+//
+// Push runs inside an exclusive lock on its plan's DATE. Five rounds of work
+// tried to make the ERP write and the ledger write atomic and could not: that
+// is strict serializability across two services with no shared transaction, and
+// every locally-correct fix moved the violation somewhere else. So the write
+// path is not made atomic here — it is made SINGULAR. With at most one push per
+// date in flight, the entire concurrent-push race class (two plans reading each
+// other's absent claims and both persisting a claim on one truck) is impossible
+// by construction rather than by argument.
+//
+// What that does NOT do is stated plainly in Push's own body and in
+// persistPush: a crash between the ERP call and the ledger write still leaves a
+// route on the dealer's board that no ledger names. A lock orders this service
+// against itself; it cannot order this service against a process that is no
+// longer running. That is the reconciler's job, and it is not done here.
 func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
+	// One read before the lock, for one fact: WHICH date this push contends
+	// for. The lock key has to come from somewhere and the plan is where the
+	// date lives, so this read is unavoidable; nothing else is decided on it.
+	// Every gate, every ERP call and every write below re-reads the plan INSIDE
+	// the lock, so a stale answer here can only send the push to wait on the
+	// wrong door, never to act on stale state.
+	head, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	date := head.PlanDate
+
+	var (
+		plan    *Plan
+		verdict error
+	)
+	lockErr := s.repo.WithDateLock(ctx, date, func(ctx context.Context) error {
+		plan, verdict = s.pushLocked(ctx, id, date)
+		// The push's own verdict is deliberately NOT returned here, and the
+		// transaction therefore always commits.
+		//
+		// A rollback would be worse than useless on every failing path this
+		// function has. Push refuses with routes ALREADY on the dealer's board
+		// — a partial push is the whole reason the ledger records acks per
+		// truck — and rolling those acks back would delete the only record of
+		// routes that really are live upstream. That is the orphan, manufactured
+		// by the transaction meant to protect against it. Before this lock
+		// existed each of those writes committed on its own as it happened;
+		// committing them together preserves exactly that, and adds only the
+		// ordering.
+		return nil
+	})
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrDateBusy) {
+			// Observable on purpose, in three places: this line, the sentence
+			// the dispatcher reads, and the 409 the handler answers (which the
+			// HTTP metrics middleware already labels by path and status, so
+			// contention is countable without a new counter).
+			slog.Warn("refused a push: another push for the same dispatch date is already running",
+				"plan", id, "date", date)
+			return nil, fmt.Errorf("%w: %s is already being pushed. Nothing was sent to GableLBM and nothing was written — try again in a moment", ErrDateBusy, date)
+		}
+		return nil, lockErr
+	}
+	return plan, verdict
+}
+
+// pushLocked is Push's body, running with this date's lock held.
+func (s *Service) pushLocked(ctx context.Context, id, date string) (*Plan, error) {
+	// Re-read under the lock. The copy Push read to find the date was read
+	// unlocked, and gating on it would be gating on a snapshot another push may
+	// have moved past between the two — precisely the read-decide-write window
+	// the lock is here to close.
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if p.PlanDate != date {
+		// Unreachable: a plan's date is set at ingest and no transition writes
+		// it. Asserted rather than assumed because the lock is keyed on the
+		// value read BEFORE it was taken, so the day someone makes the date
+		// mutable, this push would be holding the wrong date's lock and the
+		// serialization would be silently gone. Refusing is the cheap answer;
+		// the push has done nothing.
+		return nil, refusedf("this plan moved from %s to %s while the push was starting — reload and push again", date, p.PlanDate)
 	}
 	// Legal from REVIEWED only. Note that this is NOT what stops a resume: a
 	// push that died part-way deliberately left the status at REVIEWED, so

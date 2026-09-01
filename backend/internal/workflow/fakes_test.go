@@ -37,6 +37,21 @@ type fakePlanStore struct {
 	updates   int
 	conflicts int
 
+	// afterGet fires ONCE, immediately after the next Get returns.
+	//
+	// It exists for one window that has no other seam: Push reads the plan
+	// UNLOCKED to discover which date to lock, then re-reads it under the lock
+	// and gates on that. Landing a competing writer between those two reads is
+	// the only way to tell the two apart, and telling them apart is the whole
+	// point of the second read.
+	afterGet func()
+
+	// dateLocks is the set of dates currently held by a WithDateLock caller;
+	// lockGrants/lockRefusals count the two outcomes.
+	dateLocks    map[string]bool
+	lockGrants   int
+	lockRefusals int
+
 	// beforeUpdate fires once, immediately before the next Update is applied,
 	// letting a test land a competing writer inside another actor's
 	// read-modify-write window (two dispatch users, two goroutines, one plan).
@@ -119,14 +134,65 @@ func (s *fakePlanStore) takeHook() func() {
 	return hook
 }
 
-func (s *fakePlanStore) Get(_ context.Context, id string) (*Plan, error) {
+// WithDateLock models the Postgres advisory lock the repository takes: one
+// holder per date, and a CONTENDER IS REFUSED rather than queued.
+//
+// Refusing rather than queueing is the point, and is why this double is written
+// by hand instead of wrapping a sync.Mutex. A mutex would make every contended
+// trial serialize and pass, which would prove the harness cannot tell a lock
+// from a queue — and the production lock is pg_try_advisory_xact_lock, whose
+// whole contract is "somebody else has it, you get nothing". A test store that
+// blocked would be a test store that agrees with any implementation.
+//
+// grants and refusals are counted so a concurrency trial can prove it actually
+// REACHED contention. A 400-trial run that records zero refusals has serialized
+// itself by luck and asserted nothing.
+func (s *fakePlanStore) WithDateLock(_ context.Context, date string, fn func(context.Context) error) error {
+	s.mu.Lock()
+	if s.dateLocks == nil {
+		s.dateLocks = map[string]bool{}
+	}
+	if s.dateLocks[date] {
+		s.lockRefusals++
+		s.mu.Unlock()
+		return ErrDateBusy
+	}
+	s.dateLocks[date] = true
+	s.lockGrants++
+	s.mu.Unlock()
+
+	// fn is run OUTSIDE s.mu: it calls Get and Update, which take it.
+	defer func() {
+		s.mu.Lock()
+		delete(s.dateLocks, date)
+		s.mu.Unlock()
+	}()
+	return fn(context.Background())
+}
+
+// lockCounts reports (grants, refusals) — test-only accessor.
+func (s *fakePlanStore) lockCounts() (int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.lockGrants, s.lockRefusals
+}
+
+func (s *fakePlanStore) Get(_ context.Context, id string) (*Plan, error) {
+	s.mu.Lock()
 	p, ok := s.plans[id]
+	hook := s.afterGet
+	s.afterGet = nil
+	s.mu.Unlock()
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return clonePlan(p), nil
+	out := clonePlan(p)
+	// Called outside s.mu, like every other hook here, so a hook that reads or
+	// writes the store cannot deadlock on the lock its caller already holds.
+	if hook != nil {
+		hook()
+	}
+	return out, nil
 }
 
 func (s *fakePlanStore) GetLatestForDate(_ context.Context, date string) (*Plan, error) {
@@ -187,10 +253,21 @@ func (s errPlanStore) GetLatestForDate(ctx context.Context, d string) (*Plan, er
 func (s errPlanStore) ListForDate(ctx context.Context, d string) ([]*Plan, error) {
 	return s.inner.ListForDate(ctx, d)
 }
+func (s errPlanStore) WithDateLock(ctx context.Context, d string, fn func(context.Context) error) error {
+	return s.inner.WithDateLock(ctx, d, fn)
+}
 
 // fakeGable is the GableLBM integration double. pushed records every route
 // written back so a test can assert what actually reached the dispatch board.
 type fakeGable struct {
+	// mu makes the double safe to drive from two request goroutines at once.
+	// The real ERP is a server; a double that data-races under -race reports
+	// its own defect instead of the one under test, and a concurrency trial
+	// against it proves nothing. Every method below takes it, and every hook is
+	// TAKEN under it and CALLED outside it, so a hook that pushes cannot
+	// deadlock on the lock its caller already holds.
+	mu sync.Mutex
+
 	orders    []gable.Order
 	vehicles  []gable.Vehicle
 	drivers   []gable.Driver
@@ -220,6 +297,12 @@ type fakeGable struct {
 	pushed  []gable.DeliveryRoute
 	pushErr error
 
+	// onFirstPush fires once, INSIDE the first PushDeliveryRoute of a run —
+	// the instant this service has written to the dealer's board and not yet
+	// written the ledger naming it. It is TAKEN under f.mu and CALLED outside
+	// it, so a hook that itself pushes cannot deadlock.
+	onFirstPush func()
+
 	// pushErrAfter, when > 0, lets the Nth push and every one before it
 	// succeed and fails the rest — the mid-loop failure a partial push is.
 	pushErrAfter int
@@ -243,22 +326,37 @@ type fakeGable struct {
 }
 
 func (f *fakeGable) ListOrdersForDate(_ context.Context, date string) ([]gable.Order, error) {
+	f.mu.Lock()
 	f.orderDates = append(f.orderDates, date)
-	if hook := f.onListOrders; hook != nil {
-		f.onListOrders = nil
+	hook := f.onListOrders
+	f.onListOrders = nil
+	f.mu.Unlock()
+	if hook != nil {
 		hook()
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.orders, nil
 }
-func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) { return f.vehicles, nil }
+func (f *fakeGable) ListVehicles(context.Context) ([]gable.Vehicle, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.vehicles, nil
+}
 func (f *fakeGable) ListLocations(context.Context) ([]gable.Location, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.locationCalls++
 	if f.locErr != nil {
 		return nil, f.locErr
 	}
 	return f.locations, nil
 }
-func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { return f.drivers, nil }
+func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.drivers, nil
+}
 
 // PushDeliveryRoute models the upstream write as it actually behaves.
 //
@@ -269,6 +367,15 @@ func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) { retur
 // — and every assertion of the form "the ledger mirrors the board" was
 // therefore being made against a board that does not exist.
 func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
+	f.mu.Lock()
+	hook := f.onFirstPush
+	f.onFirstPush = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pushCalls++
 	if f.pushErrAfter > 0 && f.pushCalls > f.pushErrAfter {
 		return fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
@@ -288,6 +395,8 @@ func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) 
 }
 
 func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall) (*gable.RouteRecallResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.recallDispatched {
 		return nil, fmt.Errorf("%w (truck %s on %s)", gable.ErrRouteDispatched, rc.VehicleID, rc.ScheduledDate)
 	}
@@ -316,6 +425,8 @@ func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall)
 
 // recalledIDs lists the vehicles recalled, in call order.
 func (f *fakeGable) recalledIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.recalled))
 	for _, r := range f.recalled {
 		out = append(out, r.VehicleID)
@@ -325,6 +436,8 @@ func (f *fakeGable) recalledIDs() []string {
 
 // pushedIDs lists the vehicles currently live on the fake dispatch board.
 func (f *fakeGable) pushedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.pushed))
 	for _, r := range f.pushed {
 		out = append(out, r.VehicleID)

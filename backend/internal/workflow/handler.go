@@ -192,6 +192,15 @@ func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan
 		httputil.RespondError(w, r, err.Error(), http.StatusLocked, err)
 		return
 	}
+	// Another push for the same dispatch date holds that date's lock. Nothing
+	// was gated, sent or written, so this is a plain "resubmit" — the same
+	// conversation as a version conflict and the same 409, which is why it
+	// shares the code rather than inventing one. The two are told apart by the
+	// sentence, which names the date, and by the WARN line Push logs.
+	if errors.Is(err, ErrDateBusy) {
+		httputil.RespondError(w, r, err.Error(), http.StatusConflict, err)
+		return
+	}
 	// Someone else saved this plan between our read and our write. Nothing was
 	// applied — 409 tells the UI to reload the current plan and retry.
 	if errors.Is(err, ErrVersionConflict) {

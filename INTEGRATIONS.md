@@ -189,6 +189,48 @@ outcome on fresh state. Two boundaries on that replay:
   are excluded: another live ledger names those, and recalling one would cancel a route that
   plan relies on.
 
+**One push per date at a time, and what that does and does not buy.** `Push` runs inside an
+exclusive lock on its plan's **date** — `pg_try_advisory_xact_lock`, taken as the first
+statement of the transaction the whole push runs in, released by that transaction's `COMMIT`
+or `ROLLBACK`.
+
+- **The date, not the plan, is the contended resource.** A date legitimately holds several
+  plans and any of them may be pushed; `ReplaceDeliveryRoute` is keyed
+  `(vehicle_id, scheduled_date)`. Locking the plan would leave two plans for one date racing
+  exactly as before.
+- **Transaction-scoped, so a crash cannot wedge a date.** A session-scoped lock needs an
+  explicit unlock or the session to end; a killed process (or a connection parked by a
+  pooler) could hold a dispatch date shut with nobody left to open it. `COMMIT`/`ROLLBACK`
+  happen when the backend notices the client is gone, so no lease, sweeper or timeout is
+  needed to make that true.
+- **Contention fails fast.** It is a *try* lock: the second push answers `409` with a
+  sentence naming the date, having run no gate, sent nothing to GableLBM and written
+  nothing, so "try again" is a plain repeat. The alternative — queueing — would hold an HTTP
+  request *and* a pooled Postgres connection for the length of somebody else's push (up to
+  one 15s ERP timeout per truck), turning a rare correctness race into pool exhaustion that
+  reaches every other endpoint. Contention is observable as a `WARN` line and as `409`s on
+  `POST /api/v1/workflow/plans/{id}/push`, which the HTTP metrics middleware already labels
+  by path and status.
+- **The transaction always commits.** The push's own verdict is deliberately not returned
+  from the locked closure. Rolling back on a refusal would delete the ledger acks for routes
+  that are *already on the dealer's board* — manufacturing the exact orphan the ledger
+  exists to prevent. Every write below committed on its own before this lock existed;
+  committing them together preserves that and adds only the ordering.
+
+What this makes impossible is one thing precisely: **two pushes for one date interleaving**,
+so that each reads the other's not-yet-written claim, finds nothing to correct, and both
+persist a live claim on the same truck. That is acceptance I, and it measured 34–107
+violations per 400 concurrent trials before the lock and 0 per 400 after (both directions
+also confirmed by removing the lock as a mutant: 19/400 and 15/400).
+
+What it does **not** do is make the ERP write and the ledger write atomic. There is still no
+distributed transaction across AI_LM and GableLBM, and a lock orders this service against
+itself — it cannot order this service against a process that is no longer running. A crash,
+a `SIGKILL`, or a failed `COMMIT` between `PushDeliveryRoute` returning and the ledger being
+saved still leaves a route on the dealer's board that no ledger names, permanently, with
+nothing in this system able to see or recall it. **That is a reconciler's job and it is not
+built yet.** Until it is, the harm class is narrowed, not closed.
+
 > **One writer, by construction.** "No truck claimed by two plans, and no live route
 > upstream that no ledger names" depends on there being exactly ONE place in the binary
 > that can reach this endpoint. There used to be two. `internal/routing` served
