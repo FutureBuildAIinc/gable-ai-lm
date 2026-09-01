@@ -189,39 +189,69 @@ outcome on fresh state. Two boundaries on that replay:
   are excluded: another live ledger names those, and recalling one would cancel a route that
   plan relies on.
 
-**One push per date at a time, and what that does and does not buy.** `Push` runs inside an
-exclusive lock on its plan's **date** — `pg_try_advisory_xact_lock`, taken as the first
-statement of the transaction the whole push runs in, released by that transaction's `COMMIT`
-or `ROLLBACK`.
+**One writer per date at a time, and what that does and does not buy.** Every writer to a
+dispatch date — `Push`, a re-plan's supersede, a re-assignment's recall, and a late add's
+resolution — runs holding an exclusive claim on its plan's **date**. The claim is
+`pg_try_advisory_lock` (SESSION-scoped) taken on a connection from a **small pool dedicated
+to holds**, which the work never draws on. The work itself is **not** wrapped in a
+transaction.
 
 - **The date, not the plan, is the contended resource.** A date legitimately holds several
   plans and any of them may be pushed; `ReplaceDeliveryRoute` is keyed
   `(vehicle_id, scheduled_date)`. Locking the plan would leave two plans for one date racing
   exactly as before.
-- **Transaction-scoped, so a crash cannot wedge a date.** A session-scoped lock needs an
-  explicit unlock or the session to end; a killed process (or a connection parked by a
-  pooler) could hold a dispatch date shut with nobody left to open it. `COMMIT`/`ROLLBACK`
-  happen when the backend notices the client is gone, so no lease, sweeper or timeout is
-  needed to make that true.
-- **Contention fails fast.** It is a *try* lock: the second push answers `409` with a
-  sentence naming the date, having run no gate, sent nothing to GableLBM and written
-  nothing, so "try again" is a plain repeat. The alternative — queueing — would hold an HTTP
-  request *and* a pooled Postgres connection for the length of somebody else's push (up to
-  one 15s ERP timeout per truck), turning a rare correctness race into pool exhaustion that
-  reaches every other endpoint. Contention is observable as a `WARN` line and as `409`s on
-  `POST /api/v1/workflow/plans/{id}/push`, which the HTTP metrics middleware already labels
-  by path and status.
-- **The transaction always commits.** The push's own verdict is deliberately not returned
-  from the locked closure. Rolling back on a refusal would delete the ledger acks for routes
-  that are *already on the dealer's board* — manufacturing the exact orphan the ledger
-  exists to prevent. Every write below committed on its own before this lock existed;
-  committing them together preserves that and adds only the ordering.
+- **Not a transaction, so a slow push cannot take the service down.** The first version of
+  this used `pg_try_advisory_xact_lock`, which meant holding a date required holding an open
+  transaction, which pinned one of `DB_MAX_CONNS` pooled connections across every GableLBM
+  round-trip inside it — up to one 15s ERP timeout per truck. Since the claim deliberately
+  does *not* serialize different dates against each other, enough slow pushes on enough days
+  exhausted the pool for every endpoint including `/healthz/ready`. Measured with a pool of
+  5: 2 of 6 readiness probes failed at 5 concurrent slow operations and 26 of 30 at 25, with
+  a peak of 5 connections `idle in transaction`. It is 0 and 0 now.
+- **A dedicated pool, so pressure cannot take a live holder's date away.** The second
+  version was a lease row with a TTL and a renewal loop, which fixed the availability cost
+  and broke mutual exclusion: the lease survived only if the holder won a *pooled* connection
+  every renewal period. Against PostgreSQL 16 with a pool of 5 fully occupied for 28s by
+  queries well inside the deployment's own 30s `statement_timeout` — legal traffic, no fault
+  anywhere — a **second writer acquired the same date at t=30.03s while the first was still
+  writing it**. A session lock on a connection the holder already has cannot be starved of
+  the thing it already holds, and needs no TTL, no renewal and no clock.
+- **A crash releases the date by itself.** A session lock goes when its session goes, and a
+  killed process drops its sockets. For a machine that vanishes *without* closing them, the
+  hold pool asks the server for TCP keepalives, so Postgres reaps the session in about a
+  minute rather than at the OS default.
+- **Contention fails fast.** It is a *try* lock: the second writer answers `409` with error
+  code `DATE_BUSY` and a sentence naming the date, having run no gate, sent nothing to
+  GableLBM and written nothing, so "try again" is a plain repeat. The alternative — queueing
+  — would hold an HTTP request for the length of somebody else's push. Contention is
+  observable as a `WARN` line and as `409`s the HTTP metrics middleware already labels by
+  path and status.
+- **Every write still commits on its own.** The claim adds ORDERING and nothing else. A push
+  refuses with routes *already on the dealer's board* — a partial push is why the ledger
+  records acks per truck — and rolling those acks back would delete the only record of routes
+  that really are live upstream, manufacturing the exact orphan the ledger exists to prevent.
+- **`DB_DATE_HOLD_CONNS`** (default 16) is how many different dispatch dates one instance may
+  be writing at the same instant. Exceeding it is a truthful, retryable `409` — never an
+  unserialized write. To see what is held right now:
 
-What this makes impossible is one thing precisely: **two pushes for one date interleaving**,
+  ```sql
+  SELECT a.pid, a.application_name, a.state, l.classid, l.objid
+    FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+   WHERE l.locktype = 'advisory' AND l.classid = 1095975757;  -- 'AILM'
+  SELECT hashtext('2026-06-26')::oid;                         -- the objid for one date
+  ```
+
+  **A transaction-mode connection pooler in front of Postgres breaks session-scoped locks**,
+  because each statement may land on a different backend. AI_LM detects this rather than
+  running unserialized: the hold confirms `pg_backend_pid()` actually holds the lock, and
+  refuses the write if it does not. Point `DATABASE_URL` at the database directly, or use a
+  session-pooling mode.
+
+What this makes impossible is one thing precisely: **two writers to one date interleaving**,
 so that each reads the other's not-yet-written claim, finds nothing to correct, and both
-persist a live claim on the same truck. That is acceptance I, and it measured 34–107
-violations per 400 concurrent trials before the lock and 0 per 400 after (both directions
-also confirmed by removing the lock as a mutant: 19/400 and 15/400).
+persist a live claim on the same truck. That is acceptance I, and it measured 34–332
+violations per 400 concurrent trials before the claim and 0 per 400 after, across all ten
+pairs of the four date writers in both orderings.
 
 What it does **not** do is make the ERP write and the ledger write atomic. There is still no
 distributed transaction across AI_LM and GableLBM, and a lock orders this service against

@@ -193,13 +193,19 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
   rollback. The migrator (`cmd/migrate`) skips `*_down.sql`. Current set:
   `001_ai_lm_core`, `002_route_plan_loads`, `003_workflow_plans`,
   `004_workflow_plans_version` (optimistic-lock `version` column),
-  `005_workflow_date_leases` (exclusive, expiring hold on one dispatch date —
-  every writer to a date's dispatch board takes it; see
-  `internal/workflow/datelease.go`).
+  `005_workflow_date_leases` (the lease row that held a dispatch date) and
+  `006_workflow_date_leases_drop` (it stops being a row: the hold is now a
+  SESSION-scoped `pg_try_advisory_lock` on a connection from a pool dedicated to
+  holds, so it cannot be starved by the work pool and needs no TTL — see
+  `internal/workflow/datehold.go`).
 
 ### Backend Code
 - Config: env vars with `godotenv` fallback (`internal/config/config.go`). Default DB URL
-  points to **:5434** (docker-compose mapping). Integration: `GABLE_API_URL`,
+  points to **:5434** (docker-compose mapping). `cmd/server` opens **two** pools on that URL:
+  the work pool (`DB_MAX_CONNS`, default 25) and a small dedicated pool the dispatch-date
+  holds live on (`DB_DATE_HOLD_CONNS`, default 16). They must stay separate — a hold whose
+  survival depends on winning a connection from the pool its own work is draining can be
+  starved out of its own lock, which is how a date once ended up with two writers. Integration: `GABLE_API_URL`,
   `GABLE_INTEGRATION_KEY`. Licensing: `LICENSE_TOKEN` / `LICENSE_FILE` /
   `LICENSE_PUBLIC_KEY`, all optional (see below).
 - Server entry point: `backend/cmd/server/main.go` — wires every module repo→service→handler.
@@ -377,6 +383,11 @@ at test time via `license.Mint`.
 - **Concurrency control on plan writes** — migration `004` adds a `version` column and
   `workflow.Repository` does a compare-and-set update; a lost race returns
   `ErrVersionConflict` → HTTP 409. Regression tests run under `-race`.
+- **One writer per dispatch date** — every writer to a date's board (push, re-plan,
+  re-assign, late-add resolution) holds an exclusive claim on the DATE before it commits or
+  sends anything; a contender answers 409 `DATE_BUSY` having done nothing. The claim is a
+  session-scoped advisory lock on a dedicated pool (`internal/workflow/datehold.go`); the
+  file documents the two substrates it replaced and exactly what each one cost.
 - **Configurable depot** — `workflow.resolveDepot` resolves request → `DEPOT_LAT/LNG`
   config → stop centroid, records the source on the plan, and a regression test names
   the retired hardcoded coordinates so they can never come back.

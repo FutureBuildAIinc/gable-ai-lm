@@ -89,6 +89,13 @@ type Config struct {
 	DBMaxConns        int32
 	DBMinConns        int32
 	DBMaxConnLifetime int // minutes
+	// DBDateHoldConns sizes the SEPARATE pool the dispatch-date holds live on
+	// (internal/workflow). It is not a tuning knob for throughput: it is how
+	// many different dispatch DATES this instance may be writing at the same
+	// instant, each holding one idle connection for the length of one
+	// operation. Exceeding it is a truthful retryable refusal, never an
+	// unserialized write.
+	DBDateHoldConns int32
 }
 
 func Load() (*Config, error) {
@@ -137,6 +144,7 @@ func Load() (*Config, error) {
 		DBMaxConns:        int32(getEnvInt("DB_MAX_CONNS", 25)),
 		DBMinConns:        int32(getEnvInt("DB_MIN_CONNS", 2)),
 		DBMaxConnLifetime: getEnvInt("DB_MAX_CONN_LIFETIME_MIN", 60),
+		DBDateHoldConns:   int32(getEnvInt("DB_DATE_HOLD_CONNS", 16)),
 	}
 
 	// In non-dev mode, DATABASE_URL must be explicitly set — the localhost

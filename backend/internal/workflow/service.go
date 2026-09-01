@@ -212,8 +212,26 @@ func (s *Service) WithMeter(m *metrics.Meter) *Service {
 // because "nothing was sent, nothing changed, try again" is the same promise
 // every time and a dispatcher should not have to re-read it to check.
 func (s *Service) holdDate(ctx context.Context, date, held, refused string, fn func(ctx context.Context) error) error {
-	err := s.repo.WithDateLock(ctx, date, fn)
+	// This request may already hold this date. Approving a late add is one
+	// operation to the dispatcher and two to this package — it resolves the
+	// queue entry and then re-assigns — and the second half must run under the
+	// claim the first half took, not ask for it again and be refused BY ITSELF.
+	//
+	// Re-entrancy lives here rather than in the store because it is a fact
+	// about one REQUEST, not about the substrate: the claim is genuinely held,
+	// exclusively, for the whole of both halves.
+	if dateHeldBy(ctx) == date {
+		return fn(ctx)
+	}
+	err := s.repo.WithDateLock(ctx, date, func(inner context.Context) error {
+		return fn(markDateHeld(inner, date))
+	})
 	switch {
+	case errors.Is(err, ErrDateHoldsFull):
+		slog.Warn("refused a write to a dispatch date because no hold connection was free",
+			"date", date, "refused", refused)
+		return busyf("%s could not be claimed because this service is already writing as many dispatch dates at once as it has room for, so %s. Nothing was sent to GableLBM and nothing on the dispatch board changed — wait a moment and try again.",
+			date, refused)
 	case errors.Is(err, ErrDateBusy):
 		// Observable on purpose, in three places: this line, the sentence the
 		// dispatcher reads, and the 409 the handler answers (which the HTTP
@@ -229,6 +247,26 @@ func (s *Service) holdDate(ctx context.Context, date, held, refused string, fn f
 		return refusedf("%s was taken over by another dispatcher while this was running, so it was stopped part-way. Reload the plan and check the dispatch board before trying again.", date)
 	}
 	return err
+}
+
+// dateHeldKey carries "this request already holds this dispatch date" down the
+// call chain.
+//
+// It is a context value rather than a field on Service because it is per
+// REQUEST and Service is shared by all of them; a field would make one
+// dispatcher's claim visible to every other dispatcher in the process, which is
+// the exact opposite of what a claim means.
+type dateHeldKey struct{}
+
+// markDateHeld records the claim on the context fn runs under.
+func markDateHeld(ctx context.Context, date string) context.Context {
+	return context.WithValue(ctx, dateHeldKey{}, date)
+}
+
+// dateHeldBy reports which dispatch date this call chain already holds, if any.
+func dateHeldBy(ctx context.Context) string {
+	d, _ := ctx.Value(dateHeldKey{}).(string)
+	return d
 }
 
 // Get returns a plan by id, with any scheduled lock evaluated for display.

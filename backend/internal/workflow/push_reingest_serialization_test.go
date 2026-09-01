@@ -371,21 +371,45 @@ func TestAReassignmentRacingAPushNeverCancelsTheRouteItJustWrote(t *testing.T) {
 // ledger mirroring it. The table is the audit: a path added here that does not
 // appear below is a path that can run through somebody else's claim.
 //
-// Pack, Resequence, SetPriority, SetLineDimensions, the lock/unlock pair, the
-// late-add pair and the proof/sign-off pair are deliberately ABSENT: none of
-// them recalls a route, pushes one, or writes a LiveRoute entry, so none of
-// them can put this date's board and its ledgers out of step. They are guarded
-// by the plan's optimistic version, which is the right tool for "two people
-// editing one plan" and the wrong one for "two people editing one DATE".
+// LATE-ADD RESOLUTION was absent and should not have been. The note here used to
+// say the late-add pair "recalls no route, pushes none, and writes no LiveRoute
+// entry" — which is true of QUEUEING one (AddLateOrder) and false of RESOLVING
+// one: approval is the manual authorization to reshuffle a locked run, so it
+// ends in a re-assignment, and a re-assignment recalls the routes the reshuffle
+// drops off the dealer's board. It is a writer to the date and it is in the
+// table now.
+//
+// Pack, Resequence, SetPriority, SetLineDimensions, the lock/unlock pair,
+// AddLateOrder and the proof/sign-off pair remain deliberately ABSENT: none of
+// them recalls a route, pushes one, or writes a LiveRoute entry, so none of them
+// can put this date's board and its ledgers out of step. They are guarded by the
+// plan's optimistic version, which is the right tool for "two people editing one
+// plan" and the wrong one for "two people editing one DATE".
 var dateWriters = []struct {
 	name string
 	path string
 	body string
 	want int // the status when the claim is available
+	// plan builds this writer's target plan, because one of them needs state
+	// the others do not: a late add cannot be resolved unless one is queued.
+	plan func() *Plan
 }{
-	{name: "push", path: "/api/v1/workflow/plans/plan-1/push", body: ``, want: http.StatusOK},
-	{name: "re-plan (ingest)", path: "/api/v1/workflow/plans", body: `{"date":"2026-06-26","override":true,"approved_by":"dispatcher@dealer.com"}`, want: http.StatusCreated},
-	{name: "re-assign", path: "/api/v1/workflow/plans/plan-1/assign", body: `{"override":true,"approved_by":"dispatcher@dealer.com"}`, want: http.StatusOK},
+	{name: "push", path: "/api/v1/workflow/plans/plan-1/push", body: ``, want: http.StatusOK,
+		plan: func() *Plan { return planForTrucks("v1", "v2") }},
+	{name: "re-plan (ingest)", path: "/api/v1/workflow/plans", body: `{"date":"2026-06-26","override":true,"approved_by":"dispatcher@dealer.com"}`, want: http.StatusCreated,
+		plan: func() *Plan { return planForTrucks("v1", "v2") }},
+	{name: "re-assign", path: "/api/v1/workflow/plans/plan-1/assign", body: `{"override":true,"approved_by":"dispatcher@dealer.com"}`, want: http.StatusOK,
+		plan: func() *Plan { return planForTrucks("v1", "v2") }},
+	{name: "late-add resolution", path: "/api/v1/workflow/plans/plan-1/late-adds/o-v2/resolve", body: `{"approved_by":"dispatcher@dealer.com"}`, want: http.StatusOK,
+		plan: planWithAQueuedLateAdd},
+}
+
+// planWithAQueuedLateAdd is planForTrucks with a late add waiting on a decision,
+// so the resolve endpoint has something real to resolve.
+func planWithAQueuedLateAdd() *Plan {
+	p := planForTrucks("v1", "v2")
+	p.LateAdds = []LateAdd{{OrderID: "o-v2", Status: LateAddPending}}
+	return p
 }
 
 // TestEveryWriterToADateIsRefusedWhileTheDateIsHeld is the deterministic
@@ -400,7 +424,7 @@ var dateWriters = []struct {
 func TestEveryWriterToADateIsRefusedWhileTheDateIsHeld(t *testing.T) {
 	for _, w := range dateWriters {
 		t.Run(w.name, func(t *testing.T) {
-			d := newDispatchDay(t, planForTrucks("v1", "v2"))
+			d := newDispatchDay(t, w.plan())
 			d.push("plan-1") // the date is live, so every writer below has real work to refuse
 
 			var (
@@ -469,13 +493,14 @@ func TestEveryWriterToADateIsRefusedWhileTheDateIsHeld(t *testing.T) {
 //     version-conflict 409 without matching prose.
 func TestADateBusyRefusalTellsTheDispatcherSomethingTrue(t *testing.T) {
 	wantPhrase := map[string]string{
-		"push":             "this push did not run",
-		"re-plan (ingest)": "the day was not re-planned",
-		"re-assign":        "the trucks were not re-assigned",
+		"push":                "this push did not run",
+		"re-plan (ingest)":    "the day was not re-planned",
+		"re-assign":           "the trucks were not re-assigned",
+		"late-add resolution": "the late add was not resolved",
 	}
 	for _, w := range dateWriters {
 		t.Run(w.name, func(t *testing.T) {
-			d := newDispatchDay(t, planForTrucks("v1", "v2"))
+			d := newDispatchDay(t, w.plan())
 			d.push("plan-1")
 
 			var body []byte

@@ -57,6 +57,20 @@ type PoolConfig struct {
 	// bound it has.
 	StatementTimeout time.Duration
 	IdleInTxTimeout  time.Duration
+
+	// Extra is merged into the connection's startup parameters AFTER the two
+	// ceilings above, so a purpose-built pool can say things about itself that
+	// the general one has no business saying — and a key here wins, because a
+	// caller that names a parameter explicitly meant it.
+	//
+	// It exists for the dispatch-date hold pool (internal/workflow), whose
+	// connections are deliberately unlike the work pool's: they are checked out
+	// and IDLE for the length of an operation while holding a session-scoped
+	// advisory lock, they name themselves in pg_stat_activity so an operator can
+	// see what is holding a date, and they ask the SERVER to notice a dead
+	// client (tcp_keepalives_*) rather than waiting for the OS default, because
+	// the lock is only released when that session ends.
+	Extra map[string]string
 }
 
 // Default statement / transaction ceilings. They are minutes rather than
@@ -115,6 +129,9 @@ func poolConfigFor(connString string, pc PoolConfig) (*pgxpool.Config, error) {
 	// connection — rather than to whichever session happened to run a SET.
 	config.ConnConfig.RuntimeParams["statement_timeout"] = millis(st)
 	config.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = millis(idle)
+	for k, v := range pc.Extra {
+		config.ConnConfig.RuntimeParams[k] = v
+	}
 	return config, nil
 }
 

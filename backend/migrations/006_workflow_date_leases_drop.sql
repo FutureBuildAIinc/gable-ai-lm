@@ -1,0 +1,45 @@
+-- SPDX-License-Identifier: LicenseRef-OpenLBM-Community-Source-1.0
+-- SPDX-FileCopyrightText: 2026 FutureBuild, Inc. and OpenLBM contributors
+
+-- 006_workflow_date_leases_drop.sql
+-- The dispatch-date hold stops being a row.
+--
+-- WHY THE ROW IS GONE
+--
+-- 005 replaced a transaction-scoped advisory lock with a lease row because the
+-- lock held a pooled connection for the whole of an operation and starved a
+-- 25-connection pool shared with every endpoint in the service. That cost was
+-- real and the row fixed it. What the row could not do is stay held: it lives
+-- only as long as expires_at, so the holder had to RENEW, and the renewal
+-- needed a connection from the very pool whose exhaustion this whole line of
+-- work exists to survive.
+--
+-- Measured against PostgreSQL 16 with the constants 005 shipped (TTL 30s,
+-- renewal every 8s): one pool of five, every connection parked for 28s in
+-- queries well inside the deployment's own 30s statement_timeout -- legal
+-- traffic, no fault anywhere -- and a SECOND writer acquired the same dispatch
+-- date at t=30.03s while the first was still writing it. With two instances the
+-- same pressure on instance-1 alone let instance-2 hold the date from t=30.06s
+-- to t=32.06s while instance-1 wrote on until t=38.03s.
+--
+-- WHAT REPLACES IT
+--
+-- pg_try_advisory_lock (SESSION-scoped) on a connection from a small pool
+-- dedicated to holds, which the work never draws on. The holder cannot be
+-- starved out of its own lock because it is not asking for anything: it already
+-- holds the connection. There is no TTL, no renewal, no clock and no sweeper,
+-- and a dead process releases its locks by its session ending. See
+-- internal/workflow/datehold.go.
+--
+-- WHAT AN OPERATOR ASKS INSTEAD OF QUERYING THIS TABLE
+--
+--   SELECT a.pid, a.application_name, a.state, a.backend_start, l.classid, l.objid
+--     FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+--    WHERE l.locktype = 'advisory' AND l.classid = 1095975757;   -- 'AILM'
+--   -- and to name a date:
+--   SELECT hashtext('2026-06-26')::oid;
+--
+-- DROPPING IS LOSSLESS. A row here recorded only who held a date at that
+-- instant and until when -- never anything about a plan, a route or a truck --
+-- and no row in it can outlive one operation.
+DROP TABLE IF EXISTS workflow_date_leases;

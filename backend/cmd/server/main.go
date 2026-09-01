@@ -114,6 +114,23 @@ func main() {
 	}
 	logger.Info("Connected to database")
 
+	// 3a. The dispatch-date hold pool — SEPARATE from the pool above, and that
+	// separation is the point rather than an optimisation.
+	//
+	// internal/workflow serializes every writer to one dispatch date behind a
+	// session-scoped advisory lock held on a checked-out connection. Taking
+	// those connections from the work pool would make the hold's survival
+	// depend on winning a connection from the pool its own work is draining —
+	// which is how the lease this replaced handed one date to two writers under
+	// ordinary load. These connections are idle almost always: one per date
+	// being written, running a lock, an unlock and a liveness check.
+	holdDB, err := database.Connect(cfg.DatabaseURL, workflow.DateHoldPoolConfig(cfg.DBDateHoldConns))
+	if err != nil {
+		logger.Error("Failed to open the dispatch-date hold pool", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Dispatch-date hold pool ready", "conns", cfg.DBDateHoldConns)
+
 	// 3b. Prometheus metrics.
 	metrics.Register()
 	metricsCtx, metricsCancel := context.WithCancel(context.Background())
@@ -210,7 +227,7 @@ func main() {
 	compliance.NewHandler(complianceSvc).RegisterRoutes(mux, writeGuard)
 
 	// Guided end-to-end workflow: ingest → analyze → assign → pack → review → push.
-	workflowSvc := workflow.NewService(workflow.NewRepository(db), gableClient, catalogSvc, fleetSvc, complianceSvc, aiClient,
+	workflowSvc := workflow.NewService(workflow.NewRepository(db, holdDB), gableClient, catalogSvc, fleetSvc, complianceSvc, aiClient,
 		workflow.Config{
 			SecurementJurisdiction:    cfg.SecurementJurisdiction,
 			SecurementAnchorSpacingIn: cfg.SecurementAnchorSpacingIn,
@@ -325,7 +342,12 @@ func main() {
 	}
 	logger.Info("Shutdown step 2/3: stopping metrics collector...")
 	metricsCancel()
-	logger.Info("Shutdown step 3/3: closing database pool...")
+	logger.Info("Shutdown step 3/3: closing database pools...")
+	// The hold pool closes with the work pool and not before it. Step 1 has
+	// already drained the in-flight requests, so every dispatch-date hold has
+	// been released by its own writer; closing this pool earlier would end those
+	// sessions under writers still using them.
+	holdDB.Close()
 	db.Close()
 	logger.Info("Server exiting — clean shutdown complete")
 }

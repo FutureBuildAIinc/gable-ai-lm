@@ -112,3 +112,42 @@ func TestPoolConfigForRejectsAnUnparseableDSN(t *testing.T) {
 		t.Fatal("an unparseable connection string must be an error")
 	}
 }
+
+// TestPoolConfigForAppliesAPoolsOwnStartupParameters.
+//
+// Extra is how a purpose-built pool says what it is. The dispatch-date hold pool
+// (internal/workflow) uses it for three things that are each invisible until the
+// day they matter: the application_name an operator greps pg_stat_activity for
+// during an incident, the TCP keepalives that bound how long a machine that
+// vanished can hold a dispatch date shut, and a statement ceiling of its own. A
+// merge that silently dropped them would leave all three working exactly as
+// before — until a node lost power.
+func TestPoolConfigForAppliesAPoolsOwnStartupParameters(t *testing.T) {
+	cfg, err := poolConfigFor("postgres://u:p@localhost:5432/db", PoolConfig{
+		MaxConns: 4, MinConns: 4,
+		StatementTimeout: 2 * time.Second,
+		Extra: map[string]string{
+			"application_name":    "ailm-date-holds",
+			"tcp_keepalives_idle": "30",
+			// A key here names a parameter explicitly, so it wins over the
+			// package default rather than being quietly ignored.
+			"idle_in_transaction_session_timeout": "1234",
+		},
+	})
+	if err != nil {
+		t.Fatalf("poolConfigFor: %v", err)
+	}
+	rp := cfg.ConnConfig.RuntimeParams
+	if rp["application_name"] != "ailm-date-holds" {
+		t.Errorf("application_name = %q — a pool that cannot name itself cannot be found in pg_stat_activity", rp["application_name"])
+	}
+	if rp["tcp_keepalives_idle"] != "30" {
+		t.Errorf("tcp_keepalives_idle = %q, want 30", rp["tcp_keepalives_idle"])
+	}
+	if rp["statement_timeout"] != "2000" {
+		t.Errorf("statement_timeout = %q, want 2000", rp["statement_timeout"])
+	}
+	if rp["idle_in_transaction_session_timeout"] != "1234" {
+		t.Errorf("idle_in_transaction_session_timeout = %q — an explicit key must beat the default", rp["idle_in_transaction_session_timeout"])
+	}
+}

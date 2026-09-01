@@ -11,6 +11,7 @@ import (
 
 	"github.com/FutureBuildAIinc/gable-ai-lm/pkg/database"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrNotFound is returned when a workflow plan does not exist.
@@ -52,14 +53,30 @@ func busyf(format string, a ...any) error {
 
 type Repository struct {
 	db *database.DB
-	// hold is the exclusive, time-bounded claim on one dispatch date. See
-	// datelease.go for why it is a lease row and not the transaction-scoped
-	// advisory lock it replaces.
+	// hold is the exclusive claim on one dispatch date. It is a SESSION-scoped
+	// advisory lock on a connection from its OWN small pool — see datehold.go
+	// for the three substrates this has been and why it is this one.
 	hold dateHold
 }
 
-func NewRepository(db *database.DB) *Repository {
-	return &Repository{db: db, hold: newDateHold(pgDateLeases{db: db})}
+// NewRepository wires the plan store to the WORK pool and the dispatch-date
+// hold to its OWN pool.
+//
+// Two pools is the entire fix for the defect that shipped: a hold whose
+// liveness depends on winning a connection from the pool its own work is using
+// can be starved out of its own lock by that work, and pool pressure is the
+// harm this serialization exists to survive. holds must therefore be a pool
+// nothing else draws on — dial it with DateHoldPoolConfig.
+//
+// Passing the same *database.DB for both is not rejected, because there is no
+// honest way to detect it, but it reinstates exactly that coupling. cmd/server
+// dials two.
+func NewRepository(db, holds *database.DB) *Repository {
+	var pool *pgxpool.Pool
+	if holds != nil {
+		pool = holds.Pool
+	}
+	return &Repository{db: db, hold: newDateHold(pgDateHolds{pool: pool})}
 }
 
 // payload is everything outside the dedicated columns, stored as one JSONB doc.
@@ -283,15 +300,22 @@ func (r *Repository) GetLatestForDate(ctx context.Context, date string) (*Plan, 
 // It is a TRY claim, so contention FAILS FAST with ErrDateBusy rather than
 // queueing. See Service.Push for that decision and its cost.
 //
-// The claim is a LEASE ROW, not a transaction-scoped advisory lock, and fn does
-// NOT run inside a transaction. That is the whole point: fn makes several
-// GableLBM round-trips, and holding a pooled connection across them starved a
-// 25-connection pool shared with every other endpoint in the service. Each
-// repository call fn makes therefore commits on its own, exactly as it did
-// before any of this serialization existed — the claim adds ordering between
-// writers, and nothing else. datelease.go has the full argument, including what
-// the lease gives up (a dead holder is cleared by expiry rather than by its
-// transaction unwinding) and how it buys that back.
+// The claim is a SESSION-scoped advisory lock held on a connection from a
+// SEPARATE, dedicated pool, and fn does NOT run inside a transaction. Both
+// halves matter and each answers a defect that shipped:
+//
+//   - not a transaction, so no connection from the WORK pool is pinned across
+//     fn's GableLBM round-trips. Each repository call fn makes commits on its
+//     own, exactly as it did before any serialization existed; the claim adds
+//     ordering between writers and nothing else.
+//   - session-scoped on a dedicated connection, so the holder cannot be starved
+//     out of its own claim. The lease row this replaces had to win a POOLED
+//     connection every renewal period to stay alive, which made ordinary
+//     pressure on the work pool — the very thing the first bullet exists to
+//     prevent — silently hand one date to two writers.
+//
+// datehold.go has the full argument, including what a session lock costs when a
+// machine vanishes and what pays for it.
 func (r *Repository) WithDateLock(ctx context.Context, date string, fn func(ctx context.Context) error) error {
 	return r.hold.run(ctx, date, fn)
 }

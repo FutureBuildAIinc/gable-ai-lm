@@ -222,10 +222,59 @@ func (s *Service) AddLateOrder(ctx context.Context, id string, req LateAddReques
 // ResolveLateAdd approves or rejects a queued late add (T2-3). Approval is the
 // manual authorization to reshuffle the locked run, so it re-runs assignment
 // (with override) to incorporate the order; rejection drops it from the run.
+//
+// It CLAIMS THE DATE FIRST, and that ordering is the whole of this function's
+// correctness. Approving a late add ends in a re-assignment, which recalls the
+// routes the reshuffle drops from the dealer's dispatch board, so this is a
+// writer to the date like any other. It used to take the claim halfway through:
+// the queue entry was marked APPROVED and COMMITTED, and only then did Assign
+// ask for the date. A dispatcher who lost that race was told
+//
+//	"...Nothing was sent to GableLBM and nothing on the dispatch board changed
+//	 — wait a moment and try again."
+//
+// under a Try again button, with the late add already resolved. The sentence
+// was false and pressing the button answered 422 ("already APPROVED") for ever.
+// Refusing before anything is written is what makes both true again.
 func (s *Service) ResolveLateAdd(ctx context.Context, id, orderID string, req LateAddApproveRequest) (*Plan, error) {
+	// One read before the claim, for one fact: WHICH date this contends for.
+	// It commits nothing and sends nothing, which is what keeps the refusal
+	// above true. Every gate and every write below re-reads under the claim.
+	head, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	date := head.PlanDate
+
+	var plan *Plan
+	err = s.holdDate(ctx, date, "changed", "the late add was not resolved", func(ctx context.Context) error {
+		var verdict error
+		plan, verdict = s.resolveLateAddHeld(ctx, id, date, orderID, req)
+		return verdict
+	})
+	if err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// resolveLateAddHeld is ResolveLateAdd's body, running with this date claimed.
+//
+// The Assign call at the end re-enters the claim this already holds rather than
+// taking a second one — see Service.holdDate.
+func (s *Service) resolveLateAddHeld(ctx context.Context, id, date, orderID string, req LateAddApproveRequest) (*Plan, error) {
+	// Re-read under the claim. The copy ResolveLateAdd read to find the date
+	// was read unclaimed, and resolving against it would be resolving against a
+	// snapshot another writer may have moved past between the two.
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if p.PlanDate != date {
+		// Unreachable: a plan's date is set at ingest and no transition writes
+		// it. Asserted rather than assumed, because the claim is keyed on the
+		// value read BEFORE it was taken.
+		return nil, refusedf("this plan moved from %s to %s while the late add was being resolved — reload and try again", date, p.PlanDate)
 	}
 
 	idx := -1
