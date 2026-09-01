@@ -142,11 +142,7 @@ func TestAGhostClaimNeverRecallsAnotherPlansLiveRoute(t *testing.T) {
 func TestAPushWhoseFinalSaveLosesAVersionRaceKeepsItsLedger(t *testing.T) {
 	d := newDispatchDay(t, planForTrucks("v1", "v2"))
 
-	// Fires once, immediately before Push's own CONFIRMING save lands — the
-	// skip steps over the claim Push now publishes before it calls the ERP, so
-	// this stays "a dispatcher locked the run while the push was out at the
-	// ERP" rather than "before it had sent anything".
-	d.store.beforeUpdateSkip = 1
+	// Fires once, immediately before Push's own save lands.
 	d.store.beforeUpdate = func() {
 		rec := d.post("/api/v1/workflow/plans/plan-1/lock", `{"locked":true,"locked_by":"dispatcher@dealer.com"}`)
 		if rec.Code != http.StatusOK {
@@ -212,7 +208,6 @@ func TestAPartialPushThatAlsoLosesTheVersionRaceKeepsItsLedger(t *testing.T) {
 	d := newDispatchDay(t, planForTrucks("v1"), planForTrucks("v1", "v2"))
 	d.push("plan-1")
 
-	d.store.beforeUpdateSkip = 1 // step over the push's own write-ahead claim
 	d.store.beforeUpdate = func() {
 		rec := d.post("/api/v1/workflow/plans/plan-2/lock", `{"locked":true,"locked_by":"dispatcher@dealer.com"}`)
 		if rec.Code != http.StatusOK {
@@ -302,14 +297,8 @@ func contains(in []string, want string) bool {
 func TestAPushOverruledByAConcurrentRepackStillRecordsItsRoutes(t *testing.T) {
 	d := newDispatchDay(t, planForTrucks("v1", "v2"))
 
-	d.store.beforeUpdateSkip = 1 // step over the push's own write-ahead claim
 	d.store.beforeUpdate = func() {
-		// The re-pack carries an approval because by this point the push has
-		// PUBLISHED its claim on both trucks, and a claim published ahead of
-		// the wire call counts as live for every gate in this package — the
-		// route may already be on the dealer's board and no gate can tell.
-		// Re-packing over it is exactly the 423 the override idiom exists for.
-		rec := d.post("/api/v1/workflow/plans/plan-1/pack", `{"override":true,"approved_by":"dispatcher@dealer.com"}`)
+		rec := d.post("/api/v1/workflow/plans/plan-1/pack", ``)
 		if rec.Code != http.StatusOK {
 			t.Errorf("setup: the competing re-pack must land: %d (%s)", rec.Code, rec.Body.String())
 		}
@@ -366,54 +355,55 @@ type listErrStore struct {
 
 func (s listErrStore) ListForDate(context.Context, string) ([]*Plan, error) { return nil, s.err }
 
-// TestACorrectionThatCouldNotEvenLookWritesNothing is the boundary on giving
-// claims up, restated the only way write-ahead leaves open.
+// TestACorrectionThatCouldNotEvenLookKeepsItsOwnClaims is the boundary on
+// giving claims up.
 //
-// The old shape of this test asserted that a push whose by-date lookup failed
-// KEPT its own claims, and it was seeded with ONE PLAN ON THE DATE — so the
-// boundary it guarded could not produce the double claim it is a boundary on.
-// With a rival present, the same store double persisted plan-2 holding v1 while
-// plan-1 still held it: one transient database read, no concurrency, no ERP
-// failure, GableLBM up throughout, and a stored double claim.
+// Retracting is only safe when another ledger is known to be holding the truck.
+// When the lookup itself failed, nothing is known — and a plan that gave up its
+// claims on a guess would leave every route it just wrote live on the dealer's
+// board with NO ledger naming it, which is the orphan this package exists to
+// prevent, self-inflicted.
+func TestACorrectionThatCouldNotEvenLookKeepsItsOwnClaims(t *testing.T) {
+	d := newDispatchDay(t, planForTrucks("v1", "v2"))
+	d.svc.repo = listErrStore{fakePlanStore: d.store, err: errors.New("dial tcp: connection refused")}
+
+	rec := d.post("/api/v1/workflow/plans/plan-1/push", ``)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("the failed correction must be reported: %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got := sorted(liveVehicleIDs(d.store.stored("plan-1"))); !equalStrings(got, []string{"v1", "v2"}) {
+		t.Errorf("plan-1 claims %v, want both routes it wrote — with the lookup down, nothing is known about rival claims and giving these up would orphan them outright", got)
+	}
+	d.assertAcceptance()
+}
+
+// TestAPushThatCouldNotRecordItselfLeavesTheRivalClaimStanding is where the two
+// abandonments meet: the correction gave up on plan-1's claim, and then the
+// push could not record itself either.
 //
-// Inverting the order removes the dilemma rather than picking a side. The
-// lookup is now a PRECONDITION: it happens before the first wire call, so a
-// push that cannot tell who else holds these trucks has not yet displaced
-// anybody, and handing the reservation back costs nothing and strands nothing.
-func TestACorrectionThatCouldNotEvenLookWritesNothing(t *testing.T) {
+// The withdrawal that keeps an unrecorded push from orphaning routes must skip
+// exactly the trucks whose claim this push handed back. Those routes are not
+// orphans — plan-1's ledger names them, and plan-1 is what will recall them.
+// Withdrawing one would take a route off the dealer's board that a live ledger
+// still points at, which is the same harm from the other side.
+func TestAPushThatCouldNotRecordItselfLeavesTheRivalClaimStanding(t *testing.T) {
 	d := newDispatchDay(t, planForTrucks("v1"), planForTrucks("v1", "v2"))
 	d.push("plan-1")
-	d.assertAcceptance()
-
-	sent := d.g.pushCalls
-	d.svc.repo = listErrStore{fakePlanStore: d.store, err: errors.New("dial tcp: connection refused")}
+	d.svc.repo = conflictingUpdateStore{d.store}
 
 	rec := d.post("/api/v1/workflow/plans/plan-2/push", ``)
 
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("the failed lookup must be reported: %d (%s)", rec.Code, rec.Body.String())
-	}
-	if wrote := d.g.pushCalls - sent; wrote != 0 {
-		t.Errorf("the push wrote %d route(s) to the dealer's board without being able to tell who else holds those trucks — the lookup has to be a precondition, not an apology", wrote)
-	}
-	if got := liveVehicleIDs(d.store.stored("plan-2")); len(got) != 0 {
-		t.Errorf("plan-2 claims %v after writing nothing — a push that could not check must not keep a claim it never made exclusive and never used", got)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)", rec.Code, rec.Body.String())
 	}
 	if got := sorted(liveVehicleIDs(d.store.stored("plan-1"))); !equalStrings(got, []string{"v1"}) {
-		t.Errorf("plan-1 claims %v, want v1 — nothing displaced it, so nothing may take its claim away", got)
+		t.Fatalf("setup: plan-1's ledger is unwritable, so it still claims %v", got)
+	}
+	if got := sorted(d.g.pushedIDs()); !equalStrings(got, []string{"v1"}) {
+		t.Errorf("the board holds %v, want just v1 — v2 was written and never recorded anywhere and must come back off, while v1 is still named by plan-1's ledger and must not", got)
 	}
 	d.assertAcceptance()
-
-	// And it is a refusal, not a wedge: the plain retry finishes the run.
-	d.svc.repo = d.store
-	d.push("plan-2")
-	d.assertAcceptance()
-	if got := liveVehicleIDs(d.store.stored("plan-1")); len(got) != 0 {
-		t.Errorf("plan-1 still claims %v after plan-2 took both trucks over", got)
-	}
-	if got := sorted(liveVehicleIDs(d.store.stored("plan-2"))); !equalStrings(got, []string{"v1", "v2"}) {
-		t.Errorf("plan-2 claims %v, want both trucks", got)
-	}
 }
 
 // flakyListStore fails the by-date read the ledger correction depends on, until
@@ -431,49 +421,42 @@ func (s *flakyListStore) ListForDate(ctx context.Context, date string) ([]*Plan,
 	return s.fakePlanStore.ListForDate(ctx, date)
 }
 
-// TestACorrectionMissedDuringAnOutageIsNeverOwed replaces a test that PASSED
-// THROUGH the violating state.
+// TestACorrectionMissedDuringAnOutageIsPaidByTheNextAttempt is why the
+// correction is fed every truck this plan CLAIMS and not the trucks this
+// attempt WROTE.
 //
-// Its predecessor let the outage push land on v1, leaving plan-1 claiming a
-// route that push had destroyed, and called assertAcceptance only after a later
-// resume had cleaned it up — so its own midpoint failed the oracle and the
-// suite never asked. "The next attempt pays the arrears" is not a fix: nothing
-// guarantees a next attempt, and the recall path fires first, so between the
-// two calls a plain re-assign of plan-1 would take plan-2's live route off the
-// dealer's board.
-//
-// With the lookup ahead of the wire call the arrears are never incurred. The
-// oracle is therefore asserted after EVERY step, including the one in the
-// middle, and the middle is now a state a dispatcher can sit in indefinitely.
-func TestACorrectionMissedDuringAnOutageIsNeverOwed(t *testing.T) {
+// The two only differ once an attempt has been unable to pay a correction it
+// owed. Here the by-date read is down when plan-2's partial push lands on v1,
+// so plan-1 is left claiming a route that push destroyed. The resume then skips
+// v1 — it is live and byte-for-byte identical — so v1 is in no later attempt's
+// written set, and a correction keyed on the written set can never be paid by
+// anybody. Keying it on the claim makes the next push pay the arrears.
+func TestACorrectionMissedDuringAnOutageIsPaidByTheNextAttempt(t *testing.T) {
 	d := newDispatchDay(t, planForTrucks("v1"), planForTrucks("v1", "v2"))
 	d.push("plan-1")
-	d.assertAcceptance()
 
 	repo := &flakyListStore{fakePlanStore: d.store, err: errors.New("dial tcp: connection refused")}
 	d.svc.repo = repo
+	d.g.pushErrAfter = d.g.pushCalls + 1
 
 	if rec := d.post("/api/v1/workflow/plans/plan-2/push", ``); rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("the outage must be reported, got %d (%s)", rec.Code, rec.Body.String())
+		t.Fatalf("setup: the partial push must be reported, got %d (%s)", rec.Code, rec.Body.String())
 	}
-	if got := sorted(d.g.pushedIDs()); !equalStrings(got, []string{"v1"}) {
-		t.Errorf("the board holds %v, want just plan-1's v1 — nothing may reach the dealer while the date cannot be read", got)
+	if got := sorted(liveVehicleIDs(d.store.stored("plan-2"))); !equalStrings(got, []string{"v1"}) {
+		t.Fatalf("setup: plan-2 claims %v, want the truck that landed — with the lookup down it cannot know to give it up", got)
 	}
-	if got := sorted(liveVehicleIDs(d.store.stored("plan-1"))); !equalStrings(got, []string{"v1"}) {
-		t.Errorf("plan-1 claims %v, want v1 — its route is untouched, so its ledger must be too", got)
-	}
-	// THE MIDPOINT. The old test walked past this line without asking.
-	d.assertAcceptance()
 
-	// The database comes back. Nothing else is different: this is the plain retry.
+	// Both come back. Nothing else is different: this is the plain resume.
 	repo.err = nil
+	d.g.pushErrAfter = 0
+	sent := d.g.pushCalls
 	d.push("plan-2")
 
-	if got := liveVehicleIDs(d.store.stored("plan-1")); len(got) != 0 {
-		t.Errorf("plan-1 still claims %v after plan-2 replaced its route upstream", got)
+	if wrote := d.g.pushCalls - sent; wrote != 1 {
+		t.Errorf("the resume wrote %d route(s), want 1 — v1 is live and unchanged, so it is skipped, which is exactly why the correction it owes must not be keyed on what this attempt wrote", wrote)
 	}
-	if got := sorted(liveVehicleIDs(d.store.stored("plan-2"))); !equalStrings(got, []string{"v1", "v2"}) {
-		t.Errorf("plan-2 claims %v, want both trucks", got)
+	if got := liveVehicleIDs(d.store.stored("plan-1")); len(got) != 0 {
+		t.Errorf("plan-1 STILL claims %v — the attempt that displaced it could not pay the correction and the attempt that could sees only the trucks it wrote, so nothing ever pays it", got)
 	}
 	d.assertAcceptance()
 }

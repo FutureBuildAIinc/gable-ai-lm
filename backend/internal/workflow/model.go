@@ -218,58 +218,17 @@ func (p *LoadProof) Ready() bool {
 //
 // Recalls are tombstoned (RecalledAt set), never removed, so support can always
 // answer "what did we put on their board, and when did we take it off".
-//
-// A claim has TWO live states, and the difference is the whole of the ordering
-// fix. Push publishes the claim as PENDING *before* it calls GableLBM and
-// promotes it to LIVE *after*, so the gap between the two systems is
-// "claimed, not yet on the board" instead of "on the board, claimed by
-// nobody". The first costs a redundant, idempotent recall; the second is a
-// route the dealer is dispatching that nothing in this system can see, which is
-// the harm this ledger exists to prevent.
 type LiveRoute struct {
-	VehicleID   string `json:"vehicle_id"`
-	VehicleName string `json:"vehicle_name,omitempty"`
-	// State is PENDING (published as intent, ahead of the wire call) or LIVE
-	// (confirmed on the dispatch board). EMPTY READS AS LIVE, so every ledger
-	// written before this field existed keeps its meaning: a stored claim from
-	// an older release really was confirmed before it was saved.
-	State string `json:"state,omitempty"`
-	// ClaimedAt is when the PENDING claim was published. It is the lease clock:
-	// a PENDING claim a crashed process never resolved stops blocking other
-	// plans once it is older than the lease, which is what keeps a dead push
-	// from wedging the date forever. See Service.claimLease.
-	ClaimedAt  *time.Time `json:"claimed_at,omitempty"`
-	PushedAt   time.Time  `json:"pushed_at"`
-	RecalledAt *time.Time `json:"recalled_at,omitempty"`
-	RecalledBy string     `json:"recalled_by,omitempty"`
-	RecallNote string     `json:"recall_note,omitempty"`
+	VehicleID   string     `json:"vehicle_id"`
+	VehicleName string     `json:"vehicle_name,omitempty"`
+	PushedAt    time.Time  `json:"pushed_at"`
+	RecalledAt  *time.Time `json:"recalled_at,omitempty"`
+	RecalledBy  string     `json:"recalled_by,omitempty"`
+	RecallNote  string     `json:"recall_note,omitempty"`
 }
 
-// Claim states for LiveRoute.State.
-const (
-	ClaimPending = "PENDING"
-	ClaimLive    = "LIVE"
-)
-
-// Live reports whether this plan still HOLDS this truck for this date — the
-// question every gate and every recall path asks.
-//
-// A PENDING claim answers true, deliberately. The route may or may not have
-// reached the board (that is precisely what "pending" means), and this codebase
-// has one rule for that doubt, stated at recallRoutes: over-reporting what is
-// live costs a redundant, idempotent recall; under-reporting leaves a truck
-// loading for a run that no longer exists. Only Push itself distinguishes the
-// two states, because only Push can resolve them.
+// Live reports whether this route is still believed to be on the dispatch board.
 func (r LiveRoute) Live() bool { return r.RecalledAt == nil }
-
-// Confirmed reports whether this route is known to be on the dispatch board —
-// a claim this plan published AND completed. It is the narrower reading, and
-// the resume's "already sent, unchanged" skip is keyed on it: a PENDING claim
-// must always re-send, because nothing knows whether the wire call happened.
-func (r LiveRoute) Confirmed() bool { return r.RecalledAt == nil && r.State != ClaimPending }
-
-// Pending reports whether this is a published intent that was never confirmed.
-func (r LiveRoute) Pending() bool { return r.RecalledAt == nil && r.State == ClaimPending }
 
 // PushedOverride records one manual approval to change a plan whose routes were
 // already live on the dispatch board — the 423 override, in the same shape the
