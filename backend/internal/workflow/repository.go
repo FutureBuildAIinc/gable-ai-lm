@@ -24,33 +24,42 @@ var ErrNotFound = errors.New("workflow plan not found")
 // net/http request runs on its own goroutine, so it applies at INSTANCE_COUNT=1.
 var ErrVersionConflict = errors.New("workflow plan was modified concurrently — reload and retry")
 
-// ErrDateBusy is returned when another push for the same plan date already
-// holds that date's serialization lock. NOTHING has been done: no gate has run,
-// no route has been sent to GableLBM, no ledger has been written. The caller
-// may simply try again.
+// ErrDateBusy is returned when another writer for the same plan date already
+// holds that date. NOTHING has been done: no gate has run, no route has been
+// sent to GableLBM, no ledger has been written. The caller may simply try
+// again.
+//
+// Match it with errors.Is. The sentence a dispatcher reads is carried by a
+// *DateBusy wrapping it, because "dispatch date busy" is a status, not an
+// instruction, and this refusal reaches a human.
 var ErrDateBusy = errors.New("dispatch date busy")
 
-// dateLockClass namespaces this module's advisory-lock keys.
+// DateBusy is the refusal itself: the sentence written for the dispatcher,
+// wrapping the sentinel so handlers and callers can still match on it.
 //
-// Postgres advisory locks live in ONE database-wide keyspace, shared by every
-// session and every feature that ever takes one. The two-argument form
-// pg_try_advisory_xact_lock(classid, objid) is what keeps this module's keys
-// from colliding with somebody else's: the class is this constant, and only the
-// object id is derived from the date. Without it, any other advisory lock in
-// this database that happened to hash to the same bigint would silently
-// serialize against dispatch pushes, or be serialized by them.
-//
-// The value is arbitrary and its only property that matters is that it is
-// fixed. Changing it would let an old process and a new one take "the same"
-// lock and not contend, so it is a constant and not configuration.
-const dateLockClass = 0x4C4D5057 // 'LMPW' — ai-LM push, per workday
+// It exists because fmt.Errorf("%w: ...", ErrDateBusy) puts the sentinel's own
+// words at the FRONT of everything the operator reads, and "dispatch date
+// busy: " is this module talking to itself.
+type DateBusy struct{ Msg string }
+
+func (e *DateBusy) Error() string { return e.Msg }
+func (e *DateBusy) Unwrap() error { return ErrDateBusy }
+
+// busyf builds the refusal a contended date returns.
+func busyf(format string, a ...any) error {
+	return &DateBusy{Msg: fmt.Sprintf(format, a...)}
+}
 
 type Repository struct {
 	db *database.DB
+	// hold is the exclusive, time-bounded claim on one dispatch date. See
+	// datelease.go for why it is a lease row and not the transaction-scoped
+	// advisory lock it replaces.
+	hold dateHold
 }
 
 func NewRepository(db *database.DB) *Repository {
-	return &Repository{db: db}
+	return &Repository{db: db, hold: newDateHold(pgDateLeases{db: db})}
 }
 
 // payload is everything outside the dedicated columns, stored as one JSONB doc.
@@ -260,49 +269,29 @@ func (r *Repository) GetLatestForDate(ctx context.Context, date string) (*Plan, 
 	return &p, nil
 }
 
-// WithDateLock runs fn holding an exclusive lock on one dispatch DATE, so that
-// at most one push for that date is ever in flight in this deployment.
+// WithDateLock runs fn holding an exclusive claim on one dispatch DATE, so that
+// at most one writer to that date's dispatch board is ever in flight in this
+// deployment.
 //
 // The date is the contended resource, not the plan. A date legitimately holds
-// several plans and any of them may be pushed; what cannot happen twice at once
-// is the read-decide-write cycle over that date's trucks, because GableLBM's
-// ReplaceDeliveryRoute is keyed (vehicle_id, scheduled_date) and holds at most
-// one non-dispatched route per truck per day. Locking the plan would leave two
-// plans for one date racing exactly as before.
+// several plans and any of them may be pushed, re-planned or re-assigned; what
+// cannot happen twice at once is the read-decide-write cycle over that date's
+// trucks, because GableLBM's ReplaceDeliveryRoute is keyed (vehicle_id,
+// scheduled_date) and holds at most one non-dispatched route per truck per day.
+// Locking the plan would leave two plans for one date racing exactly as before.
 //
-// The lock is TRANSACTION-SCOPED (pg_try_advisory_xact_lock, not
-// pg_advisory_lock). A session-scoped lock is released by an explicit unlock or
-// by the session ending, which means a process that is killed mid-push — or
-// whose connection is held open by a pooler — can hold a dispatch date shut
-// with nobody left to open it. A transaction-scoped lock is released by COMMIT
-// or ROLLBACK, and both of those happen when the backend notices the client is
-// gone. A crashed process therefore cannot wedge a date, and no lease, sweeper
-// or timeout is needed to make that true.
-//
-// It is a TRY lock, so contention FAILS FAST with ErrDateBusy rather than
+// It is a TRY claim, so contention FAILS FAST with ErrDateBusy rather than
 // queueing. See Service.Push for that decision and its cost.
 //
-// fn runs inside the transaction: every repository call it makes picks the
-// transaction up from the context (see database.DB.GetExecutor), so the work
-// done under the lock commits with the lock's release and is never visible
-// half-done to the next holder.
+// The claim is a LEASE ROW, not a transaction-scoped advisory lock, and fn does
+// NOT run inside a transaction. That is the whole point: fn makes several
+// GableLBM round-trips, and holding a pooled connection across them starved a
+// 25-connection pool shared with every other endpoint in the service. Each
+// repository call fn makes therefore commits on its own, exactly as it did
+// before any of this serialization existed — the claim adds ordering between
+// writers, and nothing else. datelease.go has the full argument, including what
+// the lease gives up (a dead holder is cleared by expiry rather than by its
+// transaction unwinding) and how it buys that back.
 func (r *Repository) WithDateLock(ctx context.Context, date string, fn func(ctx context.Context) error) error {
-	return r.db.RunInTx(ctx, func(ctx context.Context) error {
-		var acquired bool
-		// hashtext() maps the date text into the int4 object-id space. Its
-		// exact values are a Postgres implementation detail, which is fine
-		// here and would not be if they were stored: the only requirement is
-		// that two concurrent sessions on the SAME server agree, and a hash
-		// collision between two different dates costs a spurious ErrDateBusy,
-		// never a lost mutual exclusion.
-		if err := r.db.GetExecutor(ctx).QueryRow(ctx,
-			`SELECT pg_try_advisory_xact_lock($1, hashtext($2))`,
-			int32(dateLockClass), date).Scan(&acquired); err != nil {
-			return fmt.Errorf("take the dispatch-date lock for %s: %w", date, err)
-		}
-		if !acquired {
-			return ErrDateBusy
-		}
-		return fn(ctx)
-	})
+	return r.hold.run(ctx, date, fn)
 }

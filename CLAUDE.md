@@ -192,7 +192,10 @@ See `INTEGRATIONS.md` for the consumer contract and `ARCHITECTURE.md` for the mo
 - Migrations in `backend/migrations/` as numbered SQL with a sibling `_NNN_*_down.sql`
   rollback. The migrator (`cmd/migrate`) skips `*_down.sql`. Current set:
   `001_ai_lm_core`, `002_route_plan_loads`, `003_workflow_plans`,
-  `004_workflow_plans_version` (optimistic-lock `version` column).
+  `004_workflow_plans_version` (optimistic-lock `version` column),
+  `005_workflow_date_leases` (exclusive, expiring hold on one dispatch date —
+  every writer to a date's dispatch board takes it; see
+  `internal/workflow/datelease.go`).
 
 ### Backend Code
 - Config: env vars with `godotenv` fallback (`internal/config/config.go`). Default DB URL

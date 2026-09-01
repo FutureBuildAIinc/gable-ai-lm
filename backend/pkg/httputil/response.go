@@ -62,6 +62,24 @@ func RespondJSON(w http.ResponseWriter, status int, v interface{}) {
 // A blank msg still falls back to the generic phrase, so a caller that has
 // nothing specific to say cannot accidentally send an empty message.
 func RespondError(w http.ResponseWriter, r *http.Request, msg string, code int, err error) {
+	RespondCodedError(w, r, errorCode(code), msg, code, err)
+}
+
+// RespondCodedError is RespondError with the machine-readable code chosen by
+// the caller instead of derived from the status.
+//
+// It exists because a status is not always specific enough to act on, and the
+// client cannot be asked to recover by matching prose. Two different refusals
+// in this service answer 409 Conflict — "somebody else edited this record,
+// reload before you retry" and "somebody else is holding this dispatch date,
+// nothing happened, just try again" — and they need OPPOSITE things from the
+// operator. Shipping both as CONFLICT left the app rendering one hardcoded
+// banner for both, telling a dispatcher whose change was never applied that
+// their change had been overwritten.
+//
+// code is a stable identifier the client switches on (DATE_BUSY), not a second
+// message. Keep it SCREAMING_SNAKE and keep it out of the sentence.
+func RespondCodedError(w http.ResponseWriter, r *http.Request, code, msg string, status int, err error) {
 	reqID := w.Header().Get("X-Request-ID")
 	if reqID == "" {
 		reqID = r.Header.Get("X-Request-ID")
@@ -69,7 +87,8 @@ func RespondError(w http.ResponseWriter, r *http.Request, msg string, code int, 
 
 	slog.Error(msg,
 		"error", err,
-		"status", code,
+		"status", status,
+		"code", code,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"request_id", reqID,
@@ -77,11 +96,14 @@ func RespondError(w http.ResponseWriter, r *http.Request, msg string, code int, 
 
 	clientMsg := strings.TrimSpace(msg)
 	if clientMsg == "" {
-		clientMsg = genericMessage(code)
+		clientMsg = genericMessage(status)
+	}
+	if code == "" {
+		code = errorCode(status)
 	}
 
-	RespondJSON(w, code, ErrorResponse{
-		Error: ErrorDetail{Code: errorCode(code), Message: clientMsg},
+	RespondJSON(w, status, ErrorResponse{
+		Error: ErrorDetail{Code: code, Message: clientMsg},
 		Meta:  ErrorMeta{RequestID: reqID},
 	})
 }

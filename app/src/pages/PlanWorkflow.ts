@@ -29,11 +29,13 @@ import {
   Check,
   X,
   Plus,
+  Timer,
 } from 'lucide';
 import {
   aiLmService,
   isBlockingUnplaced,
   isConflict,
+  isDateBusy,
   isLocked,
   unplacedLabel,
   type AxleLoad,
@@ -195,6 +197,12 @@ export class PlanWorkflow extends LitElement {
   // screen is stale, so the only safe recovery is reload — never a blind retry,
   // which would re-apply this dispatcher's intent on top of someone else's.
   @state() private _conflict: string | null = null;
+  // Set when a write was refused because another dispatcher is holding this
+  // DATE (HTTP 409 with code DATE_BUSY). This is NOT the conflict above and
+  // must never render as one: nothing was applied, so there is nothing to
+  // reload past, and the only useful action is to repeat what was refused.
+  // `retry` is that same action, kept so the banner can offer it.
+  @state() private _dateBusy: { message: string; retry: () => Promise<void> } | null = null;
 
   // T2-2 — inline dimension-override editor target + form.
   @state() private _dimEdit: { orderId: string; productId: string; sku: string } | null = null;
@@ -243,14 +251,21 @@ export class PlanWorkflow extends LitElement {
     this._error = '';
     this._notice = '';
     this._conflict = null;
+    this._dateBusy = null;
     try {
       const v = await fn();
       after?.(v);
     } catch (err) {
-      if (isConflict(err)) {
-        this._conflict = err instanceof Error ? err.message : String(err);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isDateBusy(err)) {
+        // Checked before isConflict: both are 409 and only this one leaves the
+        // plan on screen still correct. The server's sentence is shown as-is —
+        // it is the only thing that names the DAY that is shut.
+        this._dateBusy = { message: msg, retry: () => this._run(label, fn, after) };
+      } else if (isConflict(err)) {
+        this._conflict = msg;
       } else {
-        this._error = err instanceof Error ? err.message : String(err);
+        this._error = msg;
       }
     } finally {
       this._busy = '';
@@ -274,6 +289,7 @@ export class PlanWorkflow extends LitElement {
     this._stopPlayback();
     this._override = null;
     this._conflict = null;
+    this._dateBusy = null;
     // The plan changed — the prior briefing is stale; let the user regenerate.
     this._briefing = null;
   }
@@ -304,11 +320,18 @@ export class PlanWorkflow extends LitElement {
     this._notice = '';
     this._override = null;
     this._conflict = null;
+    this._dateBusy = null;
     try {
       this._setPlan(await fn(false, ''), this._step);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (isConflict(err)) {
+      if (isDateBusy(err)) {
+        // Another dispatcher holds this DAY — a push, a re-plan or a
+        // re-assignment already in flight. Nothing was applied, so this is not
+        // the stale-plan conversation and not the approval conversation: the
+        // dispatcher waits and repeats.
+        this._dateBusy = { message: msg, retry: () => this._runReshuffle(label, fn) };
+      } else if (isConflict(err)) {
         // Stale plan — offer reload, not the override prompt. Overriding here
         // would authorize a reshuffle against a plan that no longer exists.
         this._conflict = msg;
@@ -317,21 +340,29 @@ export class PlanWorkflow extends LitElement {
         // after that: matching on prose is how this prompt silently stops
         // appearing when somebody rewords a refusal.
       } else if (isLocked(err) || /lock|manual approval/i.test(msg)) {
-        this._override = {
-          message: msg,
-          run: async () => {
-            this._busy = label;
-            this._error = '';
-            try {
-              this._setPlan(await fn(true, this._signedBy()), this._step);
-              this._override = null;
-            } catch (e) {
-              this._error = e instanceof Error ? e.message : String(e);
-            } finally {
-              this._busy = '';
+        const runOverride = async () => {
+          this._busy = label;
+          this._error = '';
+          this._dateBusy = null;
+          try {
+            this._setPlan(await fn(true, this._signedBy()), this._step);
+            this._override = null;
+          } catch (e) {
+            const emsg = e instanceof Error ? e.message : String(e);
+            if (isDateBusy(e)) {
+              // The approval is still good — nothing was applied and nobody
+              // withdrew it. Keep the override prompt on screen and offer the
+              // same approved action again, or the dispatcher has to re-approve
+              // a withdrawal they already authorized.
+              this._dateBusy = { message: emsg, retry: runOverride };
+            } else {
+              this._error = emsg;
             }
-          },
+          } finally {
+            this._busy = '';
+          }
         };
+        this._override = { message: msg, run: runOverride };
       } else {
         this._error = msg;
       }
@@ -577,6 +608,22 @@ export class PlanWorkflow extends LitElement {
         ${this._plan ? this._renderLockBar() : nothing}
 
         ${this._plan && this._plan.loads.length > 0 ? this._renderBriefing() : nothing}
+
+        ${this._dateBusy
+          ? html`<div class="px-4 py-3 rounded-lg border border-blueprint-blue/40 bg-blueprint-blue/10 text-blueprint-blue text-sm flex flex-wrap items-center gap-3">
+              ${icon(Timer, 16)}
+              <span class="flex-1 min-w-[12rem]">${this._dateBusy.message}</span>
+              <button
+                @click=${() => this._dateBusy?.retry()}
+                ?disabled=${this._busy !== ''}
+                class="flex items-center gap-1.5 bg-blueprint-blue text-deep-space font-semibold px-3 py-1.5 rounded-lg disabled:opacity-50"
+              >${icon(RefreshCw, 14)} Try again</button>
+              <button
+                @click=${() => { this._dateBusy = null; }}
+                class="text-zinc-400 hover:text-white"
+              >${icon(X, 16)}</button>
+            </div>`
+          : nothing}
 
         ${this._conflict
           ? html`<div class="px-4 py-3 rounded-lg border border-amber-warn/40 bg-amber-warn/10 text-amber-warn text-sm flex flex-wrap items-center gap-3">

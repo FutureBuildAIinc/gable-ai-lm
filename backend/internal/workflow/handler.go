@@ -13,6 +13,17 @@ import (
 	"github.com/FutureBuildAIinc/gable-ai-lm/pkg/httputil"
 )
 
+// CodeDateBusy is the machine-readable error code for "another writer holds
+// this dispatch date". It rides on a 409 alongside the version-conflict 409 and
+// is what tells the two apart on the wire.
+//
+// The distinction is not cosmetic: a version conflict means somebody changed
+// the record under you and the only safe recovery is RELOAD, while a busy date
+// means nothing was applied at all and the recovery is simply to REPEAT. A
+// client that cannot tell them apart must guess, and the app guessed wrong for
+// every busy date it ever saw.
+const CodeDateBusy = "DATE_BUSY"
+
 // Handler exposes the guided workflow REST endpoints.
 type Handler struct {
 	svc *Service
@@ -91,6 +102,14 @@ func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	var refusal *Refusal
 	if errors.As(err, &refusal) {
 		httputil.RespondError(w, r, refusal.Msg, http.StatusUnprocessableEntity, err)
+		return
+	}
+	// Another writer holds this dispatch date: a push, a re-assignment or
+	// another re-plan. Nothing was recalled and no plan was created, so the
+	// dispatcher waits and repeats — see respondStep for why this 409 carries
+	// its own code.
+	if errors.Is(err, ErrDateBusy) {
+		httputil.RespondCodedError(w, r, CodeDateBusy, err.Error(), http.StatusConflict, err)
 		return
 	}
 	// Someone else wrote the superseded plan between our read and our write.
@@ -192,13 +211,19 @@ func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan
 		httputil.RespondError(w, r, err.Error(), http.StatusLocked, err)
 		return
 	}
-	// Another push for the same dispatch date holds that date's lock. Nothing
-	// was gated, sent or written, so this is a plain "resubmit" — the same
-	// conversation as a version conflict and the same 409, which is why it
-	// shares the code rather than inventing one. The two are told apart by the
-	// sentence, which names the date, and by the WARN line Push logs.
+	// Another writer for the same dispatch date holds it. Nothing was gated,
+	// sent or written, so this is a plain "wait and resubmit" — the same status
+	// as a version conflict, and the OPPOSITE instruction.
+	//
+	// That is why it carries its own error CODE. Both are 409, and the app
+	// keyed its banner off the status alone: every 409 rendered "Someone else
+	// changed this plan while you were working... Reload to see theirs, then
+	// redo yours", which for a busy date is false in all three of its claims —
+	// nobody changed the plan, nothing was applied to reload past, and
+	// reloading fixes nothing. Telling the two apart "by the sentence" was
+	// never possible for a client that never showed the sentence.
 	if errors.Is(err, ErrDateBusy) {
-		httputil.RespondError(w, r, err.Error(), http.StatusConflict, err)
+		httputil.RespondCodedError(w, r, CodeDateBusy, err.Error(), http.StatusConflict, err)
 		return
 	}
 	// Someone else saved this plan between our read and our write. Nothing was

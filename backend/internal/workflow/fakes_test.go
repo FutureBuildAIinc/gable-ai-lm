@@ -56,6 +56,20 @@ type fakePlanStore struct {
 	// letting a test land a competing writer inside another actor's
 	// read-modify-write window (two dispatch users, two goroutines, one plan).
 	beforeUpdate func()
+
+	// listCalls counts ListForDate calls and afterListForDate fires
+	// immediately AFTER each one returns, with that count.
+	//
+	// It exists for one window with no other seam. A re-plan reads which plans
+	// hold the date and then, several steps later, recalls what that read
+	// named. Whether the read was taken INSIDE the date claim or just before
+	// it is invisible to any end-state assertion — both orderings converge
+	// whenever nothing lands in between — and it is the whole difference
+	// between a recall set that is authoritative and one that is merely
+	// recent. A hook here lets a test land a competing push in exactly that
+	// gap and watch whether the claim refuses it.
+	listCalls        int
+	afterListForDate func(n int)
 }
 
 func newFakePlanStore(seed ...*Plan) *fakePlanStore {
@@ -211,14 +225,28 @@ func (s *fakePlanStore) GetLatestForDate(_ context.Context, date string) (*Plan,
 // because two plans minted in the same test tick share a timestamp.
 func (s *fakePlanStore) ListForDate(_ context.Context, date string) ([]*Plan, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	out := []*Plan{}
 	for i := len(s.created) - 1; i >= 0; i-- {
 		if p, ok := s.plans[s.created[i]]; ok && p.PlanDate == date {
 			out = append(out, clonePlan(p))
 		}
 	}
+	s.listCalls++
+	n, hook := s.listCalls, s.afterListForDate
+	s.mu.Unlock()
+	// Called outside s.mu, like every other hook here, so a hook that reads or
+	// writes the store cannot deadlock on the lock its caller already holds.
+	if hook != nil {
+		hook(n)
+	}
 	return out, nil
+}
+
+// lists reports how many ListForDate calls have been served (test-only).
+func (s *fakePlanStore) lists() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
 }
 
 // count reports how many plans are stored (test-only accessor). "Did the

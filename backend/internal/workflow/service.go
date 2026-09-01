@@ -93,11 +93,19 @@ type planStore interface {
 	// nothing forces the one holding live routes to be the latest — so every
 	// gate that asks "is this date live?" must ask about all of them.
 	ListForDate(ctx context.Context, date string) ([]*Plan, error)
-	// WithDateLock runs fn under an exclusive, transaction-scoped lock on one
-	// dispatch DATE, and returns ErrDateBusy — having run nothing — if another
-	// holder has it. It is the narrowest transaction seam that makes Push
-	// serializable per date; see Repository.WithDateLock for the mechanism and
-	// Service.Push for why the whole push runs inside it.
+	// WithDateLock runs fn holding an exclusive claim on one dispatch DATE, and
+	// returns ErrDateBusy — having run nothing — if another writer has it.
+	//
+	// EVERY path that writes this date's dispatch board or the ledger
+	// mirroring it runs inside it: Push, the re-plan that supersedes a live
+	// date (Ingest), and the re-assignment that recalls the trucks it drops
+	// (Assign). A claim held by only one of several writers is not a claim; it
+	// is a slower version of the same race, which is what the first version of
+	// this shipped as.
+	//
+	// fn does NOT run in a transaction. See Repository.WithDateLock and
+	// datelease.go for the mechanism and for why the transaction that used to
+	// wrap it could not stay.
 	WithDateLock(ctx context.Context, date string, fn func(ctx context.Context) error) error
 }
 
@@ -188,6 +196,39 @@ func NewService(repo planStore, g gableSource, c catalogSource, f fleetProfiles,
 func (s *Service) WithMeter(m *metrics.Meter) *Service {
 	s.meter = m
 	return s
+}
+
+// holdDate runs fn with this dispatch date claimed exclusively, and turns the
+// two ways that claim can end badly into sentences a dispatcher can act on.
+//
+// It exists because there are now three callers — Push, Ingest and Assign —
+// and the refusal they hand back is the only part of this serialization the
+// person on the other end ever sees. A shared helper is what stops one of them
+// answering with the bare sentinel ("dispatch date busy"), which names no date,
+// says nothing about what was or was not done, and offers no next step.
+//
+// held is what the other writer is doing to the date, and refused is what this
+// caller did NOT get to do; the rest of the sentence is identical on purpose,
+// because "nothing was sent, nothing changed, try again" is the same promise
+// every time and a dispatcher should not have to re-read it to check.
+func (s *Service) holdDate(ctx context.Context, date, held, refused string, fn func(ctx context.Context) error) error {
+	err := s.repo.WithDateLock(ctx, date, fn)
+	switch {
+	case errors.Is(err, ErrDateBusy):
+		// Observable on purpose, in three places: this line, the sentence the
+		// dispatcher reads, and the 409 the handler answers (which the HTTP
+		// metrics middleware already labels by path and status, so contention
+		// is countable without a new counter).
+		slog.Warn("refused a write to a dispatch date another writer is holding",
+			"date", date, "refused", refused)
+		return busyf("%s is already being %s by someone else, so %s. Nothing was sent to GableLBM and nothing on the dispatch board changed — wait a moment and try again.",
+			date, held, refused)
+	case errors.Is(err, ErrDateHoldLost):
+		// fn ran and was stopped part-way, so unlike a busy date this is NOT
+		// "nothing happened" and must never be worded as if it were.
+		return refusedf("%s was taken over by another dispatcher while this was running, so it was stopped part-way. Reload the plan and check the dispatch board before trying again.", date)
+	}
+	return err
 }
 
 // Get returns a plan by id, with any scheduled lock evaluated for display.
@@ -321,29 +362,44 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		Loads:            []TruckLoad{},
 		UnassignedOrders: []Stop{},
 	}
-	// Re-ask, immediately before the write. The snapshot above was taken BEFORE
-	// three ERP round-trips (orders, catalog, branches); a push that landed in
-	// that window is invisible to it, and creating a plan on top of a board
-	// that gained routes since is the same orphan by a slower route. This
-	// second read is the authoritative one — it is what gets recalled from and
-	// what gets persisted — and it re-runs the gate, so an unapproved late
-	// arrival is refused with the same 423 rather than silently planned over.
-	superseded, err = s.supersededPlans(ctx, req.Date)
-	if err != nil {
-		return nil, err
-	}
-	if err := gateSupersede(superseded, req.Date, req.Override, req.ApprovedBy); err != nil {
-		return nil, err
-	}
-	// The approval given above is exercised HERE, as late as possible: the
-	// superseded plans' routes come off the dealer's board only once this
-	// ingest is certain it has a replacement to put there. A recall failure
-	// aborts and creates NOTHING — a half-recalled board with a new plan on top
-	// is worse than refusing outright.
-	if err := s.supersede(ctx, superseded, plan, req.ApprovedBy); err != nil {
-		return nil, err
-	}
-	if err := s.repo.Create(ctx, plan); err != nil {
+	// Everything from here is a WRITE to this date: it reads which plans hold
+	// the date, takes their routes off the dealer's board, tombstones their
+	// ledgers, and creates the plan that replaces them. So it runs with the
+	// date claimed, exactly as a push does.
+	//
+	// Re-asking under the claim is what makes the second read authoritative
+	// rather than merely later. The snapshot above was taken BEFORE three ERP
+	// round-trips (orders, catalog, branches); a push that lands in that window
+	// is invisible to it, and a re-plan that computed its recall set from that
+	// snapshot would recall routes a push wrote AFTERWARDS — taking the day off
+	// the board while the pushing plan's ledger still swore two trucks were
+	// live. That was reachable from two plain concurrent HTTP requests, 84-113
+	// times in 400, with no crash and both callers told they had succeeded.
+	//
+	// The claim starts here and not at the top of Ingest on purpose: pulling a
+	// day of orders, a catalog and the branch list is three ERP round-trips
+	// that decide nothing about this date, and holding the day shut across them
+	// would make every re-plan a serialization point for every push.
+	if err := s.holdDate(ctx, req.Date, "changed", "the day was not re-planned", func(ctx context.Context) error {
+		superseded, err := s.supersededPlans(ctx, req.Date)
+		if err != nil {
+			return err
+		}
+		// Re-run the gate too, so an unapproved late arrival is refused with
+		// the same 423 rather than silently planned over.
+		if err := gateSupersede(superseded, req.Date, req.Override, req.ApprovedBy); err != nil {
+			return err
+		}
+		// The approval given above is exercised HERE, as late as possible: the
+		// superseded plans' routes come off the dealer's board only once this
+		// ingest is certain it has a replacement to put there. A recall failure
+		// aborts and creates NOTHING — a half-recalled board with a new plan on
+		// top is worse than refusing outright.
+		if err := s.supersede(ctx, superseded, plan, req.ApprovedBy); err != nil {
+			return err
+		}
+		return s.repo.Create(ctx, plan)
+	}); err != nil {
 		return nil, err
 	}
 	// Metered only once the plan is STORED. A plan that failed to persist is
@@ -567,10 +623,58 @@ func (a *OrderAnalysis) recomputeTotals() {
 // Assign splits the analyzed orders across the live fleet (CVRP by weight +
 // volume) and sequences each truck's route from the depot. On a locked run it
 // refuses to reshuffle unless override (manual approval) is supplied (T2-3).
+//
+// # Serialization
+//
+// Assign runs with its plan's DATE claimed, for the same reason Push does: it
+// is a writer to that date's dispatch board. It reads which of this plan's
+// routes are live, decides which trucks the new assignment drops, and RECALLS
+// those — and the recall is keyed (vehicle_id, scheduled_date), not "the route
+// this plan pushed". So a re-assignment that computed its doomed set before a
+// concurrent push took one of those trucks would cancel the route that push had
+// just written, leaving the pushing plan's ledger claiming a truck the dealer's
+// board no longer holds.
+//
+// The claim covers the whole body, not just the recall, because the doomed set
+// is derived from a read (priorLive) taken at the top: claiming only the recall
+// would serialize the write and leave the decision racing, which is the same
+// defect with a smaller window.
 func (s *Service) Assign(ctx context.Context, id string, override bool, approvedBy string) (*Plan, error) {
+	// One read before the claim, for one fact: WHICH date this contends for.
+	// Every gate and every write below re-reads the plan INSIDE the claim, so a
+	// stale answer here can only send this to wait on the wrong door.
+	head, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	date := head.PlanDate
+
+	var plan *Plan
+	err = s.holdDate(ctx, date, "changed", "the trucks were not re-assigned", func(ctx context.Context) error {
+		var verdict error
+		plan, verdict = s.assignHeld(ctx, id, date, override, approvedBy)
+		return verdict
+	})
+	if err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// assignHeld is Assign's body, running with this date claimed.
+func (s *Service) assignHeld(ctx context.Context, id, date string, override bool, approvedBy string) (*Plan, error) {
+	// Re-read under the claim. The copy Assign read to find the date was read
+	// unclaimed, and gating on it would be gating on a snapshot another writer
+	// may have moved past between the two.
 	p, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	if p.PlanDate != date {
+		// Unreachable: a plan's date is set at ingest and no transition writes
+		// it. Asserted rather than assumed, because the claim is keyed on the
+		// value read BEFORE it was taken.
+		return nil, refusedf("this plan moved from %s to %s while the re-assignment was starting — reload and assign again", date, p.PlanDate)
 	}
 	if err := gateReshuffle(p, override, approvedBy, planTransitions[actionAssign].gerund); err != nil {
 		return nil, err
@@ -1130,18 +1234,26 @@ func statusLabel(s string) string {
 //
 // # Serialization
 //
-// Push runs inside an exclusive lock on its plan's DATE. Five rounds of work
-// tried to make the ERP write and the ledger write atomic and could not: that
-// is strict serializability across two services with no shared transaction, and
+// Push runs with its plan's DATE claimed exclusively. Five rounds of work tried
+// to make the ERP write and the ledger write atomic and could not: that is
+// strict serializability across two services with no shared transaction, and
 // every locally-correct fix moved the violation somewhere else. So the write
-// path is not made atomic here — it is made SINGULAR. With at most one push per
-// date in flight, the entire concurrent-push race class (two plans reading each
-// other's absent claims and both persisting a claim on one truck) is impossible
-// by construction rather than by argument.
+// path is not made atomic here — it is made SINGULAR. With at most one writer
+// per date in flight, the concurrent-write race class (two actors reading each
+// other's absent claims and both acting on a stale picture of the date) is
+// impossible by construction rather than by argument.
 //
-// What that does NOT do is stated plainly in Push's own body and in
+// Push is not the only writer, and a claim held by one writer is not a claim.
+// Ingest's supersede and Assign's recall write the same dealer's board for the
+// same date, and both take the SAME claim on the same key. The first version of
+// this serialized Push alone, and a push racing an approved re-plan still
+// emptied the day's dispatch board while the pushing plan's ledger swore two
+// trucks were live — 84-113 violations in 400 trials, from two plain concurrent
+// HTTP requests.
+//
+// What the claim does NOT do is stated plainly in Push's own body and in
 // persistPush: a crash between the ERP call and the ledger write still leaves a
-// route on the dealer's board that no ledger names. A lock orders this service
+// route on the dealer's board that no ledger names. It orders this service
 // against itself; it cannot order this service against a process that is no
 // longer running. That is the reconciler's job, and it is not done here.
 func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
@@ -1157,39 +1269,23 @@ func (s *Service) Push(ctx context.Context, id string) (*Plan, error) {
 	}
 	date := head.PlanDate
 
-	var (
-		plan    *Plan
-		verdict error
-	)
-	lockErr := s.repo.WithDateLock(ctx, date, func(ctx context.Context) error {
+	// Every write below commits on its own as it happens, exactly as it did
+	// before any serialization existed. The claim on the date adds ORDERING and
+	// nothing else — deliberately, because a push refuses with routes ALREADY
+	// on the dealer's board (a partial push is the whole reason the ledger
+	// records acks per truck), and rolling those acks back would delete the
+	// only record of routes that really are live upstream. That would be the
+	// orphan, manufactured by the transaction meant to prevent it.
+	var plan *Plan
+	err = s.holdDate(ctx, date, "pushed", "this push did not run", func(ctx context.Context) error {
+		var verdict error
 		plan, verdict = s.pushLocked(ctx, id, date)
-		// The push's own verdict is deliberately NOT returned here, and the
-		// transaction therefore always commits.
-		//
-		// A rollback would be worse than useless on every failing path this
-		// function has. Push refuses with routes ALREADY on the dealer's board
-		// — a partial push is the whole reason the ledger records acks per
-		// truck — and rolling those acks back would delete the only record of
-		// routes that really are live upstream. That is the orphan, manufactured
-		// by the transaction meant to protect against it. Before this lock
-		// existed each of those writes committed on its own as it happened;
-		// committing them together preserves exactly that, and adds only the
-		// ordering.
-		return nil
+		return verdict
 	})
-	if lockErr != nil {
-		if errors.Is(lockErr, ErrDateBusy) {
-			// Observable on purpose, in three places: this line, the sentence
-			// the dispatcher reads, and the 409 the handler answers (which the
-			// HTTP metrics middleware already labels by path and status, so
-			// contention is countable without a new counter).
-			slog.Warn("refused a push: another push for the same dispatch date is already running",
-				"plan", id, "date", date)
-			return nil, fmt.Errorf("%w: %s is already being pushed. Nothing was sent to GableLBM and nothing was written — try again in a moment", ErrDateBusy, date)
-		}
-		return nil, lockErr
+	if err != nil {
+		return nil, err
 	}
-	return plan, verdict
+	return plan, nil
 }
 
 // pushLocked is Push's body, running with this date's lock held.

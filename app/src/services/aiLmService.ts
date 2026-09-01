@@ -29,16 +29,43 @@ interface ErrorEnvelope {
  */
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /**
+   * The envelope's machine-readable `error.code`.
+   *
+   * The status alone is not always enough. Two different refusals answer 409
+   * Conflict and need OPPOSITE things from the dispatcher: a version conflict
+   * means somebody edited the plan under you and the recovery is to RELOAD,
+   * while `DATE_BUSY` means nothing was applied at all and the recovery is
+   * simply to REPEAT. Empty when the response carried no envelope.
+   */
+  readonly code: string;
+  constructor(status: number, message: string, code = '') {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
 /** True when a write lost an optimistic-lock race and the plan must be reloaded. */
 export function isConflict(err: unknown): boolean {
-  return err instanceof ApiError && err.status === 409;
+  return err instanceof ApiError && err.status === 409 && !isDateBusy(err);
+}
+
+/**
+ * True when the backend refused because another dispatcher is holding this
+ * DATE — a push, a re-plan or a re-assignment already in flight for the same
+ * day. Nothing was gated, sent to GableLBM or written, so the recovery is to
+ * wait a moment and repeat the same action.
+ *
+ * It is deliberately NOT `isConflict`. Both are 409, and treating them as one
+ * is what put "Someone else changed this plan while you were working. Your
+ * change was not applied. Reload to see theirs, then redo yours." in front of
+ * a dispatcher whose plan nobody had touched: no change had been applied, there
+ * was nothing to reload, and the day that was actually shut was never named.
+ */
+export function isDateBusy(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 409 && err.code === 'DATE_BUSY';
 }
 
 /**
@@ -57,13 +84,15 @@ export function isLocked(err: unknown): boolean {
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
+    let code = '';
     try {
       const body = (await res.json()) as ErrorEnvelope;
       if (body.error?.message) msg = body.error.message;
+      if (body.error?.code) code = body.error.code;
     } catch {
       /* non-JSON body */
     }
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, code);
   }
   return (await res.json()) as T;
 }
