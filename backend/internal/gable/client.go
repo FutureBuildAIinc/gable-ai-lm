@@ -192,6 +192,84 @@ type RouteRecallResult struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// BoardRoute is one delivery route as GableLBM's dispatch board actually holds
+// it for a date.
+//
+//	GET /api/integration/delivery-routes?date=YYYY-MM-DD
+//
+// This is the SYSTEM OF RECORD, and it is why this type exists at all. Every
+// other wire type here is data AI_LM consumes to make a plan; this one is the
+// answer to "what does the dealer's board actually hold right now", which AI_LM
+// previously could not ask. It could WRITE the board (PushDeliveryRoute) and
+// UNDO a write (RecallDeliveryRoute) and never READ it, so every gate on this
+// service keyed on AI_LM's own ledger — a cache of this board that diverges
+// from it on any crash between the ERP write and the ledger write, with nothing
+// able to notice.
+//
+// Status separates DRAFT and SCHEDULED (live, still recallable, still ours to
+// re-plan) from IN_TRANSIT and COMPLETED (the truck has left the yard —
+// history, and never reclaimable: GableLBM answers the recall with a 409). It
+// is not decoration; without it every row on the board looks alike and a caller
+// cannot tell a route it may withdraw from one a driver is currently driving.
+//
+// CANCELLED rows are returned deliberately, with RecalledAt set when the
+// withdrawal came from us. That is how "my recall landed" is told apart from
+// "the route never existed" — a distinction our ledger cannot make after a
+// crash, and the exact blind spot this endpoint removes.
+//
+// VehicleID may be empty: delivery_routes.vehicle_id is nullable upstream and a
+// route naming no truck is therefore NOT addressable by the
+// (vehicle_id, scheduled_date) recall key. OrderIDs is always an array, never
+// null; empty means the route currently puts nothing on the board.
+//
+// The field order and tags here are pinned by GableLBM's contract suite
+// (internal/integrations/testdata/ailm_client_contract.json, type "BoardRoute").
+// Changing them breaks the integration in a way only that suite will catch.
+type BoardRoute struct {
+	RouteID       string   `json:"route_id"`
+	VehicleID     string   `json:"vehicle_id"`
+	DriverID      string   `json:"driver_id,omitempty"`
+	Status        string   `json:"status"`
+	ScheduledDate string   `json:"scheduled_date"`
+	StopCount     int      `json:"stop_count"`
+	OrderIDs      []string `json:"order_ids"`
+	RecalledAt    string   `json:"recalled_at,omitempty"`
+}
+
+// Board route statuses, as GableLBM's delivery_routes.status holds them.
+//
+// They are named here rather than spelled as literals at each comparison
+// because the LIVE/DISPATCHED split below is a product decision — "may this
+// service withdraw this route?" — and a decision spelled as a bare string in
+// three files is a decision that drifts.
+const (
+	RouteStatusDraft     = "DRAFT"
+	RouteStatusScheduled = "SCHEDULED"
+	RouteStatusInTransit = "IN_TRANSIT"
+	RouteStatusCompleted = "COMPLETED"
+	RouteStatusCancelled = "CANCELLED"
+)
+
+// Live reports whether this route is on the board AND still withdrawable by
+// this service.
+//
+// Only DRAFT and SCHEDULED qualify. IN_TRANSIT and COMPLETED are a truck that
+// has left the yard: treating one as reclaimable means proposing to re-plan a
+// run that is physically happening, and GableLBM refuses the recall with a 409
+// (ErrRouteDispatched) precisely so that mistake cannot be made quietly.
+// CANCELLED is not on the board at all.
+func (r BoardRoute) Live() bool {
+	return r.Status == RouteStatusDraft || r.Status == RouteStatusScheduled
+}
+
+// Dispatched reports that this route has left the yard. It is not live and it
+// is not gone: it is history that no recall can reach, and a caller must be
+// able to say so in a sentence rather than infer it from Live() being false —
+// which is also true of a CANCELLED route, for the opposite reason.
+func (r BoardRoute) Dispatched() bool {
+	return r.Status == RouteStatusInTransit || r.Status == RouteStatusCompleted
+}
+
 // StaffValidation is the GableLBM /api/integration/validate-staff response. It
 // reports whether a staff member's email is entitled to use AI_LM and carries
 // the role/module grants that authorize the AI_LM session.
@@ -279,6 +357,31 @@ func (c *Client) ListOrdersForDate(ctx context.Context, date string) ([]Order, e
 	q.Set("status", "CONFIRMED")
 	var out []Order
 	if err := c.do(ctx, http.MethodGet, "/api/integration/orders?"+q.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListDeliveryRoutesForDate returns every delivery route GableLBM's dispatch
+// board holds for a date — the system of record for who owns which truck that
+// day, in the same bare-array envelope as every other integration GET.
+//
+// date is REQUIRED and GableLBM answers 400 without it, unlike
+// ListOrdersForDate where it is optional. A dateless call is not a smaller
+// question but a meaningless one: the seam's whole idempotency key is
+// (vehicle_id, scheduled_date), and dropping the filter would stream every
+// route the dealer has ever had.
+//
+// The result is UNFILTERED by status on purpose — cancelled and completed
+// routes arrive alongside live ones. Filtering is the caller's job and is
+// cheap; hiding rows here would be lossy, and one of the rows a naive filter
+// would hide (CANCELLED with RecalledAt) is the one that answers "did my recall
+// land?".
+func (c *Client) ListDeliveryRoutesForDate(ctx context.Context, date string) ([]BoardRoute, error) {
+	q := url.Values{}
+	q.Set("date", date)
+	var out []BoardRoute
+	if err := c.do(ctx, http.MethodGet, "/api/integration/delivery-routes?"+q.Encode(), nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil

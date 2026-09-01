@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,23 @@ func integrationMux(t *testing.T, seen *[]recordedRequest) *http.ServeMux {
 	})
 	mux.HandleFunc("POST /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
 		record(w, r, http.StatusCreated, "")
+	})
+	// GET and POST share this path upstream, which is exactly why the read is
+	// registered here as its own method pattern: a client that sent the read as
+	// a POST, or the push as a GET, would be answered by the other handler
+	// rather than by a 405 anybody would notice.
+	//
+	// The body is the full range the endpoint documents: a live route, a route
+	// with no truck (nullable vehicle_id), a departed one, and a CANCELLED row
+	// carrying recalled_at — the row that answers "did my recall land?" and
+	// that a naive status filter would hide.
+	mux.HandleFunc("GET /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
+		record(w, r, http.StatusOK, `[`+
+			`{"route_id":"r1","vehicle_id":"v1","driver_id":"d1","status":"SCHEDULED","scheduled_date":"2026-06-26","stop_count":2,"order_ids":["o1","o2"]},`+
+			`{"route_id":"r2","vehicle_id":"","status":"DRAFT","scheduled_date":"2026-06-26","stop_count":0,"order_ids":[]},`+
+			`{"route_id":"r3","vehicle_id":"v3","status":"IN_TRANSIT","scheduled_date":"2026-06-26","stop_count":1,"order_ids":["o3"]},`+
+			`{"route_id":"r4","vehicle_id":"v4","status":"CANCELLED","scheduled_date":"2026-06-26","stop_count":0,"order_ids":[],"recalled_at":"2026-06-25T17:04:05Z"}`+
+			`]`)
 	})
 	mux.HandleFunc("POST /api/integration/validate-staff", func(w http.ResponseWriter, r *http.Request) {
 		record(w, r, http.StatusOK, `{"staff_id":"s1","email":"a@b.c","name":"A","entitled":true,"roles":["DISPATCH"],"modules":["AI_LM"]}`)
@@ -507,5 +525,244 @@ func TestAPIErrorCarriesTheStatusCodeMachinesNeed(t *testing.T) {
 	}
 	if target.Method != http.MethodPost || target.Path != "/api/integration/delivery-routes" {
 		t.Errorf("APIError should name the call: %+v", target)
+	}
+}
+
+// TestReadingTheDispatchBoardIsTheSeamsFirstREAD pins the call that lets AI_LM
+// stop trusting its own ledger.
+//
+// Every other GET on this seam is planning INPUT — vehicles, orders, products,
+// branches. This one is the system of record: what the dealer's board actually
+// holds. Four properties are asserted because dropping any one of them puts the
+// caller back to guessing.
+func TestReadingTheDispatchBoardIsTheSeamsFirstREAD(t *testing.T) {
+	var seen []recordedRequest
+	srv := httptest.NewServer(integrationMux(t, &seen))
+	defer srv.Close()
+	c := NewClient(srv.URL, "test-key")
+
+	routes, err := c.ListDeliveryRoutesForDate(context.Background(), "2026-06-26")
+	if err != nil {
+		t.Fatalf("ListDeliveryRoutesForDate: %v", err)
+	}
+
+	// 1. It is a GET on the path the push POSTs to, carrying the key and the
+	//    required date. Sending it as a POST would reach ReplaceDeliveryRoute.
+	if len(seen) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(seen))
+	}
+	got := seen[0]
+	if got.Method != http.MethodGet || got.Path != "/api/integration/delivery-routes" {
+		t.Errorf("board read went out as %s %s", got.Method, got.Path)
+	}
+	if got.Key != "test-key" || got.Accept != "application/json" {
+		t.Errorf("board read lost its headers: %+v", got)
+	}
+	if got.Query != "date=2026-06-26" {
+		t.Errorf("board read query = %q; date is REQUIRED upstream and a dateless call is a 400, not an unfiltered dump", got.Query)
+	}
+
+	// 2. It decodes as a bare array, in order, with every field.
+	if len(routes) != 4 {
+		t.Fatalf("decoded %d routes, want 4: %+v", len(routes), routes)
+	}
+	if r := routes[0]; r.RouteID != "r1" || r.VehicleID != "v1" || r.DriverID != "d1" ||
+		r.Status != RouteStatusScheduled || r.ScheduledDate != "2026-06-26" ||
+		r.StopCount != 2 || len(r.OrderIDs) != 2 || r.OrderIDs[0] != "o1" {
+		t.Errorf("live route lost detail: %+v", r)
+	}
+
+	// 3. The LIVE/DISPATCHED split, which is the product decision this type
+	//    exists to carry. Getting it wrong in one direction proposes cancelling
+	//    a run that is physically happening; in the other it leaves a route on
+	//    the board that a re-plan then silently plans over.
+	for i, want := range []struct{ live, dispatched bool }{
+		{live: true},       // SCHEDULED
+		{live: true},       // DRAFT, no vehicle
+		{dispatched: true}, // IN_TRANSIT
+		{},                 // CANCELLED — neither
+	} {
+		if routes[i].Live() != want.live || routes[i].Dispatched() != want.dispatched {
+			t.Errorf("route %d (%s): Live()=%v Dispatched()=%v, want %v/%v",
+				i, routes[i].Status, routes[i].Live(), routes[i].Dispatched(), want.live, want.dispatched)
+		}
+	}
+
+	// 4. A CANCELLED row is RETURNED, with recalled_at. Hiding it would make a
+	//    landed recall indistinguishable from a route that never existed —
+	//    which is the exact blind spot this endpoint removes.
+	if r := routes[3]; r.Status != RouteStatusCancelled || r.RecalledAt != "2026-06-25T17:04:05Z" {
+		t.Errorf("the cancelled row must survive with its recall stamp: %+v", r)
+	}
+	// A route with no truck is not addressable by the (vehicle_id, date) recall
+	// key, and the empty string is how that arrives.
+	if routes[1].VehicleID != "" {
+		t.Errorf("a nullable vehicle_id must arrive as empty, got %q", routes[1].VehicleID)
+	}
+}
+
+// TestAnEmptyBoardIsNotAFailure covers the two shapes an empty date can take.
+// A caller reconciling against the board must be able to read "nothing is on
+// this day" as a fact, and a nil slice and an empty one must mean the same
+// thing here — the difference between them is exactly the difference between
+// "the board is clear" and "something went wrong", and only the error says the
+// second.
+func TestAnEmptyBoardIsNotAFailure(t *testing.T) {
+	for _, body := range []string{`[]`, `null`} {
+		mux := http.NewServeMux()
+		mux.HandleFunc("GET /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		})
+		srv := httptest.NewServer(mux)
+		c := NewClient(srv.URL, "k")
+		routes, err := c.ListDeliveryRoutesForDate(context.Background(), "2026-06-26")
+		if err != nil {
+			t.Errorf("body %s: an empty board is not an error: %v", body, err)
+		}
+		if len(routes) != 0 {
+			t.Errorf("body %s: decoded %d routes", body, len(routes))
+		}
+		srv.Close()
+	}
+}
+
+// TestAnUnreadableBoardIsAnError is the other half, and it is the one the
+// caller's fail-closed rule rests on. A 500 from GableLBM must NOT decode to an
+// empty board: "the dealer has nothing scheduled" and "we could not find out"
+// are opposite answers, and only one of them makes it safe to re-plan the day.
+func TestAnUnreadableBoardIsAnError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"list delivery routes"}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	routes, err := NewClient(srv.URL, "k").ListDeliveryRoutesForDate(context.Background(), "2026-06-26")
+	if err == nil {
+		t.Fatalf("a 500 decoded to %d routes with no error — a failed read must never read as an empty board", len(routes))
+	}
+	if routes != nil {
+		t.Errorf("a failed read returned %v alongside its error", routes)
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+		t.Errorf("the caller needs the status to act on: %v", err)
+	}
+}
+
+// TestBoardRouteStillMirrorsTheERPContract is this repo's half of a cross-repo
+// seam, and it exists because the OTHER half cannot see this file.
+//
+// GableLBM pins the mirror in internal/integrations/ailm_contract_test.go by
+// keeping a HAND-COPIED aiLMBoardRoute beside a golden
+// (internal/integrations/testdata/ailm_client_contract.json, type
+// "BoardRoute"). That suite reduces its own copy and compares it to the golden
+// — so it catches somebody editing GableLBM, and is structurally blind to
+// somebody editing the type below. Nothing in either repo's CI opens both
+// checkouts at once. Without this test, a field renamed here builds clean,
+// tests clean, ships, and then decodes as a zero value against a perfectly
+// healthy ERP.
+//
+// So the reduction is repeated here, deliberately, in the SAME shape GableLBM
+// reduces to: json name, Go type, pointer, omitempty, IN ORDER. A change to
+// BoardRoute must break this test, and the fix is never to edit the expectation
+// alone — it is to re-sync GableLBM's copy and regenerate its golden with
+// -update-golden.
+//
+// Only BoardRoute and RouteRecall are pinned: they are the two types whose
+// shape a caller cannot recover from if it is wrong. A recall keyed on the
+// wrong field silently withdraws nothing (or the wrong truck), and a board row
+// that decodes without its status makes every route on the board look
+// reclaimable.
+func TestBoardRouteStillMirrorsTheERPContract(t *testing.T) {
+	type field struct {
+		name      string
+		goType    string
+		pointer   bool
+		omitEmpty bool
+	}
+	for _, tc := range []struct {
+		typ  any
+		want []field
+	}{{
+		typ: BoardRoute{},
+		want: []field{
+			{name: "route_id", goType: "string"},
+			{name: "vehicle_id", goType: "string"},
+			{name: "driver_id", goType: "string", omitEmpty: true},
+			{name: "status", goType: "string"},
+			{name: "scheduled_date", goType: "string"},
+			{name: "stop_count", goType: "int"},
+			{name: "order_ids", goType: "[]string"},
+			{name: "recalled_at", goType: "string", omitEmpty: true},
+		},
+	}, {
+		typ: RouteRecall{},
+		want: []field{
+			{name: "vehicle_id", goType: "string"},
+			{name: "scheduled_date", goType: "string"},
+			{name: "reason", goType: "string", omitEmpty: true},
+			{name: "recalled_by", goType: "string", omitEmpty: true},
+		},
+	}} {
+		rt := reflect.TypeOf(tc.typ)
+		t.Run(rt.Name(), func(t *testing.T) {
+			if rt.NumField() != len(tc.want) {
+				t.Fatalf("%s has %d fields, the ERP mirror pins %d — re-sync internal/integrations/ailm_contract_test.go and regenerate its golden",
+					rt.Name(), rt.NumField(), len(tc.want))
+			}
+			for i, want := range tc.want {
+				f := rt.Field(i)
+				parts := strings.Split(f.Tag.Get("json"), ",")
+				name, omit := parts[0], false
+				for _, p := range parts[1:] {
+					if p == "omitempty" {
+						omit = true
+					}
+				}
+				ft := f.Type
+				ptr := ft.Kind() == reflect.Pointer
+				if ptr {
+					ft = ft.Elem()
+				}
+				if name != want.name || ft.String() != want.goType || ptr != want.pointer || omit != want.omitEmpty {
+					t.Errorf("%s field %d is {%s %s ptr=%v omitempty=%v}, the ERP mirror pins {%s %s ptr=%v omitempty=%v}",
+						rt.Name(), i, name, ft.String(), ptr, omit, want.name, want.goType, want.pointer, want.omitEmpty)
+				}
+			}
+		})
+	}
+}
+
+// TestStatusConstantsAreTheERPsOwnValues pins the strings, not just the shape.
+// Status is only useful because both sides spell delivery_routes.status the
+// same way; a typo here would classify every route as neither live nor
+// dispatched, which fails OPEN — a route on the board that looks like nothing
+// at all is a route a re-plan walks straight over.
+func TestStatusConstantsAreTheERPsOwnValues(t *testing.T) {
+	for got, want := range map[string]string{
+		RouteStatusDraft:     "DRAFT",
+		RouteStatusScheduled: "SCHEDULED",
+		RouteStatusInTransit: "IN_TRANSIT",
+		RouteStatusCompleted: "COMPLETED",
+		RouteStatusCancelled: "CANCELLED",
+	} {
+		if got != want {
+			t.Errorf("status constant = %q, want %q (GableLBM delivery_routes.status)", got, want)
+		}
+	}
+	// Every status the ERP can hold must fall into exactly one bucket, or a
+	// route classified as neither is a route no gate will ever see.
+	for _, st := range []string{RouteStatusDraft, RouteStatusScheduled, RouteStatusInTransit, RouteStatusCompleted, RouteStatusCancelled} {
+		r := BoardRoute{Status: st}
+		if r.Live() && r.Dispatched() {
+			t.Errorf("%s is both live and dispatched", st)
+		}
+		if st != RouteStatusCancelled && !r.Live() && !r.Dispatched() {
+			t.Errorf("%s is neither live nor dispatched — it would be invisible to every gate", st)
+		}
 	}
 }

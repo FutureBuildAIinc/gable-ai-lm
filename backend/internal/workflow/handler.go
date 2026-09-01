@@ -46,6 +46,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, roleGuard ...func(http.Hand
 
 	mux.HandleFunc("POST /api/v1/workflow/plans", guard(h.HandleIngest))
 	mux.HandleFunc("GET /api/v1/workflow/plans/latest", guard(h.HandleLatest))
+	// The dispatch board as GableLBM actually holds it, reconciled against this
+	// service's ledgers. Read-only: it is the surface an orphaned route is
+	// SURFACED on, and a surface that repaired things could not be polled.
+	mux.HandleFunc("GET /api/v1/workflow/dispatch-board", guard(h.HandleDispatchBoard))
 	mux.HandleFunc("GET /api/v1/workflow/plans/{id}", guard(h.HandleGet))
 	mux.HandleFunc("POST /api/v1/workflow/plans/{id}/assign", guard(h.HandleAssign))
 	mux.HandleFunc("POST /api/v1/workflow/plans/{id}/pack", guard(h.HandlePack))
@@ -97,6 +101,17 @@ func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		httputil.RespondError(w, r, err.Error(), http.StatusLocked, err)
 		return
 	}
+	// The dispatch board could not be read, so this re-plan FAILED CLOSED. It
+	// is 502 and not 423 on purpose: 423 opens the approval prompt, and there
+	// is nothing here a dispatcher could approve — approving would mean
+	// "re-plan over a board you cannot see", which is the harm itself. It is
+	// also not the generic "ingest failed" 502 below, because "GableLBM is
+	// unreachable, nothing changed, try again" is a different support call from
+	// "the catalog would not resolve".
+	if errors.Is(err, ErrBoardUnreadable) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadGateway, err)
+		return
+	}
 	// A truck that has already left the yard cannot have its route recalled, so
 	// the re-plan is refused with the sentence naming it (422), not a shrug.
 	var refusal *Refusal
@@ -140,6 +155,43 @@ func (h *Handler) HandleLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.RespondJSON(w, http.StatusOK, plan)
+}
+
+// HandleDispatchBoard reports what GableLBM's dispatch board holds for a date
+// and every way this service's ledgers disagree with it.
+//
+// It exists because "surface an orphan, do not silently recall it" needs a
+// place to surface it. The re-plan gate is what actually closes the harm — a
+// re-ingest can no longer plan over a route it cannot see — but a 423 only
+// reaches somebody who happened to attempt a re-plan, and a route on the
+// dealer's board that no plan owns has to be findable on its own by a human who
+// can decide what to do about it.
+//
+// It writes NOTHING, including the ghost claims it reports. Ghost repair runs
+// on the re-plan path under the dispatch-date claim that makes it safe; doing
+// it here would mean a GET that mutates, which cannot be polled or put on a
+// dashboard, and would change state for a caller who only asked a question.
+//
+// date is required — a dateless board is not a smaller question, it is a
+// meaningless one, exactly as it is on the ERP endpoint underneath.
+func (h *Handler) HandleDispatchBoard(w http.ResponseWriter, r *http.Request) {
+	report, err := h.svc.BoardReportForDate(r.Context(), r.URL.Query().Get("date"))
+	if errors.Is(err, ErrInvalidRequest) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadRequest, err)
+		return
+	}
+	// Unreadable is reported as unreadable. Answering 200 with an empty board
+	// would tell a dashboard the date is clean at the exact moment nothing is
+	// known about it — the same fail-open this whole change removes.
+	if errors.Is(err, ErrBoardUnreadable) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadGateway, err)
+		return
+	}
+	if err != nil {
+		httputil.RespondError(w, r, "dispatch board lookup failed", http.StatusInternalServerError, err)
+		return
+	}
+	httputil.RespondJSON(w, http.StatusOK, report)
 }
 
 func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {

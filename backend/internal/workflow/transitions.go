@@ -208,6 +208,11 @@ func liveRoutes(p *Plan) []LiveRoute {
 // liveRoutesAcross is liveRoutes over a set of plans, in plan order. It is what
 // makes one refusal sentence able to describe a whole date: a date can hold
 // several plans and any number of them may be holding trucks on the board.
+//
+// It is now the LEDGER's answer, and the ledger is a cache. The supersede gate
+// filters it through the dispatch board (boardView.backedLiveRoutes) before it
+// names anything, because a ghost in an approval prompt asks a dispatcher to
+// weigh cancelling a run that is not there.
 func liveRoutesAcross(plans []*Plan) []LiveRoute {
 	out := []LiveRoute{}
 	for _, p := range plans {
@@ -227,7 +232,11 @@ func planIDs(plans []*Plan) string {
 }
 
 // liveRouteNames lists the trucks whose routes are live, for a refusal message.
-func liveRouteNames(live []LiveRoute) string {
+//
+// It returns the names rather than a joined string so a caller can append the
+// board's own unnamed trucks (divergenceTrucks) to the SAME list. Two lists
+// joined separately is how one of them ends up missing from a sentence.
+func liveRouteNames(live []LiveRoute) []string {
 	names := make([]string, 0, len(live))
 	for _, r := range live {
 		if r.VehicleName != "" {
@@ -236,7 +245,7 @@ func liveRouteNames(live []LiveRoute) string {
 		}
 		names = append(names, r.VehicleID)
 	}
-	return strings.Join(names, ", ")
+	return names
 }
 
 // gateTransition is the single precondition every workflow mutation runs.
@@ -274,7 +283,7 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 		return nil
 
 	case needsApproval:
-		return requireApproval([]*Plan{p}, action, t.gerund,
+		return requireApproval([]*Plan{p}, live, nil, action, t.gerund,
 			"will recall the route of any truck it drops", override, approvedBy)
 
 	default: // notListed
@@ -300,33 +309,76 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 // for a run that no longer exists" — reached by what is plausibly the more
 // common dispatcher action of the two.
 //
-// So the gate keys on the ledgers of the plans being SUPERSEDED, and on nothing
-// else. Not on their status: a plan that reached PUSHED and has since had every
-// route recalled has nothing on the board, and re-planning that date must stay
-// exactly as frictionless as it is today. "Are there live routes?" is the whole
-// question.
+// # The authority is the BOARD, not the ledger
 //
-// And it keys on EVERY plan holding the date, not the newest. A date holds one
-// plan per ingest — that is what "supersede rather than replace" means — and
-// the live one need not be the latest: pushing an older plan by id after a
-// re-ingest has minted a successor leaves the newest plan's ledger empty and
-// the board full. A latest-only gate walks straight past that, which three
-// plain HTTP calls demonstrated. prev is the union (see Service.supersededPlans)
-// and is already filtered to plans with something live, so an empty slice is
-// the frictionless path and costs nothing.
+// This gate used to take exactly one input: the ledgers of the plans holding
+// the date. That was the deepest defect on the branch and no amount of locking
+// could reach it. Plan.LiveRoutes is a CACHE of GableLBM's dispatch board, and
+// a crash between the ERP write and the ledger write leaves the two disagreeing
+// with nothing able to notice — so a gate reading only the ledger is a gate
+// that can be talked out of refusing by a lie, in exactly the direction that
+// hurts: an empty ledger over a full board reads as "nothing live here, plan
+// away".
 //
-// The refusal is ErrPushed with an approver — the same 423 idiom as the lock
-// and as every other live-route gate — and an exercised override is recorded on
-// every superseded plan, where the recalls it authorizes will be tombstoned.
-func gateSupersede(prev []*Plan, date string, override bool, approvedBy string) error {
-	// Nothing holding this date has anything on the board: the common case, and
-	// it must cost nothing.
-	if len(prev) == 0 {
+// It now takes both, and treats them as what they are:
+//
+//   - prev is still the ledger side. A plan whose ledger claims live routes is
+//     something a re-plan strands, and the ledger is where the recall that
+//     un-strands it is tombstoned, so it cannot simply be dropped. It has,
+//     however, already been RECONCILED against the board by the time it gets
+//     here: stale claims were tombstoned (see repairGhostClaims), so this gate
+//     no longer demands an approval for routes that do not exist.
+//   - orphans is the board side, and it is the half that closes the harm. A
+//     live route the board holds that no ledger names was, until now,
+//     completely invisible: a re-ingest sailed straight over it and the new
+//     plan had no idea the truck was taken. Now the gate SEES it, and a
+//     re-plan over it is refused.
+//
+// # What is deliberately NOT here
+//
+// Only ORPHAN divergences are passed in. A DISPATCHED route — IN_TRANSIT or
+// COMPLETED — must never gate a re-plan, and that is not leniency: GableLBM
+// answers every recall of a departed route with a terminal 409, so an approval
+// could not clear such a refusal and the date would become permanently
+// un-re-plannable by any action a dispatcher can take. A gate whose refusal has
+// no remedy is a bug, not a safeguard. The same holds for a route with no
+// vehicle, which the (vehicle_id, scheduled_date) recall key cannot even name.
+// Both are reported instead — see BoardReportForDate.
+//
+// # The refusal, and what approving it means
+//
+// It stays ErrPushed with an approver — the same 423 idiom as the lock and as
+// every other live-route gate — but the sentence now distinguishes the two
+// sources, because they mean very different things to the person reading it.
+// Recalling a route a previous plan of ours pushed is routine. Recalling a
+// route that no plan of ours names may be cancelling a delivery a dispatcher
+// built by hand and a driver is about to leave on, so approving must be a
+// decision made about NAMED trucks, never a side effect of clicking through the
+// same prompt as last time.
+func gateSupersede(view boardView, prev []*Plan, orphans []BoardDivergence, date string, override bool, approvedBy string) error {
+	// Nothing holding this date has anything on the board and the board holds
+	// nothing we do not name: the common case, and it must cost nothing.
+	if len(prev) == 0 && len(orphans) == 0 {
 		return nil
 	}
-	return requireApproval(prev, actionSupersede,
+
+	// Named from the BOARD, not from the ledgers. prev is already filtered to
+	// plans the board backs, but a plan can hold one real claim and one ghost,
+	// and a prompt that named the ghost would ask for approval to cancel a run
+	// that does not exist.
+	live := view.backedLiveRoutes(prev)
+	var clauses []string
+	if len(prev) > 0 {
+		clauses = append(clauses, fmt.Sprintf("will recall every route %s left on the dispatch board", planIDs(prev)))
+	}
+	if len(orphans) > 0 {
+		clauses = append(clauses, fmt.Sprintf(
+			"will ALSO recall %d route(s) the dispatch board holds that NO plan of ours names (%s) — a dispatcher may have created them in GableLBM and a truck may be about to drive one, so approve only if you know these are yours to cancel",
+			len(orphans), strings.Join(divergenceTrucks(orphans), ", ")))
+	}
+	return requireApproval(prev, live, orphans, actionSupersede,
 		fmt.Sprintf("re-planning %s", date),
-		fmt.Sprintf("will recall every route %s left on the dispatch board", planIDs(prev)),
+		strings.Join(clauses, ", and "),
 		override, approvedBy)
 }
 
@@ -344,26 +396,48 @@ func gateSupersede(prev []*Plan, date string, override bool, approvedBy string) 
 // approval is recorded on each plan it authorizes changing, because that is
 // where the recall it pays for will be tombstoned. A second sentence for the
 // multi-plan case would be a second override idiom for a dispatcher to learn.
-func requireApproval(plans []*Plan, action, gerund, consequence string, override bool, approvedBy string) error {
-	live := liveRoutesAcross(plans)
+//
+// live is the routes to NAME, handed in rather than derived from plans,
+// because the two callers disagree about what counts. A transition gate names
+// the plan's whole ledger; the supersede gate names only what the dispatch
+// board actually backs, since a ghost in an approval prompt asks a dispatcher
+// to weigh cancelling a run that is not there.
+//
+// orphans are trucks the BOARD holds that no plan names. They are named in the
+// same sentence as the ledger's own trucks, because a dispatcher weighing an
+// approval needs one list of what is about to come off the board, not two. They
+// are counted in the recorded note for the same reason, and they belong to no
+// plan, so when they are the ONLY reason for the approval there is no plan here
+// to record it on — Ingest records that case on the plan it creates, which is
+// the only durable artifact of a re-plan that superseded nothing.
+func requireApproval(plans []*Plan, live []LiveRoute, orphans []BoardDivergence, action, gerund, consequence string, override bool, approvedBy string) error {
+	names := append(liveRouteNames(live), divergenceTrucks(orphans)...)
+	n := len(live) + len(orphans)
 	if !override {
 		return fmt.Errorf("%w (%s) — %s requires manual approval (override), and %s",
-			ErrPushed, liveRouteNames(live), gerund, consequence)
+			ErrPushed, strings.Join(names, ", "), gerund, consequence)
 	}
-	who := approvedBy
-	if who == "" {
-		who = "an approver"
-	}
+	who := approverOrDefault(approvedBy)
 	for _, p := range plans {
 		p.PushedOverrides = append(p.PushedOverrides, PushedOverride{
 			Action:     action,
 			ApprovedBy: who,
 			ApprovedAt: time.Now(),
 			Note: fmt.Sprintf("%s approved with %d route(s) live on the dispatch board (%s)",
-				gerund, len(live), liveRouteNames(live)),
+				gerund, n, strings.Join(names, ", ")),
 		})
 	}
 	return nil
+}
+
+// approverOrDefault names who authorized something. It is deliberately never an
+// empty string: "who approved cancelling this truck's route?" must not be
+// answerable with a blank.
+func approverOrDefault(approvedBy string) string {
+	if approvedBy == "" {
+		return "an approver"
+	}
+	return approvedBy
 }
 
 // walkBackAfterReshuffle invalidates the later-stage artifacts a mid-workflow

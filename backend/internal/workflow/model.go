@@ -246,6 +246,50 @@ type PushedOverride struct {
 	Note       string    `json:"note,omitempty"`
 }
 
+// Board-repair actions: what this service actually DID about a divergence
+// between GableLBM's dispatch board and its own ledger.
+//
+// Three, not one, because the asymmetry is the product decision. A ghost is
+// repaired on our side alone; an orphan is a route on the dealer's board and is
+// only ever withdrawn under an approval that named it; a departed or
+// unaddressable route is reported and left completely alone. Collapsing these
+// into "handled" would make the audit trail unable to answer the one question
+// an incident asks: did we cancel something nobody agreed to cancel?
+const (
+	// RepairTombstoned — a stale claim of OURS was corrected. Nothing on the
+	// dealer's board changed, because there was nothing there.
+	RepairTombstoned = "TOMBSTONED"
+	// RepairRecalled — a route WAS taken off the dealer's board, under an
+	// explicit approval.
+	RepairRecalled = "RECALLED"
+	// RepairReported — seen, named, and deliberately not touched.
+	RepairReported = "REPORTED"
+)
+
+// BoardRepair is one thing a re-plan did (or pointedly did not do) about a
+// disagreement between the dispatch board and this service's ledger, recorded
+// on the plan that was created over that board.
+//
+// It exists because the divergences are discovered at re-plan time, acted on
+// under a dispatch-date claim, and then gone: without this, a plan would carry
+// no record that the date it was built on had a truck out that belonged to
+// nobody, or that two stale claims were corrected to let it proceed. "Who
+// withdrew this route, and who approved it?" must be answerable from the plan.
+type BoardRepair struct {
+	Kind        string    `json:"kind"`   // GHOST / ORPHAN / DISPATCHED / UNADDRESSABLE
+	Action      string    `json:"action"` // TOMBSTONED / RECALLED / REPORTED
+	VehicleID   string    `json:"vehicle_id,omitempty"`
+	VehicleName string    `json:"vehicle_name,omitempty"`
+	RouteID     string    `json:"route_id,omitempty"`
+	BoardStatus string    `json:"board_status,omitempty"`
+	StopCount   int       `json:"stop_count"`
+	OrderIDs    []string  `json:"order_ids,omitempty"`
+	PlanID      string    `json:"plan_id,omitempty"`
+	At          time.Time `json:"at"`
+	By          string    `json:"by,omitempty"`
+	Note        string    `json:"note,omitempty"`
+}
+
 // Lock window codes (T2-3).
 const (
 	LockWindowMorning   = "MORNING"
@@ -321,8 +365,12 @@ type Plan struct {
 	// PushedOverrides is the audit trail of manual approvals to change this
 	// plan after its routes went live.
 	PushedOverrides []PushedOverride `json:"pushed_overrides,omitempty"`
-	CreatedAt       time.Time        `json:"created_at"`
-	UpdatedAt       time.Time        `json:"updated_at"`
+	// BoardRepairs records what this plan's ingest found on GableLBM's
+	// dispatch board that its ledgers disagreed with, and what it did about
+	// each one. Repository.payload must carry it — see the note there.
+	BoardRepairs []BoardRepair `json:"board_repairs,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 // IngestRequest starts a workflow run for a date.

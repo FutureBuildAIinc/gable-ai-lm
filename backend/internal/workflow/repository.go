@@ -104,6 +104,7 @@ type payload struct {
 	LateAdds         []LateAdd        `json:"late_adds,omitempty"`
 	LiveRoutes       []LiveRoute      `json:"live_routes,omitempty"`
 	PushedOverrides  []PushedOverride `json:"pushed_overrides,omitempty"`
+	BoardRepairs     []BoardRepair    `json:"board_repairs,omitempty"`
 }
 
 func (r *Repository) marshalPayload(p *Plan) ([]byte, error) {
@@ -119,6 +120,7 @@ func (r *Repository) marshalPayload(p *Plan) ([]byte, error) {
 		LateAdds:         p.LateAdds,
 		LiveRoutes:       p.LiveRoutes,
 		PushedOverrides:  p.PushedOverrides,
+		BoardRepairs:     p.BoardRepairs,
 	})
 }
 
@@ -138,6 +140,7 @@ func (r *Repository) unmarshalPayload(raw []byte, p *Plan) error {
 	p.LateAdds = pl.LateAdds
 	p.LiveRoutes = pl.LiveRoutes
 	p.PushedOverrides = pl.PushedOverrides
+	p.BoardRepairs = pl.BoardRepairs
 	if p.Orders == nil {
 		p.Orders = []OrderAnalysis{}
 	}

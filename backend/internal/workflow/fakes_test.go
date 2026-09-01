@@ -184,6 +184,19 @@ func (s *fakePlanStore) WithDateLock(_ context.Context, date string, fn func(con
 	return fn(context.Background())
 }
 
+// holdsDate reports whether this date is claimed RIGHT NOW — test-only.
+//
+// It exists because the only other way to ask is to send a competing writer,
+// and a writer that is ALLOWED through does not just answer the question, it
+// changes the board mid-flight and the reconciliation that follows then
+// describes a state the test created rather than the one under test. Asking the
+// lock directly answers "is the claim held here?" without touching anything.
+func (s *fakePlanStore) holdsDate(date string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dateLocks[date]
+}
+
 // lockCounts reports (grants, refusals) — test-only accessor.
 func (s *fakePlanStore) lockCounts() (int, int) {
 	s.mu.Lock()
@@ -351,6 +364,118 @@ type fakeGable struct {
 	// recallMissing marks the recall as having found nothing on the board —
 	// the idempotent no-op, which is a success.
 	recallMissing bool
+
+	// --- the dispatch board, as a READ ---
+	//
+	// The board this double reports is DERIVED from f.pushed, never tracked
+	// beside it. That is the whole point: the fake ERP must not be able to hold
+	// a board that disagrees with itself, or a test could "prove" the
+	// reconciler right against a board that does not exist. A route reaches
+	// this board by being pushed (by the service, or by pushOutside standing in
+	// for a dispatcher working directly in GableLBM) and leaves it by being
+	// recalled.
+
+	// boardStatus overrides a truck's status on the board. Absent means
+	// SCHEDULED, which is what GableLBM's ReplaceDeliveryRoute actually writes.
+	// It is how a test makes a truck IN_TRANSIT — a route that is real, on the
+	// board, and can never be recalled.
+	boardStatus map[string]string
+
+	// boardErr makes the board unreadable (an unreachable or broken ERP).
+	boardErr error
+
+	// boardCalls counts board reads. "Was the board consulted at all, and how
+	// many times?" is the difference between a gate that reads the system of
+	// record and one that still trusts its cache, and no end-state assertion
+	// can tell them apart.
+	boardCalls int
+
+	// onBoardRead fires INSIDE every board read, with that read's 1-based
+	// count. It is the only seam that can answer "was this read taken under the
+	// dispatch-date claim?": a hook that tries to write the same date and is
+	// refused proves the claim was held, which no end-state assertion can,
+	// because every ordering converges when nothing lands in between.
+	//
+	// It takes the count because a re-plan reads the board TWICE — once
+	// outside the claim to make a refusal honest before three heavier ERP
+	// pulls, once inside it to decide — and the two reads must be told apart:
+	// a hook that could only see the first would report the exact opposite of
+	// the truth about where the claim is taken.
+	onBoardRead func(n int)
+}
+
+// ListDeliveryRoutesForDate reports the board the pushes have actually built.
+func (f *fakeGable) ListDeliveryRoutesForDate(_ context.Context, date string) ([]gable.BoardRoute, error) {
+	f.mu.Lock()
+	f.boardCalls++
+	n, hook := f.boardCalls, f.onBoardRead
+	f.mu.Unlock()
+	// Called outside f.mu, like every other hook here, so a hook that itself
+	// drives the ERP double cannot deadlock on the lock its caller holds.
+	if hook != nil {
+		hook(n)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.boardErr != nil {
+		return nil, f.boardErr
+	}
+	out := []gable.BoardRoute{}
+	for i, r := range f.pushed {
+		if r.ScheduledDate != date {
+			continue
+		}
+		status := gable.RouteStatusScheduled
+		if st, ok := f.boardStatus[r.VehicleID]; ok {
+			status = st
+		}
+		orderIDs := make([]string, 0, len(r.Stops))
+		for _, st := range r.Stops {
+			orderIDs = append(orderIDs, st.OrderID)
+		}
+		out = append(out, gable.BoardRoute{
+			RouteID:       fmt.Sprintf("route-%d-%s", i, r.VehicleID),
+			VehicleID:     r.VehicleID,
+			DriverID:      r.DriverID,
+			Status:        status,
+			ScheduledDate: r.ScheduledDate,
+			StopCount:     len(r.Stops),
+			OrderIDs:      orderIDs,
+		})
+	}
+	return out, nil
+}
+
+// boardReads reports how many times the board was consulted (test-only).
+func (f *fakeGable) boardReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.boardCalls
+}
+
+// pushOutside puts a route on the board that this service did NOT write — a
+// dispatcher creating a run by hand in GableLBM, or the surviving half of a
+// push whose ledger write was lost to a crash.
+//
+// It writes to the SAME f.pushed the service's own pushes land in, rather than
+// to a side list, so the acceptance oracle and the reconciler see one board.
+// An orphan that only the code under test could see would prove nothing.
+func (f *fakeGable) pushOutside(vehicleID, date, status string, orderIDs ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stops := make([]gable.RouteStop, 0, len(orderIDs))
+	for i, id := range orderIDs {
+		stops = append(stops, gable.RouteStop{OrderID: id, Sequence: i + 1})
+	}
+	f.pushed = append(f.pushed, gable.DeliveryRoute{
+		VehicleID: vehicleID, ScheduledDate: date, Stops: stops,
+	})
+	if status != "" && status != gable.RouteStatusScheduled {
+		if f.boardStatus == nil {
+			f.boardStatus = map[string]string{}
+		}
+		f.boardStatus[vehicleID] = status
+	}
 }
 
 func (f *fakeGable) ListOrdersForDate(_ context.Context, date string) ([]gable.Order, error) {
@@ -425,6 +550,16 @@ func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) 
 func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall) (*gable.RouteRecallResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A truck that has left the yard cannot be recalled, and GableLBM says so
+	// with a 409. Modelling it from the SAME boardStatus the board read is
+	// derived from is what makes "IN_TRANSIT is never treated as reclaimable"
+	// an assertion about behaviour rather than about a flag: a reconciler that
+	// wrongly classified a departed truck as reclaimable would reach this and
+	// fail, instead of quietly succeeding against a permissive double.
+	if st, ok := f.boardStatus[rc.VehicleID]; ok &&
+		(st == gable.RouteStatusInTransit || st == gable.RouteStatusCompleted) {
+		return nil, fmt.Errorf("%w (truck %s on %s)", gable.ErrRouteDispatched, rc.VehicleID, rc.ScheduledDate)
+	}
 	if f.recallDispatched {
 		return nil, fmt.Errorf("%w (truck %s on %s)", gable.ErrRouteDispatched, rc.VehicleID, rc.ScheduledDate)
 	}
@@ -471,6 +606,36 @@ func (f *fakeGable) pushedIDs() []string {
 		out = append(out, r.VehicleID)
 	}
 	return out
+}
+
+// removeFromBoard takes a route off the board WITHOUT telling this service — a
+// dispatcher cancelling a run in GableLBM's own UI, or the ERP side of a
+// half-applied change. It is how a GHOST is made: our ledger goes on claiming a
+// truck the system of record no longer holds.
+func (f *fakeGable) removeFromBoard(vehicleID, date string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := make([]gable.DeliveryRoute, 0, len(f.pushed))
+	for _, r := range f.pushed {
+		if r.VehicleID == vehicleID && r.ScheduledDate == date {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	f.pushed = kept
+	delete(f.boardStatus, vehicleID)
+}
+
+// setBoardStatus moves a truck's route to another status on the board — most
+// importantly IN_TRANSIT, which is a route that is real, still on the board,
+// and can never be recalled.
+func (f *fakeGable) setBoardStatus(vehicleID, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.boardStatus == nil {
+		f.boardStatus = map[string]string{}
+	}
+	f.boardStatus[vehicleID] = status
 }
 
 // fakeCatalog resolves products to effective geometry.

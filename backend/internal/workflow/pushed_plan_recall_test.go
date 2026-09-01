@@ -615,6 +615,12 @@ func TestPayloadRoundTripsTheLiveRouteLedger(t *testing.T) {
 		PushedOverrides: []PushedOverride{{
 			Action: actionAssign, ApprovedBy: "dispatcher@dealer.com", ApprovedAt: *recalledAt,
 		}},
+		BoardRepairs: []BoardRepair{{
+			Kind: DivergenceOrphan, Action: RepairRecalled, VehicleID: "v9",
+			RouteID: "route-9", BoardStatus: "SCHEDULED", StopCount: 2,
+			OrderIDs: []string{"o-1", "o-2"}, At: *recalledAt, By: "dispatcher@dealer.com",
+			Note: "withdrawn by an approved re-plan",
+		}},
 	}
 
 	r := &Repository{}
@@ -642,6 +648,18 @@ func TestPayloadRoundTripsTheLiveRouteLedger(t *testing.T) {
 	}
 	if out.Loads[0].PushedAt == nil || out.Loads[0].PushedDigest != "abc123" {
 		t.Errorf("the per-load ack must ride inside Loads: %+v", out.Loads[0])
+	}
+	// BoardRepairs is the ONLY record that a route was taken off the dealer's
+	// board that no plan named, and who approved it. Losing it to the payload
+	// trap would leave an incident review unable to answer "who cancelled this
+	// customer's delivery?" — and every in-memory test would still pass.
+	if len(out.BoardRepairs) != 1 {
+		t.Fatalf("BoardRepairs did not survive the payload round-trip: got %+v.\n"+
+			"Add the field to the payload struct AND marshalPayload AND unmarshalPayload — all three.", out.BoardRepairs)
+	}
+	if r := out.BoardRepairs[0]; r.Kind != DivergenceOrphan || r.Action != RepairRecalled ||
+		r.VehicleID != "v9" || r.By != "dispatcher@dealer.com" || len(r.OrderIDs) != 2 {
+		t.Errorf("board repair lost detail in the round-trip: %+v", r)
 	}
 }
 
