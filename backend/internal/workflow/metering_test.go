@@ -255,10 +255,10 @@ type failAfterNPushes struct {
 	err   error
 }
 
-func (f *failAfterNPushes) PushDeliveryRoute(ctx context.Context, r gable.DeliveryRoute) error {
+func (f *failAfterNPushes) PushDeliveryRoute(ctx context.Context, r gable.DeliveryRoute) (*gable.RouteAck, error) {
 	f.calls++
 	if f.calls > f.n {
-		return f.err
+		return nil, f.err
 	}
 	return f.fakeGable.PushDeliveryRoute(ctx, r)
 }

@@ -116,7 +116,12 @@ type gableSource interface {
 	ListVehicles(ctx context.Context) ([]gable.Vehicle, error)
 	ListLocations(ctx context.Context) ([]gable.Location, error)
 	ListDrivers(ctx context.Context) ([]gable.Driver, error)
-	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) error
+	// PushDeliveryRoute writes a route to the dispatch board and returns the
+	// ERP's acknowledgement. The ack carries GableLBM's own route id, which is
+	// what a ledger claim needs in order to name ONE row rather than a truck: a
+	// truck can hold two rows for a day, and a claim that could only name the
+	// truck let the second one stand in for ours. See gable.RouteAck.
+	PushDeliveryRoute(ctx context.Context, route gable.DeliveryRoute) (*gable.RouteAck, error)
 	// RecallDeliveryRoute withdraws a route this plan previously pushed. It is
 	// the inverse the dispatch board lacked, and without it a re-assignment
 	// could only ever orphan the trucks it dropped.
@@ -366,9 +371,8 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 	// Nothing is repaired here: a repair is a WRITE and every write to this
 	// date happens under the claim. The ghosts are merely discounted, in
 	// memory, so this ask refuses for the right reasons.
-	divergences := reconcile(view, livePlans(all))
-	if err := gateSupersede(view, view.backedLivePlans(all),
-		divergencesOfKind(divergences, DivergenceOrphan),
+	truth := view.reconcile(livePlans(all))
+	if err := gateSupersede(truth, truth.backedLivePlans(), truth.orphans(),
 		req.Date, req.Override, req.ApprovedBy); err != nil {
 		return nil, err
 	}
@@ -490,7 +494,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		if err != nil {
 			return err
 		}
-		divergences := reconcile(view, livePlans(all))
+		truth := view.reconcile(livePlans(all))
 
 		// GHOSTS FIRST, and before the gate. A claim the board does not back is
 		// this service being wrong about itself; repairing it takes nothing off
@@ -499,7 +503,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		// that does not exist — and the recall that approval authorizes is keyed
 		// (vehicle, date), so it would cancel whatever route that truck has
 		// acquired since.
-		if err := s.repairGhostClaims(ctx, all, divergencesOfKind(divergences, DivergenceGhost), time.Now()); err != nil {
+		if err := s.repairGhostClaims(ctx, all, truth.ghosts(), time.Now()); err != nil {
 			return err
 		}
 
@@ -507,14 +511,14 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 		// just read: which plans does this re-plan actually strand? The plan
 		// pointers are the ones repairGhostClaims adopted, so they carry the
 		// current version and supersede() can write them.
-		superseded := view.backedLivePlans(all)
-		orphans := divergencesOfKind(divergences, DivergenceOrphan)
+		superseded := truth.backedLivePlans()
+		orphans := truth.orphans()
 
 		// Re-run the gate, so an unapproved late arrival is refused with the
 		// same 423 rather than silently planned over — and so is a route the
 		// BOARD holds that no ledger names, which the cheap ask above is
 		// structurally unable to see.
-		if err := gateSupersede(view, superseded, orphans, req.Date, req.Override, req.ApprovedBy); err != nil {
+		if err := gateSupersede(truth, superseded, orphans, req.Date, req.Override, req.ApprovedBy); err != nil {
 			return err
 		}
 		// The approval given above is exercised HERE, as late as possible: the
@@ -545,7 +549,7 @@ func (s *Service) Ingest(ctx context.Context, req IngestRequest) (*Plan, error) 
 					req.Date, len(orphans), strings.Join(divergenceTrucks(orphans), ", ")),
 			})
 		}
-		recordReportedDivergences(plan, divergences, time.Now())
+		recordReportedDivergences(plan, truth.divergences(), time.Now())
 		return s.repo.Create(ctx, plan)
 	}); err != nil {
 		return nil, err
@@ -787,6 +791,23 @@ func (a *OrderAnalysis) recomputeTotals() {
 // is derived from a read (priorLive) taken at the top: claiming only the recall
 // would serialize the write and leave the decision racing, which is the same
 // defect with a smaller window.
+//
+// # It reads the dispatch board, and it did not use to
+//
+// Assign gated on gateReshuffle and gateTransition, both keyed on
+// Plan.LiveRoutes, and consulted GableLBM's board exactly zero times. That was
+// wrong in both directions and the second one has teeth. A stale claim made it
+// demand an approval for a route that does not exist; and every one of the four
+// states that puts a route on the board with no ledger naming it — a dispatcher
+// hand-building a run, some other writer, a crash between the ERP write and the
+// ledger write, a holder killed mid-push — was answered 423 by a re-ingest and
+// 200 by a re-assignment of the same date. This is not a passive path: it
+// RECALLS, keyed (vehicle_id, scheduled_date), every route whose truck the new
+// assignment drops, and it picked those trucks from the ledger this branch
+// exists to stop trusting.
+//
+// So it reads the board twice, for the two different reasons Ingest reads it
+// twice. See the note at each read.
 func (s *Service) Assign(ctx context.Context, id string, override bool, approvedBy string) (*Plan, error) {
 	// One read before the claim, for one fact: WHICH date this contends for.
 	// Every gate and every write below re-reads the plan INSIDE the claim, so a
@@ -796,6 +817,26 @@ func (s *Service) Assign(ctx context.Context, id string, override bool, approved
 		return nil, err
 	}
 	date := head.PlanDate
+
+	// THE CHEAP, HONEST ASK — outside the claim, deliberately.
+	//
+	// It costs one ERP round-trip and a plan list, and it saves, on a refusal:
+	// taking the dispatch-date claim at all (a serialization point every push
+	// on this date would then queue behind), the vehicle and driver pulls, a
+	// fleet-profile lookup per truck, and the CVRP solve and sequencing that
+	// follow. A dispatcher who needs an approver should not pay for any of
+	// that, and neither should the pushes waiting on the door.
+	//
+	// It is honest rather than merely early because it reads the BOARD. Gating
+	// here on the ledger alone would refuse for the wrong reasons in both
+	// directions, which is what it did before this existed.
+	//
+	// It decides nothing that is acted on. Nothing is repaired, no approval is
+	// recorded that survives (head and this plan list are copies this call
+	// throws away), and the verdict is re-earned under the claim below.
+	if err := s.gateAssignOverBoard(ctx, head, date, override, approvedBy); err != nil {
+		return nil, err
+	}
 
 	var plan *Plan
 	err = s.holdDate(ctx, date, "changed", "the trucks were not re-assigned", func(ctx context.Context) error {
@@ -807,6 +848,33 @@ func (s *Service) Assign(ctx context.Context, id string, override bool, approved
 		return nil, err
 	}
 	return plan, nil
+}
+
+// gateAssignOverBoard is the pre-claim ask: read the board, reconcile it against
+// this date's ledgers, and answer the same question the authoritative gate below
+// will answer.
+//
+// It is a separate function only so the two asks cannot drift into asking
+// different questions — the reason c2cb4d9's ingest gate is one function called
+// twice. It WRITES NOTHING: the ghosts it finds are discounted in memory by
+// handing gateTransitionOverBoard the board-backed live set instead of the
+// ledger's, exactly as Ingest discounts them before its own cheap gate. A repair
+// is a write, and every write to a date happens under that date's claim.
+func (s *Service) gateAssignOverBoard(ctx context.Context, p *Plan, date string, override bool, approvedBy string) error {
+	all, err := s.repo.ListForDate(ctx, date)
+	if err != nil {
+		return fmt.Errorf("look up the existing plans for %s: %w", date, err)
+	}
+	view, err := s.readBoard(ctx, date)
+	if err != nil {
+		return err
+	}
+	truth := view.reconcile(livePlans(all))
+	if err := refuseContested(truth.orphans(), date); err != nil {
+		return err
+	}
+	return gateTransitionOverBoard(p, actionAssign,
+		truth.backedLiveRoutes([]*Plan{p}), truth.orphans(), override, approvedBy)
 }
 
 // assignHeld is Assign's body, running with this date claimed.
@@ -824,15 +892,91 @@ func (s *Service) assignHeld(ctx context.Context, id, date string, override bool
 		// value read BEFORE it was taken.
 		return nil, refusedf("this plan moved from %s to %s while the re-assignment was starting — reload and assign again", date, p.PlanDate)
 	}
+	// The lock gate first: it is the cheapest refusal on this path, it needs
+	// nothing from GableLBM, and a locked run must be turned away before this
+	// function repairs anything.
 	if err := gateReshuffle(p, override, approvedBy, planTransitions[actionAssign].gerund); err != nil {
 		return nil, err
 	}
-	// Re-assignment on a plan whose routes are live needs an approver, because
-	// it is about to decide which trucks stop existing.
-	if err := gateTransition(p, actionAssign, override, approvedBy); err != nil {
+
+	// THE AUTHORITATIVE BOARD READ. It sits here — inside the dispatch-date
+	// claim, immediately before the gate whose verdict is acted on — for the
+	// same two reasons Ingest's does.
+	//
+	// INSIDE THE CLAIM, because outside it the answer is only recent, not true:
+	// a push landing between the cheap ask above and this point is invisible to
+	// that snapshot, and this function goes on to RECALL by (vehicle_id,
+	// scheduled_date) — so a doomed set computed from the earlier read would
+	// cancel a route written afterwards, leaving the pushing plan's ledger
+	// swearing to a truck the board no longer holds. Under the claim, no other
+	// writer in this service can move this board.
+	//
+	// IMMEDIATELY BEFORE THE GATE, because the reconciliation it feeds must
+	// describe the same board the recall set is computed from. The doomed set is
+	// derived from THIS view further down, several ERP round-trips later, and
+	// that is sound for exactly one reason: the claim is held across both, so
+	// the only actor that could have moved the board in between is a human in
+	// GableLBM's own UI — which no lock of ours reaches, and which is precisely
+	// why an unnamed route is surfaced for a decision rather than acted on.
+	// Re-reading before the recall would produce a board the approval above was
+	// never given about.
+	//
+	// AND IT IS THE ONLY ONE THAT WRITES: the ghosts found here are repaired.
+	all, err := s.repo.ListForDate(ctx, date)
+	if err != nil {
+		return nil, fmt.Errorf("look up the existing plans for %s: %w", date, err)
+	}
+	// Share the pointer, so the repair below lands on the very copy this
+	// function gates on and persists. Re-listing to pick it up again would ask
+	// the store a question the repair has already answered, and mirroring the
+	// tombstone by hand would leave p.Version behind and turn the repair into a
+	// 409 on the Update at the end.
+	for i := range all {
+		if all[i].ID == p.ID {
+			all[i] = p
+		}
+	}
+	view, err := s.readBoard(ctx, date)
+	if err != nil {
 		return nil, err
 	}
-	priorLive := liveRoutes(p)
+	truth := view.reconcile(livePlans(all))
+	if err := refuseContested(truth.orphans(), date); err != nil {
+		return nil, err
+	}
+	// GHOSTS FIRST, and before the gate — the same ordering, for the same
+	// reason, as the re-plan path. A claim the board does not back is this
+	// service being wrong about itself; repairing it takes nothing off anybody's
+	// board, and leaving it would make this gate demand an approval for a route
+	// that does not exist and then RECALL that truck by (vehicle, date),
+	// cancelling whatever it has acquired since.
+	if err := s.repairGhostClaims(ctx, all, truth.ghosts(), time.Now()); err != nil {
+		return nil, err
+	}
+	// Re-assignment on a plan whose routes are live needs an approver, because
+	// it is about to decide which trucks stop existing — and so does one run
+	// over a board holding routes no plan of ours names.
+	if err := gateTransitionOverBoard(p, actionAssign,
+		truth.backedLiveRoutes([]*Plan{p}), truth.orphans(), override, approvedBy); err != nil {
+		return nil, err
+	}
+	// THE DOOMED SET IS COMPUTED FROM THE BOARD, not from the ledger. This is
+	// the set whose members will be RECALLED — by (vehicle_id, scheduled_date),
+	// which cancels whatever that truck holds at the time — so it must be the
+	// routes the dealer's board actually has rather than the routes we believe
+	// it has.
+	//
+	// Given the repair immediately above, this is currently EQUIVALENT to
+	// liveRoutes(p): repairGhostClaims has just tombstoned every claim the board
+	// does not back, so the two sets are identical and a mutation swapping them
+	// SURVIVES the suite. It stays anyway, and deliberately. The equivalence is
+	// a property of the ORDERING, not of the recall: move the repair, make it
+	// conditional, or let some future divergence kind be repaired elsewhere, and
+	// liveRoutes(p) silently starts recalling routes that do not exist again —
+	// keyed (vehicle, date), which cancels whatever those trucks have acquired
+	// since. Removing the repair AND this line together IS caught, by
+	// TestAReassignmentComputesItsRecallSetFromTheBoard.
+	priorLive := truth.backedLiveRoutes([]*Plan{p})
 
 	byOrder := orderIndex(p)
 	var rstops []routing.Stop
@@ -1546,17 +1690,42 @@ func (s *Service) pushLocked(ctx context.Context, id, date string) (*Plan, error
 			continue
 		}
 
-		if err := s.gable.PushDeliveryRoute(ctx, route); err != nil {
+		ack, err := s.gable.PushDeliveryRoute(ctx, route)
+		if err != nil {
 			pushErr, failedTruck = err, l.VehicleName
 			break
+		}
+		// The route id the ERP just minted. It is what makes this plan's claim
+		// name ONE row on the board instead of a (truck, day) pair the board
+		// does not keep unique — see gable.RouteAck and boardView.reconcile. An
+		// empty id (an ERP whose acknowledgement could not be read) is a
+		// supported outcome, not a failure: the claim then matches by truck,
+		// exactly as every claim written before this change does.
+		routeID := ""
+		if ack != nil {
+			routeID = ack.RouteID
+			// Replaced is the ERP saying this write DELETEd a prior
+			// DRAFT/SCHEDULED row for the same truck and day. It is logged and
+			// never branched on: clearDisplacedClaims deliberately runs over
+			// every truck this plan claims rather than over the trucks this
+			// attempt happened to write, because a resumed push SKIPS the
+			// trucks that already landed and would otherwise never pay the
+			// correction they owe. Narrowing that pass to Replaced would
+			// reintroduce exactly that hole. What the flag is worth is the
+			// warning below: a replacement on a truck we did NOT already claim
+			// means this push destroyed a row somebody else put there.
+			if ack.Replaced && !routeIsLive(p, l.VehicleID) {
+				slog.Warn("a push replaced a dispatch-board route this plan did not claim — it may have been built in GableLBM by hand",
+					"plan", p.ID, "date", p.PlanDate, "vehicle", l.VehicleID, "new_route", routeID)
+			}
 		}
 
 		t := now
 		l.PushedAt = &t
 		l.PushedDigest = digest
-		markRouteLive(p, l.VehicleID, l.VehicleName, now)
+		markRouteLive(p, l.VehicleID, l.VehicleName, routeID, now)
 		wrote = append(wrote, l.VehicleName)
-		acks = append(acks, pushAck{vehicleID: l.VehicleID, vehicleName: l.VehicleName, digest: digest})
+		acks = append(acks, pushAck{vehicleID: l.VehicleID, vehicleName: l.VehicleName, routeID: routeID, digest: digest})
 		// Metered per route, inside the loop, because that is where the value
 		// actually occurs: a push that fails on the fourth truck still put
 		// three real routes on the dealer's dispatch board, and they do not
@@ -1642,7 +1811,12 @@ func (s *Service) pushLocked(ctx context.Context, id, date string) (*Plan, error
 type pushAck struct {
 	vehicleID   string
 	vehicleName string
-	digest      string
+	// routeID is GableLBM's identity for the row this attempt wrote. It rides
+	// on the ack because the ledger is re-stated from these when the save has
+	// to be replayed, and a replay that dropped the id would leave a claim that
+	// can only be matched to the board by truck.
+	routeID string
+	digest  string
 }
 
 // pushOutcome is everything one Push attempt decided, in a form that can be
@@ -1677,7 +1851,7 @@ type pushOutcome struct {
 // as the other writer set it.
 func (o pushOutcome) applyTo(p *Plan) bool {
 	for _, a := range o.acks {
-		markRouteLive(p, a.vehicleID, a.vehicleName, o.at)
+		markRouteLive(p, a.vehicleID, a.vehicleName, a.routeID, o.at)
 		for i := range p.Loads {
 			if p.Loads[i].VehicleID != a.vehicleID {
 				continue
@@ -2071,16 +2245,24 @@ func routeDigest(route gable.DeliveryRoute) string {
 // markRouteLive records that a truck's route is now on the dispatch board,
 // reviving a previously recalled entry for the same truck rather than
 // accumulating duplicates.
-func markRouteLive(p *Plan, vehicleID, vehicleName string, at time.Time) {
+//
+// routeID OVERWRITES whatever the revived entry carried, and must. The push
+// upstream is create-or-replace: GableLBM DELETEs the prior DRAFT/SCHEDULED row
+// and INSERTs a new one with a new id, so a re-push of the same truck leaves the
+// old id naming a row that no longer exists. Keeping it would turn this plan's
+// own live claim into a ghost on the next reconciliation and let its real route
+// read as an orphan.
+func markRouteLive(p *Plan, vehicleID, vehicleName, routeID string, at time.Time) {
 	for i := range p.LiveRoutes {
 		if p.LiveRoutes[i].VehicleID == vehicleID && p.LiveRoutes[i].Live() {
 			p.LiveRoutes[i].PushedAt = at
 			p.LiveRoutes[i].VehicleName = vehicleName
+			p.LiveRoutes[i].RouteID = routeID
 			return
 		}
 	}
 	p.LiveRoutes = append(p.LiveRoutes, LiveRoute{
-		VehicleID: vehicleID, VehicleName: vehicleName, PushedAt: at,
+		VehicleID: vehicleID, VehicleName: vehicleName, RouteID: routeID, PushedAt: at,
 	})
 }
 

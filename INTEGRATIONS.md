@@ -136,19 +136,48 @@ AI_LM posts an approved plan back:
 Idempotent on `(vehicle_id, scheduled_date)` — re-approving a plan overwrites rather than
 duplicates.
 
+**The response is consumed, and the `route_id` in it is load-bearing:**
+`{ route_id, stop_count, created, replaced }` (`gable.RouteAck`). AI_LM used to discard the
+body and read only the status code, which left it holding no identity for a route it had
+just written except the truck and the day — see the correction to "at most one route per
+truck per day" below. The id is stored on `Plan.live_routes[].route_id` and is what a
+reconciliation matches a claim to a board row with. `replaced` is recorded in the log line
+and never branched on: it says a prior `DRAFT`/`SCHEDULED` row for that truck and day was
+deleted, which is useful evidence when the deleted row was one AI_LM did not claim, but the
+ledger correction below deliberately runs over every truck the plan claims rather than over
+the trucks this attempt wrote.
+
 The workflow push writes one route per truck and **acknowledges each one on the plan as it
 lands** (`TruckLoad.pushed_at` plus a digest of the payload, and a `Plan.live_routes`
 entry). A push that fails part-way therefore persists what it managed to write and leaves
 the plan at `REVIEWED` — never `PUSHED` — so re-running it resumes, skipping the trucks
 already on the board whose route is unchanged *and whose ledger entry is still live*.
 
-**"Overwrites rather than duplicates" is a constraint on AI_LM, not just a convenience.**
+**"Overwrites rather than duplicates" constrains AI_LM's own writes, and NOTHING ELSE.**
 `ReplaceDeliveryRoute` DELETEs any `DRAFT`/`SCHEDULED` `delivery_route` for the same
-`(vehicle_id, scheduled_date)` before inserting, so GableLBM holds **at most one
-non-dispatched route per truck per day**. A date can hold several AI_LM plans (a re-ingest
-supersedes rather than replaces), so two of them claiming the same truck live is not untidy
-— it is a state the dealer's system cannot represent, and the second push has already
-destroyed the first plan's route. `workflow.Push` therefore tombstones any *other* plan's
+`(vehicle_id, scheduled_date)` before inserting, so no two routes AI_LM has pushed can be
+live on one truck for one day. A date can hold several AI_LM plans (a re-ingest supersedes
+rather than replaces), so two of them claiming the same truck live means the second push has
+already destroyed the first plan's route.
+
+**It is NOT a database invariant, and reading it as one caused real harm.** `delivery_routes`
+has no unique index on `(vehicle_id, scheduled_date)` — migration 009 declines it — and
+`internal/delivery/repository.go`'s `CreateRoute`, the dealer's own dispatch UI, inserts with
+no dedup at all. So the board genuinely can hold a route AI_LM pushed *and* a run a
+dispatcher built by hand, on one truck, on one day. While AI_LM matched claims to the board
+by `(vehicle, date)`, the hand-built row stood in for its own: the reconciliation reported the
+date in sync with zero divergences, and an approved re-plan recalled the truck and destroyed
+a run it had never named. Claims are matched by `route_id` now, both rows are kept, and the
+one nothing names is reported as an orphan — a *contested* one, because `recall` is keyed
+`(vehicle_id, scheduled_date)` and cannot withdraw one of two rows. AI_LM refuses that date
+(422) rather than offering an approval it could not honour; the remedy is to cancel whichever
+run is wrong in GableLBM.
+
+**`delivery_routes.status` is `VARCHAR(50)` with no `CHECK` constraint.** A value AI_LM does
+not recognise (`ON_HOLD`, say — the column accepts it and the endpoint returns it verbatim)
+is classified as `UNKNOWN_STATUS`: counted as HELD, always reported, and never repaired or
+withdrawn automatically. It used to answer false to both "live" and "departed", which read as
+"no such route" and tombstoned the claim on a route that was on the board at that moment. `workflow.Push` therefore tombstones any *other* plan's
 `live_routes` entry for a truck it just re-routed. That is a ledger correction, not a
 recall: there is nothing left upstream to withdraw, so no `recall` call is made. Skipping it
 would leave every gate keyed on `live_routes` — including the re-ingest gate — reading a
@@ -302,9 +331,11 @@ Request `{ vehicle_id, scheduled_date, reason?, recalled_by? }`; response
 
 Three contract points that shape the AI_LM side:
 
-- **Keyed on `(vehicle_id, scheduled_date)`, never a stored `route_id`.** Every push mints a
-  new route row upstream, so an id captured at push time recalls nothing — or names a route
-  that now belongs to a different plan.
+- **Keyed on `(vehicle_id, scheduled_date)`, because that is the only key the endpoint
+  accepts.** Not because an id is useless: AI_LM captures `route_id` from the write-back and
+  matches its ledger to the board with it. What it cannot do is *name one row on the wire*.
+  Where the board holds two live rows for one truck, this call withdraws both — which is why
+  a contested orphan is refused rather than offered for approval.
 - **`recalled: false` is success, not "not found".** A recall states a desired end state
   ("no live route for this truck that day"), and it is retried after a failed multi-truck
   recall, so it must converge rather than report a phantom failure. AI_LM relies on this:

@@ -608,7 +608,7 @@ func TestPayloadRoundTripsTheLiveRouteLedger(t *testing.T) {
 		}},
 		UnassignedOrders: []Stop{},
 		LiveRoutes: []LiveRoute{
-			{VehicleID: "v1", VehicleName: "Flatbed 1", PushedAt: *recalledAt},
+			{VehicleID: "v1", VehicleName: "Flatbed 1", RouteID: "dr-77", PushedAt: *recalledAt},
 			{VehicleID: "v2", VehicleName: "Flatbed 2", PushedAt: *recalledAt,
 				RecalledAt: recalledAt, RecalledBy: "dispatcher@dealer.com", RecallNote: "dropped by re-assigning trucks"},
 		},
@@ -639,6 +639,15 @@ func TestPayloadRoundTripsTheLiveRouteLedger(t *testing.T) {
 	}
 	if out.LiveRoutes[0].VehicleID != "v1" || !out.LiveRoutes[0].Live() {
 		t.Errorf("live route lost: %+v", out.LiveRoutes[0])
+	}
+	// The route id is what makes the claim name ONE row on the dealer's board
+	// rather than a (truck, day) pair the ERP does not keep unique. Dropped in
+	// the payload, every stored claim silently reverts to truck matching and a
+	// dispatcher's hand-built second run becomes invisible again — with every
+	// in-memory test still green, because fakePlanStore round-trips the whole
+	// Plan through encoding/json and never touches this code.
+	if out.LiveRoutes[0].RouteID != "dr-77" {
+		t.Errorf("LiveRoute.RouteID did not survive the payload round-trip: %+v", out.LiveRoutes[0])
 	}
 	if out.LiveRoutes[1].Live() || out.LiveRoutes[1].RecalledBy != "dispatcher@dealer.com" {
 		t.Errorf("recall tombstone lost: %+v", out.LiveRoutes[1])

@@ -298,7 +298,11 @@ AI_LM consumes these GableLBM endpoints (all `X-Integration-Key` gated; base URL
   (`vehicle_id, driver_id, scheduled_date, stops[]{order_id, sequence, lat, lng}`,
   optional `load_manifest` JSON — the 3D packing manifest that powers GableLBM's
   yard **Pack Trucks** step-by-step loading surface).
-  Idempotent on `(vehicle_id, scheduled_date)`.
+  Idempotent on `(vehicle_id, scheduled_date)`. The response
+  `{route_id, stop_count, created, replaced}` is **consumed**: `route_id` is stored on the
+  plan's live-route ledger, because `(vehicle_id, scheduled_date)` is not unique upstream
+  (no unique index; the dealer's own `CreateRoute` inserts with no dedup) and a claim that
+  could only name a truck let a hand-built second run stand in for AI_LM's own.
 - `POST /api/integration/validate-staff`         → staff login entitlement check.
   Request `{email}`; response `{staff_id, email, name, entitled, roles[], modules[]}`.
   Called by `gable.Client.ValidateStaff` from `POST /api/v1/auth/login`; when

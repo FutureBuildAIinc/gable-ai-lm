@@ -121,8 +121,8 @@ func (d *dispatchDay) board() map[string]bool {
 	defer d.g.mu.Unlock()
 	out := map[string]bool{}
 	for _, r := range d.g.pushed {
-		if r.ScheduledDate == d.date {
-			out[r.VehicleID] = true
+		if r.route.ScheduledDate == d.date {
+			out[r.route.VehicleID] = true
 		}
 	}
 	return out

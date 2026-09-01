@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -157,11 +158,16 @@ type DeliveryRoute struct {
 // dispatch board. It is the inverse of DeliveryRoute and the reason a dispatch
 // board can no longer outlive the plan that created it.
 //
-// It is keyed on (VehicleID, ScheduledDate) and NEVER on a stored route id.
-// The push upstream is create-or-replace: every re-push mints a fresh
-// delivery_routes row, so an id captured at push time either names nothing by
-// the time a recall matters or — worse — names a route that now belongs to a
-// different plan.
+// It is keyed on (VehicleID, ScheduledDate) because that is the only key the
+// endpoint upstream accepts — NOT because a route id would be useless. AI_LM
+// now captures the id the ERP mints (see RouteAck) and matches its ledger to
+// the board with it; what it still cannot do is NAME one row on the wire. That
+// asymmetry has a consequence the workflow has to handle rather than hide: when
+// the board holds two live rows for one truck on one day — a state the ERP
+// genuinely produces, since migration 009 declines a unique index on the pair
+// and the dealer's own CreateRoute inserts with no dedup — this call withdraws
+// BOTH, and no approval can make it withdraw one. workflow.boardTruth reports
+// that case as a CONTESTED orphan and refuses rather than guessing.
 //
 // Reason and RecalledBy carry the provenance of the manual approval that
 // authorized the withdrawal (the workflow's 423 override). Both are optional on
@@ -190,6 +196,28 @@ type RouteRecallResult struct {
 	RouteID   string `json:"route_id,omitempty"` // the route withdrawn; empty when Recalled is false
 	StopCount int    `json:"stop_count"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// RouteAck is GableLBM's acknowledgement of a route write-back
+// (integrations.DeliveryRouteResponse, upstream).
+//
+// It exists because this client used to THROW IT AWAY — c.do(..., nil) — and
+// with it the one fact that makes a claim addressable: RouteID, the identity
+// the ERP minted for the row it just wrote. Without it AI_LM could only match
+// its ledger to the board by (vehicle_id, scheduled_date), and the ERP does not
+// guarantee that pair is unique: migration 009 declines a unique index on it and
+// internal/delivery/repository.go's CreateRoute — the dealer's own dispatch UI —
+// inserts with no dedup at all. So a second, hand-built row for the same truck
+// silently stood in for ours, and a re-plan cancelled a run it had never named.
+//
+// Replaced is the ERP saying this push superseded a prior DRAFT/SCHEDULED route
+// for the same vehicle and date. It is reported, never branched on: see the note
+// at the call site in workflow.pushLocked.
+type RouteAck struct {
+	RouteID   string `json:"route_id"`
+	StopCount int    `json:"stop_count"`
+	Created   bool   `json:"created"`
+	Replaced  bool   `json:"replaced"`
 }
 
 // BoardRoute is one delivery route as GableLBM's dispatch board actually holds
@@ -270,6 +298,26 @@ func (r BoardRoute) Dispatched() bool {
 	return r.Status == RouteStatusInTransit || r.Status == RouteStatusCompleted
 }
 
+// Unknown reports that GableLBM answered with a delivery_routes.status this
+// client does not recognise — neither live, nor departed, nor cancelled.
+//
+// It is not a theoretical bucket. delivery_routes.status is VARCHAR(50) with NO
+// CHECK CONSTRAINT (migration 009), so the column accepts any string the ERP,
+// an operator or a future migration cares to put in it, and the integration
+// endpoint returns it verbatim. Confirmed against Postgres: the column took the
+// value ON_HOLD and the endpoint handed it back unchanged.
+//
+// Naming it matters because the alternative is silence. With only Live() and
+// Dispatched(), an unrecognised status answered false to both — so a route that
+// is on the dealer's board RIGHT NOW read as "no such route", the ledger claim
+// on it was classified a ghost and tombstoned with no wire call and no way
+// back, and the row itself fell out of every other pass too. A status we do not
+// understand must fail toward "a human has to look at this", never toward
+// "there is nothing there".
+func (r BoardRoute) Unknown() bool {
+	return !r.Live() && !r.Dispatched() && r.Status != RouteStatusCancelled
+}
+
 // StaffValidation is the GableLBM /api/integration/validate-staff response. It
 // reports whether a staff member's email is entitled to use AI_LM and carries
 // the role/module grants that authorize the AI_LM session.
@@ -308,6 +356,17 @@ func (e *APIError) Error() string {
 // different in kind from every other failure here: not "retry", but "this
 // cannot be undone from a screen — call the driver".
 var ErrRouteDispatched = errors.New("route already dispatched; cannot recall")
+
+// ErrResponseUnreadable reports that GableLBM ACCEPTED a call — a 2xx — and
+// answered with a body this client could not decode.
+//
+// It is a distinct sentinel because for a WRITE it does not mean the write
+// failed. It means the opposite: the effect happened and only the receipt was
+// lost. A caller that cannot tell this apart from a transport failure must
+// either retry a write that already landed or report a route on the dealer's
+// board as never written; PushDeliveryRoute needs the second reading and this
+// is what makes it expressible.
+var ErrResponseUnreadable = errors.New("GableLBM answered but its response could not be read")
 
 // --- Methods ---
 
@@ -387,10 +446,36 @@ func (c *Client) ListDeliveryRoutesForDate(ctx context.Context, date string) ([]
 	return out, nil
 }
 
-// PushDeliveryRoute writes an approved route back to GableLBM. Idempotent
-// upstream on (vehicle_id, scheduled_date).
-func (c *Client) PushDeliveryRoute(ctx context.Context, route DeliveryRoute) error {
-	return c.do(ctx, http.MethodPost, "/api/integration/delivery-routes", route, nil)
+// PushDeliveryRoute writes an approved route back to GableLBM and returns the
+// ERP's acknowledgement, including the ROUTE ID it minted. Idempotent upstream
+// on (vehicle_id, scheduled_date).
+//
+// The ack is the point. This used to pass nil for out and discard the body, so
+// the only identity AI_LM ever held for a route it had written was the truck and
+// the day — and the dealer's board can hold two rows for that pair. Capturing
+// the id is what lets a ledger claim name ONE row, and therefore what lets a
+// second row on the same truck be seen as the unnamed run it is.
+//
+// A 2xx whose body cannot be decoded returns an EMPTY ack and no error, and
+// that direction is deliberate. The route is on the dealer's board by then: the
+// ERP accepted the write and said so with its status code. Reporting that as a
+// failure would abort the push having already written the route, leaving a live
+// route no ledger names — the exact orphan this whole seam exists to prevent —
+// whereas an empty RouteID merely leaves the claim matched the old way, by
+// truck, which is no worse than every claim written before this change. A
+// transport failure or a non-2xx is still an error: neither means the write
+// landed.
+func (c *Client) PushDeliveryRoute(ctx context.Context, route DeliveryRoute) (*RouteAck, error) {
+	var ack RouteAck
+	if err := c.do(ctx, http.MethodPost, "/api/integration/delivery-routes", route, &ack); err != nil {
+		if errors.Is(err, ErrResponseUnreadable) {
+			slog.Warn("GableLBM accepted a route write-back but its answer could not be read; the route is on the board and this plan's claim on it names no route id",
+				"vehicle", route.VehicleID, "date", route.ScheduledDate, "error", err)
+			return &RouteAck{}, nil
+		}
+		return nil, err
+	}
+	return &ack, nil
 }
 
 // RecallDeliveryRoute withdraws a previously pushed route from GableLBM's
@@ -473,7 +558,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 			// bare "decode response: EOF" told an operator that SOMETHING
 			// upstream answered in a shape AI_LM could not read, and nothing
 			// about which of the six routes it was.
-			return fmt.Errorf("decode %s %s response: %w", method, path, err)
+			// Wrapped in ErrResponseUnreadable so a caller can tell "the
+			// call did not happen" from "the call happened and only the
+			// receipt is missing". The sentence itself is unchanged: it is
+			// the operator-facing contract pinned by the client suite.
+			return fmt.Errorf("%w: decode %s %s response: %w", ErrResponseUnreadable, method, path, err)
 		}
 	}
 	return nil

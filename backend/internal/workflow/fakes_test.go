@@ -5,6 +5,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -335,7 +337,13 @@ type fakeGable struct {
 	// pre-write one, so a test can land a competing push in it.
 	onListOrders func()
 
-	pushed  []gable.DeliveryRoute
+	// pushed is the dispatch board as this double holds it: one boardRow per
+	// delivery_routes row, NOT one per truck. Two rows for one truck on one day
+	// is a state the real ERP produces (migration 009 declines a unique index on
+	// (vehicle_id, scheduled_date); the dealer's own CreateRoute inserts with no
+	// dedup), and a double that could not represent it could not fail the way
+	// production did.
+	pushed  []boardRow
 	pushErr error
 
 	// onFirstPush fires once, INSIDE the first PushDeliveryRoute of a run —
@@ -378,8 +386,19 @@ type fakeGable struct {
 	// boardStatus overrides a truck's status on the board. Absent means
 	// SCHEDULED, which is what GableLBM's ReplaceDeliveryRoute actually writes.
 	// It is how a test makes a truck IN_TRANSIT — a route that is real, on the
-	// board, and can never be recalled.
+	// board, and can never be recalled — or gives it a status this service does
+	// not recognise at all, which delivery_routes.status (VARCHAR(50), no CHECK
+	// constraint) genuinely permits.
 	boardStatus map[string]string
+
+	// nextRouteID numbers the rows this double mints, and it only ever goes up.
+	//
+	// The board used to derive a route id from a row's INDEX in f.pushed, which
+	// meant an id changed identity whenever an earlier row was recalled. An
+	// identity that moves is not an identity, and the code under test now
+	// matches ledger claims to board rows by exactly this value — a fake that
+	// recycled ids could make a wrong implementation look right.
+	nextRouteID int
 
 	// boardErr makes the board unreadable (an unreachable or broken ERP).
 	boardErr error
@@ -404,6 +423,14 @@ type fakeGable struct {
 	onBoardRead func(n int)
 }
 
+// boardRow is one row of the fake dispatch board: the route as it was written,
+// plus the identity the ERP minted for it. The id is stored, never derived,
+// because it is the thing the code under test matches on.
+type boardRow struct {
+	route   gable.DeliveryRoute
+	routeID string
+}
+
 // ListDeliveryRoutesForDate reports the board the pushes have actually built.
 func (f *fakeGable) ListDeliveryRoutesForDate(_ context.Context, date string) ([]gable.BoardRoute, error) {
 	f.mu.Lock()
@@ -421,7 +448,8 @@ func (f *fakeGable) ListDeliveryRoutesForDate(_ context.Context, date string) ([
 		return nil, f.boardErr
 	}
 	out := []gable.BoardRoute{}
-	for i, r := range f.pushed {
+	for _, row := range f.pushed {
+		r := row.route
 		if r.ScheduledDate != date {
 			continue
 		}
@@ -434,7 +462,7 @@ func (f *fakeGable) ListDeliveryRoutesForDate(_ context.Context, date string) ([
 			orderIDs = append(orderIDs, st.OrderID)
 		}
 		out = append(out, gable.BoardRoute{
-			RouteID:       fmt.Sprintf("route-%d-%s", i, r.VehicleID),
+			RouteID:       row.routeID,
 			VehicleID:     r.VehicleID,
 			DriverID:      r.DriverID,
 			Status:        status,
@@ -444,6 +472,21 @@ func (f *fakeGable) ListDeliveryRoutesForDate(_ context.Context, date string) ([
 		})
 	}
 	return out, nil
+}
+
+// mintRouteID hands out the next never-reused delivery_routes.id. Callers hold
+// f.mu.
+//
+// The value is deterministic but deliberately NOT ordered by insertion, because
+// the real column is `id UUID PRIMARY KEY DEFAULT uuid_generate_v4()` and a v4
+// UUID carries no order information whatever. Ids that ascended with insertion
+// would make a reconciler that merely preserved the ERP's scan order look as if
+// it sorted by route id, which is the one thing the report's determinism now
+// rests on.
+func (f *fakeGable) mintRouteID(vehicleID string) string {
+	f.nextRouteID++
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", vehicleID, f.nextRouteID)))
+	return "dr-" + hex.EncodeToString(sum[:6])
 }
 
 // boardReads reports how many times the board was consulted (test-only).
@@ -467,8 +510,14 @@ func (f *fakeGable) pushOutside(vehicleID, date, status string, orderIDs ...stri
 	for i, id := range orderIDs {
 		stops = append(stops, gable.RouteStop{OrderID: id, Sequence: i + 1})
 	}
-	f.pushed = append(f.pushed, gable.DeliveryRoute{
-		VehicleID: vehicleID, ScheduledDate: date, Stops: stops,
+	// APPENDED, never replacing. This stands in for a row the SERVICE did not
+	// write — most importantly internal/delivery/repository.go's CreateRoute,
+	// the dealer's own dispatch UI, which inserts with no dedup of any kind. A
+	// truck that already carries our route can therefore end up with a second,
+	// hand-built one, which is the state that used to be invisible.
+	f.pushed = append(f.pushed, boardRow{
+		route:   gable.DeliveryRoute{VehicleID: vehicleID, ScheduledDate: date, Stops: stops},
+		routeID: f.mintRouteID(vehicleID),
 	})
 	if status != "" && status != gable.RouteStatusScheduled {
 		if f.boardStatus == nil {
@@ -519,7 +568,7 @@ func (f *fakeGable) ListDrivers(context.Context) ([]gable.Driver, error) {
 // could represent a board the real one cannot — two plans both holding a truck
 // — and every assertion of the form "the ledger mirrors the board" was
 // therefore being made against a board that does not exist.
-func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) error {
+func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) (*gable.RouteAck, error) {
 	f.mu.Lock()
 	hook := f.onFirstPush
 	f.onFirstPush = nil
@@ -531,20 +580,36 @@ func (f *fakeGable) PushDeliveryRoute(_ context.Context, r gable.DeliveryRoute) 
 	defer f.mu.Unlock()
 	f.pushCalls++
 	if f.pushErrAfter > 0 && f.pushCalls > f.pushErrAfter {
-		return fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
+		return nil, fmt.Errorf("gable POST /api/integration/delivery-routes: status 503: upstream unavailable")
 	}
 	if f.pushErr != nil {
-		return f.pushErr
+		return nil, f.pushErr
 	}
-	kept := make([]gable.DeliveryRoute, 0, len(f.pushed)+1)
+	kept := make([]boardRow, 0, len(f.pushed)+1)
+	replaced := false
 	for _, existing := range f.pushed {
-		if existing.VehicleID == r.VehicleID && existing.ScheduledDate == r.ScheduledDate {
+		if existing.route.VehicleID == r.VehicleID && existing.route.ScheduledDate == r.ScheduledDate {
+			// The upstream DELETE only reaches DRAFT/SCHEDULED rows, and it
+			// reaches ALL of them — including one a dispatcher built by hand.
+			// That is why a push over a contested truck destroys the other run
+			// and why nothing in this package may reach a push in that state
+			// without a human having looked.
+			if st, ok := f.boardStatus[existing.route.VehicleID]; ok &&
+				(st == gable.RouteStatusInTransit || st == gable.RouteStatusCompleted) {
+				kept = append(kept, existing)
+				continue
+			}
+			replaced = true
 			continue
 		}
 		kept = append(kept, existing)
 	}
-	f.pushed = append(kept, r)
-	return nil
+	// A FRESH id, exactly as ReplaceDeliveryRoute does: it DELETEs the prior row
+	// and INSERTs a new one, so the id a re-push lands on is never the id the
+	// previous push recorded.
+	row := boardRow{route: r, routeID: f.mintRouteID(r.VehicleID)}
+	f.pushed = append(kept, row)
+	return &gable.RouteAck{RouteID: row.routeID, StopCount: len(r.Stops), Created: true, Replaced: replaced}, nil
 }
 
 func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall) (*gable.RouteRecallResult, error) {
@@ -572,9 +637,14 @@ func (f *fakeGable) RecallDeliveryRoute(_ context.Context, rc gable.RouteRecall)
 	}
 	// Drop the recalled route from the board the fake is standing in for, so
 	// "what is live upstream" stays honest across a push/recall/push cycle.
+	// Keyed (vehicle_id, scheduled_date) and nothing finer, because that is the
+	// only key the endpoint accepts. Every row for the pair goes — which is
+	// exactly why a second, hand-built row for a truck we also hold cannot be
+	// withdrawn on its own, and why boardTruth refuses instead of offering an
+	// approval it could not honour.
 	kept := f.pushed[:0]
 	for _, r := range f.pushed {
-		if r.VehicleID != rc.VehicleID || r.ScheduledDate != rc.ScheduledDate {
+		if r.route.VehicleID != rc.VehicleID || r.route.ScheduledDate != rc.ScheduledDate {
 			kept = append(kept, r)
 		}
 	}
@@ -603,7 +673,7 @@ func (f *fakeGable) pushedIDs() []string {
 	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.pushed))
 	for _, r := range f.pushed {
-		out = append(out, r.VehicleID)
+		out = append(out, r.route.VehicleID)
 	}
 	return out
 }
@@ -615,15 +685,50 @@ func (f *fakeGable) pushedIDs() []string {
 func (f *fakeGable) removeFromBoard(vehicleID, date string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	kept := make([]gable.DeliveryRoute, 0, len(f.pushed))
+	kept := make([]boardRow, 0, len(f.pushed))
 	for _, r := range f.pushed {
-		if r.VehicleID == vehicleID && r.ScheduledDate == date {
+		if r.route.VehicleID == vehicleID && r.route.ScheduledDate == date {
 			continue
 		}
 		kept = append(kept, r)
 	}
 	f.pushed = kept
 	delete(f.boardStatus, vehicleID)
+}
+
+// cancelRow takes ONE row off the board by its route id — a dispatcher opening
+// GableLBM and cancelling the run they built by hand, leaving ours alone.
+//
+// removeFromBoard cannot express that: it is keyed (vehicle, date), like the
+// recall wire call, and clears every row for the truck. The difference is the
+// whole reason a contested orphan is refused rather than approved — this double
+// must be able to show the remedy actually working.
+func (f *fakeGable) cancelRow(routeID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := make([]boardRow, 0, len(f.pushed))
+	for _, r := range f.pushed {
+		if r.routeID == routeID {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	f.pushed = kept
+}
+
+// unassignVehicle nulls a row's vehicle without touching anything else —
+// delivery_routes.vehicle_id is nullable upstream and nothing stops a route
+// AI_LM wrote from losing its truck. The recall key is (vehicle_id,
+// scheduled_date), so the row becomes un-nameable on the wire while our ledger
+// still holds a claim on it.
+func (f *fakeGable) unassignVehicle(routeID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.pushed {
+		if f.pushed[i].routeID == routeID {
+			f.pushed[i].route.VehicleID = ""
+		}
+	}
 }
 
 // setBoardStatus moves a truck's route to another status on the board — most

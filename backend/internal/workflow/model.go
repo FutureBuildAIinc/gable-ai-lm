@@ -219,7 +219,27 @@ func (p *LoadProof) Ready() bool {
 // Recalls are tombstoned (RecalledAt set), never removed, so support can always
 // answer "what did we put on their board, and when did we take it off".
 type LiveRoute struct {
-	VehicleID   string     `json:"vehicle_id"`
+	VehicleID string `json:"vehicle_id"`
+	// RouteID is the identity GableLBM minted for the row this claim names —
+	// delivery_routes.id, returned by the write-back as route_id and captured
+	// by gable.RouteAck.
+	//
+	// It is what makes a claim ADDRESSABLE. Without it the only handle on a
+	// route was (vehicle_id, scheduled_date), and the ERP does not make that
+	// pair unique: migration 009 declines a unique index on it and the dealer's
+	// own CreateRoute inserts with no dedup, so a dispatcher hand-building a
+	// second run for the same truck produced a row that stood in for ours in
+	// every comparison this service made. The board looked in sync, the second
+	// row was reported nowhere, and an approved re-plan recalled the truck and
+	// destroyed a run it had never named.
+	//
+	// It is EMPTY on every claim written before this existed, and on any claim
+	// whose push got no readable acknowledgement. That is a supported state,
+	// not a defect: boardTruth matches an id-less claim to the board by truck,
+	// exactly as the whole ledger used to be matched, so such a claim can be
+	// neither invented into a ghost nor mistaken for an orphan. See the two
+	// passes in boardView.reconcile.
+	RouteID     string     `json:"route_id,omitempty"`
 	VehicleName string     `json:"vehicle_name,omitempty"`
 	PushedAt    time.Time  `json:"pushed_at"`
 	RecalledAt  *time.Time `json:"recalled_at,omitempty"`

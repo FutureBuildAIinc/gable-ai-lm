@@ -171,9 +171,9 @@ func TestPushDoesNotRefuseADimensionlessSku(t *testing.T) {
 
 	// Not blocking is only half of it: the yard must be told, or the hangers
 	// silently leave the manifest.
-	m, ok := g.pushed[0].LoadManifest.(map[string]any)
+	m, ok := g.pushed[0].route.LoadManifest.(map[string]any)
 	if !ok {
-		t.Fatalf("manifest is %T, want a map", g.pushed[0].LoadManifest)
+		t.Fatalf("manifest is %T, want a map", g.pushed[0].route.LoadManifest)
 	}
 	noGeom, _ := m["no_geometry"].([]string)
 	if len(noGeom) != 1 || !strings.Contains(noGeom[0], "HANGER-26") {
@@ -232,7 +232,7 @@ func TestPushDoesNotRefuseOnTheAdvisoryAxleSplit(t *testing.T) {
 	}
 
 	// It must not vanish either. The manifest that reaches the yard carries it.
-	m := g.pushed[0].LoadManifest.(map[string]any)
+	m := g.pushed[0].route.LoadManifest.(map[string]any)
 	advisories, _ := m["advisories"].([]string)
 	found := false
 	for _, a := range advisories {

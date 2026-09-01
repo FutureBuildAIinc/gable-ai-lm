@@ -205,22 +205,6 @@ func liveRoutes(p *Plan) []LiveRoute {
 	return out
 }
 
-// liveRoutesAcross is liveRoutes over a set of plans, in plan order. It is what
-// makes one refusal sentence able to describe a whole date: a date can hold
-// several plans and any number of them may be holding trucks on the board.
-//
-// It is now the LEDGER's answer, and the ledger is a cache. The supersede gate
-// filters it through the dispatch board (boardView.backedLiveRoutes) before it
-// names anything, because a ghost in an approval prompt asks a dispatcher to
-// weigh cancelling a run that is not there.
-func liveRoutesAcross(plans []*Plan) []LiveRoute {
-	out := []LiveRoute{}
-	for _, p := range plans {
-		out = append(out, liveRoutes(p)...)
-	}
-	return out
-}
-
 // planIDs names the plans a refusal is about, so a dispatcher reading it can go
 // and look at them. "Some other plan has routes out" is not actionable.
 func planIDs(plans []*Plan) string {
@@ -259,6 +243,32 @@ func liveRouteNames(live []LiveRoute) []string {
 // It mutates only p.PushedOverrides, and only on the success path. Every
 // refusal returns before the caller has written anything.
 func gateTransition(p *Plan, action string, override bool, approvedBy string) error {
+	return gateTransitionOverBoard(p, action, liveRoutes(p), nil, override, approvedBy)
+}
+
+// gateTransitionOverBoard is gateTransition told what the DISPATCH BOARD says,
+// rather than left to infer it from the plan.
+//
+// It takes two extra inputs, and both exist because the board and the ledger can
+// disagree:
+//
+//   - live is what to treat as this plan's live routes. gateTransition passes
+//     the raw ledger, which is right for every action that reads no board.
+//     Assign passes boardTruth.backedLiveRoutes — the claims the board actually
+//     backs — so a plan whose ledger is all ghosts is not made to beg an
+//     approval for routes that do not exist.
+//   - orphans are routes the BOARD holds for this date that no plan of ours
+//     names. They escalate this transition on their own, with no ledger
+//     involvement at all, because a re-assignment is a writer to that date's
+//     board: it decides which trucks stop existing and recalls them by
+//     (vehicle_id, scheduled_date). Running it over a board holding runs nobody
+//     can account for is the same class of act as re-planning over one, and
+//     until this existed it was the identical harm with no gate on it —
+//     Ingest refused with a 423 and Assign answered 200 in every one of the
+//     four states that produce an orphan.
+//
+// A CONTESTED orphan never reaches the approval: see refuseContested.
+func gateTransitionOverBoard(p *Plan, action string, live []LiveRoute, orphans []BoardDivergence, override bool, approvedBy string) error {
 	t, ok := planTransitions[action]
 	if !ok {
 		// A programming error, not a dispatcher's: an action with no row is a
@@ -272,9 +282,10 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 	// at REVIEWED with trucks 1-2 live upstream, and re-assigning THAT plan
 	// orphans exactly as much as re-assigning a fully PUSHED one. Status alone
 	// would miss it. Only actions the table already marks approval-worthy from
-	// PUSHED escalate, so the table stays the single source of truth.
-	live := liveRoutes(p)
-	if allow == allowed && len(live) > 0 && t.from[StatusPushed] == needsApproval {
+	// PUSHED escalate, so the table stays the single source of truth — and an
+	// unnamed route on the board escalates through the same door, because the
+	// consequence being approved is the same one.
+	if allow == allowed && (len(live) > 0 || len(orphans) > 0) && t.from[StatusPushed] == needsApproval {
 		allow = needsApproval
 	}
 
@@ -283,8 +294,21 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 		return nil
 
 	case needsApproval:
-		return requireApproval([]*Plan{p}, live, nil, action, t.gerund,
-			"will recall the route of any truck it drops", override, approvedBy)
+		consequence := "will recall the route of any truck it drops"
+		if len(orphans) > 0 {
+			// Spelled out rather than folded into the sentence above, because
+			// approving this does something DIFFERENT to these routes: nothing.
+			// A re-assignment re-shuffles one plan; it has no replacement to put
+			// on the board in an unnamed run's place, so withdrawing one would
+			// cancel a delivery and leave the slot empty. The approval says "I
+			// know these are there and this run may be re-planned around them",
+			// and the sentence has to say so or the approver will read it as the
+			// re-plan prompt, which DOES withdraw them.
+			consequence += fmt.Sprintf(", and re-shuffles this run over %d route(s) the dispatch board holds that NO plan of ours names (%s) — a dispatcher may have created them in GableLBM. This action does NOT withdraw them; approve only if this run may be re-planned around them",
+				len(orphans), strings.Join(divergenceTrucks(orphans), ", "))
+		}
+		return requireApproval([]*Plan{p}, live, orphans, action, t.gerund,
+			consequence, override, approvedBy)
 
 	default: // notListed
 		if p.Status == StatusPushed {
@@ -355,7 +379,16 @@ func gateTransition(p *Plan, action string, override bool, approvedBy string) er
 // built by hand and a driver is about to leave on, so approving must be a
 // decision made about NAMED trucks, never a side effect of clicking through the
 // same prompt as last time.
-func gateSupersede(view boardView, prev []*Plan, orphans []BoardDivergence, date string, override bool, approvedBy string) error {
+func gateSupersede(truth boardTruth, prev []*Plan, orphans []BoardDivergence, date string, override bool, approvedBy string) error {
+	// A route we cannot withdraw without withdrawing our own is refused before
+	// anything is offered for approval. It is FIRST because the alternative is
+	// worse than not gating at all: the prompt below would promise to withdraw a
+	// run it cannot name, and an approval given against that promise cancels a
+	// delivery. See refuseContested.
+	if err := refuseContested(orphans, date); err != nil {
+		return err
+	}
+
 	// Nothing holding this date has anything on the board and the board holds
 	// nothing we do not name: the common case, and it must cost nothing.
 	if len(prev) == 0 && len(orphans) == 0 {
@@ -366,7 +399,7 @@ func gateSupersede(view boardView, prev []*Plan, orphans []BoardDivergence, date
 	// plans the board backs, but a plan can hold one real claim and one ghost,
 	// and a prompt that named the ghost would ask for approval to cancel a run
 	// that does not exist.
-	live := view.backedLiveRoutes(prev)
+	live := truth.backedLiveRoutes(prev)
 	var clauses []string
 	if len(prev) > 0 {
 		clauses = append(clauses, fmt.Sprintf("will recall every route %s left on the dispatch board", planIDs(prev)))

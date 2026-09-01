@@ -284,6 +284,17 @@ func (h *Handler) respondStep(w http.ResponseWriter, r *http.Request, plan *Plan
 		httputil.RespondError(w, r, err.Error(), http.StatusConflict, err)
 		return
 	}
+	// The dispatch board could not be read, so this step FAILED CLOSED — the
+	// same 502, with the same sentence, that HandleIngest answers. Assign reads
+	// the board now, and without this its refusal fell through to the generic
+	// "workflow step failed" 422 below: an operator would be told the request
+	// was unprocessable when in fact GableLBM was unreachable and nothing had
+	// been attempted. It is deliberately NOT 423 — approving would mean
+	// "re-assign over a board you cannot see", which is the harm itself.
+	if errors.Is(err, ErrBoardUnreadable) {
+		httputil.RespondError(w, r, err.Error(), http.StatusBadGateway, err)
+		return
+	}
 	var refusal *Refusal
 	if errors.As(err, &refusal) {
 		httputil.RespondError(w, r, refusal.Msg, http.StatusUnprocessableEntity, err)

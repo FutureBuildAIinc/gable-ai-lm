@@ -74,7 +74,10 @@ func integrationMux(t *testing.T, seen *[]recordedRequest) *http.ServeMux {
 		record(w, r, http.StatusOK, `[{"id":"o1","status":"CONFIRMED","branch_id":"loc1","lines":[]}]`)
 	})
 	mux.HandleFunc("POST /api/integration/delivery-routes", func(w http.ResponseWriter, r *http.Request) {
-		record(w, r, http.StatusCreated, "")
+		// The body GableLBM actually returns
+		// (integrations.DeliveryRouteResponse). This client used to pass nil for
+		// out and discard it, taking the route id with it — see RouteAck.
+		record(w, r, http.StatusCreated, `{"route_id":"dr-77","stop_count":1,"created":true,"replaced":true}`)
 	})
 	// GET and POST share this path upstream, which is exactly why the read is
 	// registered here as its own method pattern: a client that sent the read as
@@ -129,7 +132,7 @@ func TestBaseURLTrailingSlashDoesNotBreakWriteBack(t *testing.T) {
 				Stops:         []RouteStop{{OrderID: "o1", Sequence: 1, Lat: 49.9, Lng: -119.5}},
 				LoadManifest:  map[string]any{"version": 2},
 			}
-			if err := c.PushDeliveryRoute(context.Background(), route); err != nil {
+			if _, err := c.PushDeliveryRoute(context.Background(), route); err != nil {
 				t.Fatalf("PushDeliveryRoute: %v", err)
 			}
 
@@ -351,7 +354,7 @@ func TestErrorCarriesUpstreamStatusAndSnippet(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := NewClient(srv.URL, "wrong").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
+	_, err := NewClient(srv.URL, "wrong").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
 	if err == nil {
 		t.Fatal("a 403 must not read as a successful push")
 	}
@@ -515,7 +518,7 @@ func TestAPIErrorCarriesTheStatusCodeMachinesNeed(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
+	_, err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
 	var target *APIError
 	if !errors.As(err, &target) {
 		t.Fatalf("upstream failure %v should be an *APIError", err)
@@ -739,9 +742,7 @@ func TestBoardRouteStillMirrorsTheERPContract(t *testing.T) {
 
 // TestStatusConstantsAreTheERPsOwnValues pins the strings, not just the shape.
 // Status is only useful because both sides spell delivery_routes.status the
-// same way; a typo here would classify every route as neither live nor
-// dispatched, which fails OPEN — a route on the board that looks like nothing
-// at all is a route a re-plan walks straight over.
+// same way; a typo here would classify a route as neither live nor dispatched.
 func TestStatusConstantsAreTheERPsOwnValues(t *testing.T) {
 	for got, want := range map[string]string{
 		RouteStatusDraft:     "DRAFT",
@@ -754,15 +755,166 @@ func TestStatusConstantsAreTheERPsOwnValues(t *testing.T) {
 			t.Errorf("status constant = %q, want %q (GableLBM delivery_routes.status)", got, want)
 		}
 	}
-	// Every status the ERP can hold must fall into exactly one bucket, or a
-	// route classified as neither is a route no gate will ever see.
-	for _, st := range []string{RouteStatusDraft, RouteStatusScheduled, RouteStatusInTransit, RouteStatusCompleted, RouteStatusCancelled} {
+}
+
+// TestEveryStatusFallsIntoExactlyOneBucket is the test the one above USED to
+// claim to be, and was not.
+//
+// Its old second half looped over the five constants and asserted each landed in
+// a bucket — which is trivially true of a list built from the buckets, and says
+// nothing at all about the value the ERP can actually hold. delivery_routes.status
+// is VARCHAR(50) with NO CHECK CONSTRAINT (migration 009): the column takes any
+// string, and the integration endpoint returns it verbatim. ON_HOLD was confirmed
+// against real Postgres.
+//
+// So the property that matters is TOTALITY over arbitrary strings, not over the
+// five we know: every value must land in exactly one of live / dispatched /
+// cancelled / unknown. Before Unknown() existed, an unrecognised status landed in
+// NONE of them and answered false everywhere — a route on the dealer's board that
+// looked like nothing at all, which is the direction that destroys things: the
+// ledger claim on it was tombstoned automatically and the row was reported
+// nowhere.
+func TestEveryStatusFallsIntoExactlyOneBucket(t *testing.T) {
+	statuses := []string{
+		RouteStatusDraft, RouteStatusScheduled, RouteStatusInTransit,
+		RouteStatusCompleted, RouteStatusCancelled,
+		// Values the column permits and this client has never heard of. The
+		// empty string is here because it is what a missing JSON key decodes to.
+		"ON_HOLD", "AWAITING_PERMIT", "scheduled", "", "SCHEDULED ",
+	}
+	for _, st := range statuses {
 		r := BoardRoute{Status: st}
-		if r.Live() && r.Dispatched() {
-			t.Errorf("%s is both live and dispatched", st)
+		buckets := 0
+		for _, in := range []bool{r.Live(), r.Dispatched(), r.Status == RouteStatusCancelled, r.Unknown()} {
+			if in {
+				buckets++
+			}
 		}
-		if st != RouteStatusCancelled && !r.Live() && !r.Dispatched() {
-			t.Errorf("%s is neither live nor dispatched — it would be invisible to every gate", st)
+		if buckets != 1 {
+			t.Errorf("status %q lands in %d buckets, want exactly 1 (live=%v dispatched=%v cancelled=%v unknown=%v)",
+				st, buckets, r.Live(), r.Dispatched(), r.Status == RouteStatusCancelled, r.Unknown())
 		}
+	}
+}
+
+// TestAnUnrecognisedStatusIsUnknownAndNotCancelled pins the direction the
+// classification must fail in.
+//
+// "Unknown" must never collapse into "cancelled" or into "not on the board".
+// Those are the two readings that authorize destroying something: a row read as
+// gone makes the ledger claim on it a ghost, and a ghost is tombstoned without a
+// wire call, without an approval, and with no way back.
+func TestAnUnrecognisedStatusIsUnknownAndNotCancelled(t *testing.T) {
+	r := BoardRoute{RouteID: "r9", VehicleID: "v9", Status: "ON_HOLD"}
+	if !r.Unknown() {
+		t.Fatal("ON_HOLD must be reported as a status this client does not understand")
+	}
+	if r.Live() || r.Dispatched() {
+		t.Error("an unrecognised status must not be guessed into a bucket we act on")
+	}
+	if r.Status == RouteStatusCancelled {
+		t.Error("an unrecognised status must never read as cancelled")
+	}
+	// And the five we DO know are never unknown, or the report would cry wolf on
+	// every ordinary board.
+	for _, st := range []string{RouteStatusDraft, RouteStatusScheduled, RouteStatusInTransit, RouteStatusCompleted, RouteStatusCancelled} {
+		if (BoardRoute{Status: st}).Unknown() {
+			t.Errorf("%s is a status this client knows and must not be reported as unrecognised", st)
+		}
+	}
+}
+
+// TestPushDeliveryRouteCapturesTheRouteTheERPMinted is the fact this client used
+// to throw away.
+//
+// PushDeliveryRoute called c.do(..., nil) and read only the status code, so the
+// only handle AI_LM ever held on a route it had written was (vehicle_id,
+// scheduled_date). The ERP does not keep that pair unique — migration 009
+// declines the index and the dealer's own CreateRoute inserts with no dedup — so
+// a dispatcher's hand-built second run for the same truck was indistinguishable
+// from ours, and an approved re-plan cancelled a run it had never named.
+func TestPushDeliveryRouteCapturesTheRouteTheERPMinted(t *testing.T) {
+	var seen []recordedRequest
+	srv := httptest.NewServer(integrationMux(t, &seen))
+	defer srv.Close()
+
+	ack, err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{
+		VehicleID: "v1", ScheduledDate: "2026-06-26",
+		Stops: []RouteStop{{OrderID: "o1", Sequence: 1}},
+	})
+	if err != nil {
+		t.Fatalf("PushDeliveryRoute: %v", err)
+	}
+	if ack == nil || ack.RouteID != "dr-77" {
+		t.Fatalf("the route id GableLBM minted was not captured: %+v", ack)
+	}
+	if !ack.Created || !ack.Replaced || ack.StopCount != 1 {
+		t.Errorf("the whole acknowledgement must round-trip, including replaced: %+v", ack)
+	}
+}
+
+// TestAPushWhoseReceiptCannotBeReadIsStillASuccess pins the direction the one
+// new failure mode has to fail in.
+//
+// Decoding a response body is a new way for this call to fail: it previously
+// discarded the body and could not. If an unreadable 2xx were reported as an
+// error, the caller would abort a push having ALREADY put the route on the
+// dealer's board — leaving a live route no ledger names, which is the exact
+// orphan the whole board-authority seam exists to prevent. An empty RouteID
+// costs only the old (vehicle, date) matching, which every claim written before
+// this change uses anyway.
+//
+// GableLBM's own handler always writes the body; a proxy, a 204, or a future
+// version need not.
+func TestAPushWhoseReceiptCannotBeReadIsStillASuccess(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"an empty body", ""},
+		{"a body this client cannot parse", `<html>gateway timeout</html>`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+
+			ack, err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
+			if err != nil {
+				t.Fatalf("the ERP accepted the write; reporting it as a failure strands the route it just created: %v", err)
+			}
+			if ack == nil {
+				t.Fatal("a successful push must hand back an acknowledgement, even an empty one")
+			}
+			if ack.RouteID != "" {
+				t.Errorf("RouteID = %q, want empty — nothing was read", ack.RouteID)
+			}
+		})
+	}
+}
+
+// TestATransportFailureOnPushIsStillAFailure is the other half of the same
+// decision. "The receipt was lost" and "the call never happened" must not
+// collapse into one another: reporting a dead connection as a success would
+// record a claim on a route that does not exist.
+func TestATransportFailureOnPushIsStillAFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Close() // nothing is listening
+
+	if _, err := NewClient(srv.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"}); err == nil {
+		t.Fatal("an unreachable GableLBM must not read as a route on the dispatch board")
+	}
+
+	// And so is a refusal: a 409 is not a receipt we failed to read.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":"nope"}`)
+	}))
+	defer bad.Close()
+	ack, err := NewClient(bad.URL, "k").PushDeliveryRoute(context.Background(), DeliveryRoute{VehicleID: "v1"})
+	if err == nil || ack != nil {
+		t.Fatalf("a 409 answered ack=%+v err=%v; it must be an error", ack, err)
+	}
+	if errors.Is(err, ErrResponseUnreadable) {
+		t.Error("a non-2xx is not an unreadable receipt — the write did not happen")
 	}
 }
