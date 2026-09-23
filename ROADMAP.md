@@ -105,8 +105,9 @@ Roughly two paths, and they are genuinely different products:
   process-global optimizer, ORS and AI clients; tenant-scoped caches and rate
   limits; and Postgres RLS or an enforced repository-level scope so a missing
   `WHERE tenant_id` is a compile-or-deny error rather than a data leak. It also
-  requires the licensing/metering seam in §4, because a multi-tenant plane you
-  cannot meter is a multi-tenant plane you cannot bill.
+  requires §4's metering to grow a tenant dimension: today's counters are labelled
+  per *deployment*, which is exactly right for one stack per dealer and useless
+  the moment two dealers share one.
 
 ---
 
@@ -257,52 +258,115 @@ its 12 000 lb steer at about 12 500 lb of cargo).
 
 ---
 
-## 4. No licensing, metering or entitlement seam
+## 4. Licensing, metering and entitlement — the seam exists; it gates nothing
 
-**Affects: Managed (no billing). Self-host (no enforceable license).**
+**Affects: Managed (no billing yet). Self-host (nothing is enforced).**
+
+**Status: the seam has landed. What remains is the business decision, not the code.**
 
 ### What it is
 
-Searching the backend for `licen|entitle|meter|quota|billing|edition` returns
-exactly two things: per-staff entitlement delegated to GableLBM's
-`validate-staff` (`backend/internal/auth/service.go`,
-`backend/internal/gable/client.go`), and a comment in
-`backend/migrations/001_ai_lm_core.sql` saying the module is kept portable "for
-commercial licensing."
+There is now a place to put entitlement, and it is wired: `backend/internal/license`
+plus four business counters in `backend/pkg/metrics`. See
+`backend/internal/license/license.go` for the package doc; the rest of this
+section says what it does and, more importantly, what it deliberately does not.
 
-There is no license validation, no offline license key, no usage metering, no
-per-tenant counters, no community-vs-commercial feature gate, and no place to put
-one. `pkg/metrics` instruments HTTP and the database pool; it counts no business
-events at all.
+**Entitlement.** `license.Load(cfg)` reads an offline, Ed25519-signed token from
+`LICENSE_TOKEN` or `LICENSE_FILE`, verified against `LICENSE_PUBLIC_KEY`. No
+network call on any path — `imports_test.go` fails the build if the package ever
+imports `net/http`. `cmd/server/main.go` loads it once, before the database, and
+logs one INFO line: `edition`, `subject`, `licensed_version`, `expires_at`,
+`change_date`.
 
-### Why it matters
+**The editions come from the licence, not from a price list.** AI_LM is governed
+by `LicenseRef-OpenLBM-Community-Source-1.0`, which already defines the states
+this software can be in:
+
+| `edition` | Who | Basis |
+|---|---|---|
+| `evaluation` | anyone, non-production | §1 Grant — **no token required** |
+| `community` | a Community Member, in production | §2 Additional Use Grant |
+| `commercial` | anyone else in production | §3 Production-Use Condition |
+| `agpl` | any version past its Change Date | §4 Conversion (AGPL-3.0-only, availability + 5y) |
+
+**No token means `evaluation`, and that is the licence operating as written** —
+§1 grants non-production use to everyone, so an unlicensed instance is
+exercising a grant it already holds. It is not a fail-open gap awaiting a
+lockout. A *present but invalid* token is a different question and fails closed,
+hard: a bad signature, an unknown signing key, or a claim edited after issue
+refuses to start rather than downgrading silently, because a signature nobody
+enforces is decorative. An **expired** token drops to `evaluation` with a WARN
+naming the date and keeps running — an expiry must not take a dealer's dispatch
+offline mid-shift.
+
+**The token records a determination; it does not compute one.** Whether an
+organisation is a Community Member, and whether a use is Competing Use, are
+legal judgements. The claims carry the facts the judgement rested on — the
+location count and revenue answer as given, and the thresholds in force on the
+day — so an auditor can reconstruct why an edition was granted even after those
+thresholds move. `competing_use_acknowledged: true` is a hard boot failure
+naming the field-of-use exclusion; that use is outside the grant entirely and
+the software must not imply it can represent it.
+
+**Metering.** `pkg/metrics` now counts business events as well as HTTP and the
+database pool: `ailm_plans_created_total`, `ailm_trucks_packed_total`,
+`ailm_routes_pushed_total`, `ailm_catalog_pulls_total`, each labelled `edition`
+and `subject` (`unlicensed` when absent). One stack per dealer means the
+deployment *is* the tenant, so this needed no tenancy model, no per-request
+resolution and no migration — which is what took this item from XL to L. Every
+counter increments where the value actually occurs: a plan that fails to persist
+does not count, and a push that dies on the fourth truck counts the three routes
+that reached the dispatch board. Scrape-only, deliberately: there is no outbound
+usage feed, because an unsolicited phone-home from a self-hosted instance is a
+trust problem and the destination is a business decision.
+
+**Feature gating.** `(*License).Allow(feature string) bool`. It returns **true
+for every feature in every edition**, and `TestAllowGatesNothing` pins that, so
+the day it changes is a deliberate, reviewed diff rather than a drift.
+
+`cmd/keygen` mints tokens (and keypairs) for testing and for issue; no private
+key is in this repository, and the test suite generates its own.
+
+### What is still open
+
+- **Who signs.** The signing private key needs an owner and a storage location
+  before any real token is minted. `builtinPublicKeys` in `license.go` is
+  deliberately empty until then — a placeholder key would be a trusted issuer
+  nobody controls.
+- **Where usage goes beyond `/metrics`.** Confirmed scrape-only for v1.
+- **Whether the thresholds hold.** The Standard still marks 50 Locations / $1B
+  `[COUNSEL:]`. The seam survives them moving because tokens record what they
+  were measured against; the Standard still needs the answer.
+- **What, if anything, ever becomes commercial-only.** That is a product
+  decision, and the seam exists so it costs one call site when it is made.
+
+### Why it mattered
 
 The commercial thesis — AI_LM licensed to third-party ERP vendors, self-hostable
 under OpenLBM Community Source, managed for dealers who do not want to run it —
-has no mechanism behind it. You cannot verify that a self-hosted instance is
-licensed, meter a managed deployment for billing, or gate a commercial-only
-feature. Compliance is on the honour system, which is a fine thing to choose
-deliberately and a bad thing to discover.
+had no mechanism behind it. Compliance was on the honour system, which is a fine
+thing to choose deliberately and a bad thing to discover.
 
-This is not urgent for the community edition, which is unrestricted by design.
-It is a hard prerequisite for either revenue model.
+It is still the honour system, and now that is a *choice*: nothing is gated, and
+the reason the community edition is unrestricted is written down rather than
+implied by an absence. The difference is that entitlement is no longer a
+retrofit. Adding it to a system that has already shipped without any notion of
+it is materially harder than adding an always-true check, which is why the seam
+was reserved before there was anything to enforce.
 
-### What the fix involves
+### What to be careful of
 
-Add `backend/internal/license` with three separable pieces:
+**Do not "fix" the absent-token default.** No token means `evaluation`, and that
+is §1 of the licence, not an oversight. Turning it into a lockout would break
+every legitimate evaluation, development and air-gapped install, and it would be
+doing so in the name of a licence that grants exactly that use.
 
-1. **Entitlement** — a signed license token (issuer, tenant, edition, expiry,
-   feature flags) verified at boot, offline, with no phone-home. Self-host needs
-   this to work on an air-gapped network.
-2. **Metering** — counter events on the events that correlate with value (plan
-   created, truck packed, route pushed, catalog pull), exported via `/metrics`
-   and/or an outbound usage feed. Needs §1's tenant dimension to be billable.
-3. **Feature gating** — a helper handlers consult, so a commercial-only
-   capability is one call rather than a fork.
+**Do not make the package reach the network.** A licence check that fails when
+the internet does is a licence check that takes a dealer's dispatch board down
+for a DNS outage. There is a test that enforces this.
 
-Reserve the seam now even if the community edition gates nothing. Retrofitting
-entitlement into a system that has shipped without it is materially harder than
-adding an always-true check today.
+**Do not let a bad token downgrade.** Present-but-invalid fails closed. The
+moment that becomes a warning, the signature stops meaning anything.
 
 ---
 
@@ -489,7 +553,9 @@ GableLBM, in which case it applies completely.
 
 If you are **evaluating a managed offering**: §1 is the answer to "can you host
 us on shared infrastructure" and the answer is no, one stack per dealer. §4 is
-the answer to "how do you bill for this" and the answer is not yet.
+the answer to "how do you bill for this": the usage is now counted and the
+entitlement is now verifiable, and there is still no billing — the mechanism
+exists, the commercial decision has not been made.
 
 If you are an **ERP vendor considering an integration**: §2 and §5 are the two
 that decide whether this is a weekend or a quarter. Ask for the conformance

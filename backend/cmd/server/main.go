@@ -23,6 +23,7 @@ import (
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/config"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/fleet"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/gable"
+	"github.com/FutureBuildAIinc/gable-ai-lm/internal/license"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/load"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/routing"
 	"github.com/FutureBuildAIinc/gable-ai-lm/internal/workflow"
@@ -64,6 +65,41 @@ func main() {
 
 	logger.Info("Starting AI_LM server...", "port", cfg.Port, "auth_mode", cfg.AuthMode, "log_level", cfg.LogLevel)
 
+	// 2b. License / entitlement seam (internal/license). Loaded FIRST, before
+	// the database and before anything binds a port, because a present-but-
+	// invalid token is a hard startup failure and there is nothing to be gained
+	// by discovering that after opening a connection pool.
+	//
+	// Three outcomes, and only the first stops the service:
+	//   - a token that will not verify, or one acknowledging Competing Use →
+	//     Load returns an error and we exit. Never a silent downgrade: a
+	//     signature nobody enforces is decorative.
+	//   - a token that has EXPIRED → a WARN naming the date, edition drops to
+	//     "evaluation", and the service boots. An expiry must not take a
+	//     dealer's dispatch offline mid-shift.
+	//   - no token at all → edition "evaluation". That is §1 of the OpenLBM
+	//     Community Source License operating as written (non-production use is
+	//     granted to everyone), not a gap to be closed.
+	lic, err := license.Load(license.Config{
+		Token:      cfg.LicenseToken,
+		File:       cfg.LicenseFile,
+		PublicKeys: license.SplitKeys(cfg.LicensePublicKeys),
+	})
+	if err != nil {
+		logger.Error("License validation failed — refusing to start", "error", err)
+		os.Exit(1)
+	}
+	for _, w := range lic.Warnings() {
+		logger.Warn(w)
+	}
+	// The one licence line. Everything an operator needs to answer "what is
+	// this instance entitled to, and until when" is on it.
+	logger.Info("License loaded", lic.LogAttrs()...)
+	// No handler consults lic.Allow in v1 and that is the design: the seam
+	// gates NOTHING. When a capability does become commercial-only, `lic` is
+	// already here to be passed to the module that owns it, and the gate is one
+	// call rather than a retrofit through a shipped system.
+
 	// 3. Database.
 	db, err := database.Connect(cfg.DatabaseURL, database.PoolConfig{
 		MaxConns:          cfg.DBMaxConns,
@@ -83,7 +119,13 @@ func main() {
 	metricsCtx, metricsCancel := context.WithCancel(context.Background())
 	defer metricsCancel()
 	metrics.StartDBPoolCollector(metricsCtx, db.Pool, 15*time.Second)
-	logger.Info("Prometheus metrics initialized")
+	// Business metering, labelled with this deployment's licence identity. One
+	// meter per process: with one stack per dealer the deployment IS the
+	// tenant, so there is no per-request resolution and no tenancy model to
+	// build. Constructing it here also materialises all four ailm_* series at
+	// zero, so they are on /metrics from the first scrape.
+	meter := metrics.NewMeter(string(lic.Edition()), lic.Subject())
+	logger.Info("Prometheus metrics initialized", "metering_edition", string(lic.Edition()), "metering_subject", lic.Subject())
 
 	// 4. Auth middleware — fail-closed: a token verifier (SESSION_SECRET and/or
 	// JWKS_URL) is required unless AUTH_MODE=dev. /api/v1/auth/login is public so
@@ -147,7 +189,7 @@ func main() {
 	fleet.NewHandler(fleetSvc).RegisterRoutes(mux, writeGuard)
 
 	// Catalog (product dimensions + PIM-merged effective geometry).
-	catalogSvc := catalog.NewService(catalog.NewRepository(db), gableClient)
+	catalogSvc := catalog.NewService(catalog.NewRepository(db), gableClient).WithMeter(meter)
 	catalog.NewHandler(catalogSvc).RegisterRoutes(mux, writeGuard)
 
 	// Load optimization (pillar 1).
@@ -177,6 +219,7 @@ func main() {
 			DepotLat:                  cfg.DepotLat,
 			DepotLng:                  cfg.DepotLng,
 		})
+	workflowSvc.WithMeter(meter)
 	workflow.NewHandler(workflowSvc).RegisterRoutes(mux, writeGuard)
 	// DEPOT_LAT/DEPOT_LNG are the install-wide fallback, shared by the workflow
 	// and routing modules because both resolve their origin through the one
