@@ -80,6 +80,14 @@ func (r *Repository) Get(ctx context.Context, id string) (*Plan, error) {
 	if p.UnassignedStops == nil {
 		p.UnassignedStops = []Stop{}
 	}
+	// DepotSource/DepotNote are likewise not persisted — route_plans has no
+	// column for either — and so come back as "" here. They are left as "" on
+	// purpose: re-resolving the origin now would answer today's question about
+	// the day this plan was built for, and any invented value would read as
+	// authoritative provenance that nobody recorded. An empty note on this path
+	// means "not stored", not "no fallback happened"; see Plan.DepotSource. A
+	// migration adding the two columns is what would change this, and it would
+	// change it here, in the SELECT.
 	return &p, nil
 }
 

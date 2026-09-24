@@ -110,6 +110,12 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 	}
 
 	depotLat, depotLng, depotSource, depotNote := s.resolveDepot(ctx, req, orders, points)
+	// Two copies of the same two values, on purpose. The log is the durable one
+	// (route_plans has no column for them — see Plan.DepotSource); the plan
+	// below is the one the dispatcher actually reads, on the response to the
+	// POST that created it. They are the same variables, so the sentence
+	// support finds in the logs is word for word the sentence the dispatcher
+	// was shown.
 	slog.Info("routing plan depot resolved",
 		"date", req.Date, "depot_source", depotSource, "depot_lat", depotLat, "depot_lng", depotLng,
 		"note", depotNote)
@@ -152,6 +158,8 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		PlanDate:         req.Date,
 		GableBranchID:    req.BranchID,
 		GableVehicleID:   req.VehicleID,
+		DepotSource:      depotSource,
+		DepotNote:        depotNote,
 		Loads:            loads,
 		UnassignedStops:  unassigned,
 		Stops:            flattened,
@@ -159,6 +167,10 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 		TotalDurationMin: round2(totalDuration),
 		Status:           "DRAFT",
 	}
+	// Save writes the column-backed fields only; DepotSource/DepotNote have no
+	// columns and are dropped on the floor here. The plan returned below still
+	// carries them in memory, which is the whole of their reach: this response,
+	// and no later read of the same row.
 	if err := s.repo.Save(ctx, plan); err != nil {
 		return nil, err
 	}
@@ -207,8 +219,14 @@ func (s *Service) Plan(ctx context.Context, req PlanRequest) (*Plan, error) {
 // 404, and that must cost this plan its branch origin, not the plan itself.
 //
 // The result is not persisted: route_plans is a column-backed table and adding
-// a depot_source column is a migration. The caller logs it instead, once per
-// plan, so support can still answer "why does this route start there?".
+// a depot_source column is a migration. The caller does two things with it
+// instead. It puts both values on the Plan it returns, so the dispatcher who
+// asked for this route reads the warning on the CREATE response — the moment
+// it is still actionable — and it logs the same two values once per plan, so
+// support can still answer "why does this route start there?" after that
+// response is gone. What that split does and does not guarantee (in
+// particular: a later GET of the same plan carries neither) is spelled out on
+// Plan.DepotSource.
 func (s *Service) resolveDepot(ctx context.Context, req PlanRequest, orders []gable.Order, stops []depot.Point) (lat, lng float64, source, note string) {
 	// The yards this day's orders actually ship from — the same question, asked
 	// through the same helper, as internal/workflow asks of its analyses.
